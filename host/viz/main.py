@@ -15,7 +15,7 @@ else:
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
+print(PROJECT_ROOT)
 # ✅ Теперь импорты работают
 import tkinter as tk
 from host.viz.app import IMUApp
