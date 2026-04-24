@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 
-# 🔧 АВТО-ФИКС ПУТЕЙ: добавляем корень проекта в sys.path
+# АВТО-ФИКС ПУТЕЙ: добавляем корень проекта в sys.path
 # Это позволяет запускать скрипт из любой папки и с любым способом вызова
 CURRENT_FILE = Path(__file__).resolve()
 # Ищем папку 'mocap-system' или любую, содержащую 'host/' и 'firmware/'
