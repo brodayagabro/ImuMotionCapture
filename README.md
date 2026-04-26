@@ -1,3 +1,5 @@
+# Структура файлов
+```text
 ImuMotionCapture/
 ├── firmware/                     #  Заготовка под прошивки МК
 │   ├── platforms/
@@ -42,7 +44,7 @@ ImuMotionCapture/
 ├── deploy/
 ├── requirements.txt              #  pip install -r requirements.txt
 └── README.md
-
+```
 # Запуск тестов
 ```cmd
 # 1. Установите dev-зависимости
