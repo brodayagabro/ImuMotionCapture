@@ -1,0 +1,9 @@
+https://habr.com/ru/articles/255661/ - Хабр про фильтр маджвика
+
+https://github.com/xioTechnologies/Fusion - опенсорсная библиотека фильтра
+
+https://drive.google.com/drive/folders/1I6sBC-8Q3_vtY-GrFDZbWJZJFk7UnNfO - гугл диск с описанием датчиков WitMotion
+
+https://github.com/WITMOTION?tab=overview&from=2024-12-01&to=2024-12-31 - репозиторий на GitHub WitMotion
+
+https://github.com/Mayitzin/ahrs/tree/master - какой-то крутой репо с кучей фильтров
