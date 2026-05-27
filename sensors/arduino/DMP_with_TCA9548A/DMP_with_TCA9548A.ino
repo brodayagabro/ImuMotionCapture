@@ -75,39 +75,71 @@ void processCommands() {
   }
 }
 
-// ================= ИНИЦИАЛИЗАЦИЯ ДАТЧИКА =================
+// Структура для хранения индивидуальных оффсетов
+struct SensorOffsets {
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
+};
+
+// Массив оффсетов (заполнится при первой калибровке)
+SensorOffsets offsets[NUM_SENSORS];
+
 bool initSensorDMP(uint8_t sensorId, SensorConfig& s) {
   selectTCA(s.channel);
   
-  // 1. Сырой пинг (обходит баги библиотеки)
   if (!pingMPU(MPU_ADDR)) {
     Serial.print("ERR:Sensor "); Serial.print(sensorId+1); 
-    Serial.println(" not responding to I2C ping");
+    Serial.println(" not responding");
     return false;
   }
-  Serial.print("Sensor "); Serial.print(sensorId+1); 
-  Serial.println(" detected on I2C");
-  // supply your own gyro offsets here, scaled for min sensitivity
-  mpu.setXGyroOffset(220);
-  mpu.setYGyroOffset(76);
-  mpu.setZGyroOffset(-85);
-  mpu.setZAccelOffset(1788); // 1688 factory default for my test chip
-
-  // 2. Инициализация DMP
-  Serial.print("Loading DMP for sensor "); Serial.println(sensorId+1);
+  
+  Serial.print("Init sensor "); Serial.println(sensorId+1);
+  
+  // Базовая инициализация (сброс к дефолтным оффсетам)
+  mpu.initialize();
+  mpu.setXGyroOffset(0);
+  mpu.setYGyroOffset(0);
+  mpu.setZGyroOffset(0);
+  mpu.setXAccelOffset(0);
+  mpu.setYAccelOffset(0);
+  mpu.setZAccelOffset(0);
+  
   uint8_t devStatus = mpu.dmpInitialize();
-
-  if (devStatus == 0) {
-    mpu.setDMPEnabled(true);
-    s.packetSize = mpu.dmpGetFIFOPacketSize();
-    s.dmpReady = true;
-    Serial.print("OK:Sensor "); Serial.println(sensorId+1);
-    return true;
-  } else {
-    Serial.print("ERR:DMP init sensor "); Serial.print(sensorId+1);
-    Serial.print(" code="); Serial.println(devStatus);
+  if (devStatus != 0) {
+    Serial.print("ERR:DMP init code="); Serial.println(devStatus);
     return false;
   }
+  
+  // ⭐ ИНДИВИДУАЛЬНАЯ КАЛИБРОВКА ДЛЯ КАЖДОГО ДАТЧИКА
+  Serial.print("Calibrating sensor "); Serial.print(sensorId+1);
+  Serial.println("... KEEP STILL (~15s)");
+  
+  mpu.CalibrateAccel(6);
+  mpu.CalibrateGyro(6);
+  
+  // Сохраняем полученные оффсеты
+  offsets[sensorId].ax = mpu.getXAccelOffset();
+  offsets[sensorId].ay = mpu.getYAccelOffset();
+  offsets[sensorId].az = mpu.getZAccelOffset();
+  offsets[sensorId].gx = mpu.getXGyroOffset();
+  offsets[sensorId].gy = mpu.getYGyroOffset();
+  offsets[sensorId].gz = mpu.getZGyroOffset();
+  
+  Serial.print("Offsets S"); Serial.print(sensorId+1); Serial.print(": ");
+  Serial.print("A("); Serial.print(offsets[sensorId].ax);
+  Serial.print(","); Serial.print(offsets[sensorId].ay);
+  Serial.print(","); Serial.print(offsets[sensorId].az);
+  Serial.print(") G("); Serial.print(offsets[sensorId].gx);
+  Serial.print(","); Serial.print(offsets[sensorId].gy);
+  Serial.print(","); Serial.print(offsets[sensorId].gz);
+  Serial.println(")");
+  
+  mpu.setDMPEnabled(true);
+  s.packetSize = mpu.dmpGetFIFOPacketSize();
+  s.dmpReady = true;
+  
+  Serial.print("OK:Sensor "); Serial.println(sensorId+1);
+  return true;
 }
 
 // ================= SETUP =================
