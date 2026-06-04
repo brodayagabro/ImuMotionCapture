@@ -9,12 +9,12 @@
 │   └── Pasted image 20251028123107.png
 ├── DMP_with_TCA9548A/ - сбор данных с нескольких датчиком(dmp) с помощью мультиплексора TCA9548A
 │   └── DMP_with_TCA9548A.ino
-├── MPU6050_DMP6/ - Пример работы с DMP из используемой библиотеки
+├── MPU6050_DMP6/ - Пример работы с DMP из используемой библиотеки+команды START/STOP/CLIB
 │   ├── MPU6050_DMP6.ino
 │   └── Processing/
 │       └── MPUTeapot/
 │           └── MPUTeapot.pde
-├── MPU6050_DMP6_cmd/ - Интеграция handshake в скетч для синхронизации с хостом
+├── MPU6050_DMP6_cmd/ - DMP+START/STOP/CALIB+TCA9548a on 1st channel
 │   ├── MPU6050_DMP6_cmd.ino
 │   └── Processing/
 │       └── MPUTeapot/
