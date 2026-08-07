@@ -5,6 +5,8 @@ description = "Analyze measured UDP packet arrival frequency"
 requires-python = ">=3.11"
 dependencies = [
     "matplotlib>=3.10,<4",
+    "numpy>=2.2,<3",
+    "pandas>=2.2,<4",
 ]
 
 [tool.uv]

@@ -27,6 +27,11 @@ DEFAULT_DEVICE_IP: Final = "192.168.1.100"
 DEFAULT_DEVICE_PORT: Final = 4210
 CUBE_COUNT: Final = 5
 IDENTITY_QUATERNION: Final = (1.0, 0.0, 0.0, 0.0)
+DEFAULT_SENSOR_IDS: Final = (0, 1, 2, 6, 7)
+RAW_SENSOR_ID_PROFILES: Final = {
+    "tca_channel": {0: 0, 1: 1, 2: 2, 6: 6, 7: 7},
+    "sequential": {1: 0, 2: 1, 3: 2, 4: 6, 5: 7},
+}
 
 CUBE_VERTICES: Final = (
     (-0.7, -0.7, -0.7),
@@ -103,6 +108,7 @@ class QuaternionViewer:
         self.stop_receiver = threading.Event()
         self.events: queue.Queue[tuple[str, float, object, object]] = queue.Queue()
         self.quaternions: dict[int, tuple[float, float, float, float]] = {}
+        self.active_sensor_id_mode: str | None = None
         self.needs_redraw = True
         self.rx_packet_count = 0
         self.rx_quaternion_count = 0
@@ -113,7 +119,7 @@ class QuaternionViewer:
         self.packet_status = tk.StringVar(value="UDP-пакетов: 0 · кватернионов: 0")
         self.rate_hz = tk.StringVar(value="10")
         self.manual_command = tk.StringVar()
-        self.sensor_mapping = [tk.IntVar(value=index + 1) for index in range(CUBE_COUNT)]
+        self.sensor_mapping = [tk.IntVar(value=sensor_id) for sensor_id in DEFAULT_SENSOR_IDS]
 
         self.cube_collections: list[Poly3DCollection] = []
         self.cube_axes: list[list[object]] = []
@@ -205,7 +211,7 @@ class QuaternionViewer:
             item = ttk.Frame(mapping_frame)
             item.pack(side=tk.LEFT, padx=(0, 18))
             ttk.Label(item, text=f"Куб {index + 1} ← датчик").pack(side=tk.LEFT)
-            ttk.Spinbox(item, from_=1, to=255, textvariable=variable, width=4).pack(
+            ttk.Spinbox(item, from_=0, to=255, textvariable=variable, width=4).pack(
                 side=tk.LEFT, padx=(5, 0)
             )
 
@@ -281,7 +287,8 @@ class QuaternionViewer:
             ]
             self.cube_axes.append(axis_lines)
             self.cube_labels.append(
-                self.axes.text(center[0], center[1], -1.35, f"Куб {index + 1}\nдатчик {index + 1}",
+                self.axes.text(center[0], center[1], -1.35,
+                               f"Куб {index + 1}\nдатчик {DEFAULT_SENSOR_IDS[index]}",
                                ha="center", va="top", fontsize=9)
             )
 
@@ -301,6 +308,7 @@ class QuaternionViewer:
             return
 
         self.disconnect_device(log=False)
+        self.active_sensor_id_mode = None
         try:
             endpoint = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -427,28 +435,57 @@ class QuaternionViewer:
             )
             self._parse_packet(text)
 
+        id_mode = self.active_sensor_id_mode or "определение…"
         self.packet_status.set(
-            f"UDP-пакетов: {self.rx_packet_count} · кватернионов: {self.rx_quaternion_count}"
+            f"UDP-пакетов: {self.rx_packet_count} · "
+            f"кватернионов: {self.rx_quaternion_count} · ID: {id_mode}"
         )
         self.root.after(20, self._process_events)
 
     def _parse_packet(self, text: str) -> None:
-        received_quaternion = False
+        raw_quaternions: dict[int, tuple[float, float, float, float]] = {}
         for line in text.splitlines():
             parts = line.split()
             if len(parts) != 6 or parts[0].upper() not in {"Q", "QUAT"}:
                 continue
             try:
-                sensor_id = int(parts[1])
+                raw_sensor_id = int(parts[1])
                 values = tuple(float(value) for value in parts[2:6])
                 quaternion = normalize_quaternion(values)  # type: ignore[arg-type]
             except (ValueError, OverflowError):
                 continue
-            self.quaternions[sensor_id] = quaternion
-            self.rx_quaternion_count += 1
-            received_quaternion = True
+            raw_quaternions[raw_sensor_id] = quaternion
 
-        if received_quaternion:
+        if not raw_quaternions:
+            return
+        if self.active_sensor_id_mode is None:
+            raw_ids = set(raw_quaternions)
+            candidates = [
+                mode
+                for mode, profile in RAW_SENSOR_ID_PROFILES.items()
+                if raw_ids.issubset(profile)
+            ]
+            if len(candidates) == 1:
+                self.active_sensor_id_mode = candidates[0]
+            elif not candidates:
+                self.active_sensor_id_mode = "raw"
+            else:
+                # IDs 1 and 2 are ambiguous until a complete frame arrives.
+                return
+
+        if self.active_sensor_id_mode == "raw":
+            canonical = raw_quaternions
+        else:
+            profile = RAW_SENSOR_ID_PROFILES[self.active_sensor_id_mode]
+            canonical = {
+                profile[raw_sensor_id]: quaternion
+                for raw_sensor_id, quaternion in raw_quaternions.items()
+                if raw_sensor_id in profile
+            }
+
+        if canonical:
+            self.quaternions.update(canonical)
+            self.rx_quaternion_count += len(canonical)
             self.needs_redraw = True
 
     def _mapping_changed(self, *_args: object) -> None:
@@ -460,7 +497,7 @@ class QuaternionViewer:
                 try:
                     sensor_id = int(self.sensor_mapping[cube_index].get())
                 except (tk.TclError, ValueError):
-                    sensor_id = cube_index + 1
+                    sensor_id = DEFAULT_SENSOR_IDS[cube_index]
 
                 quaternion = self.quaternions.get(sensor_id, IDENTITY_QUATERNION)
                 matrix = quaternion_matrix(quaternion)
