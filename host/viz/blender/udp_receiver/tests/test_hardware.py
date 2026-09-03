@@ -2,7 +2,7 @@
 
 Usage:
     blender --background Human_spine_UDP.blend --python-exit-code 1 \
-        --python test_hardware.py -- udp_mocap.py 192.168.1.117 4210 5
+        --python tests/test_hardware.py -- udp_mocap.py DEVICE_IP 4210 5
 """
 
 import math

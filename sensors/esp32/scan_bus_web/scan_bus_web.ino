@@ -6,14 +6,9 @@
 
 #define TCA_ADDR 0x70
 
-// ===== Настройки Wi-Fi =====
-// Вариант 1: ESP32-C3 как точка доступа (проще для отладки)
-const char* ap_ssid = "ESP32C3_I2C";
-const char* ap_pass = "12345678";
-
-// Вариант 2: подключение к роутеру (раскомментируйте и заполните)
-const char* sta_ssid = "NeuroMorphMIPT";
-const char* sta_pass = "31870016";
+// Диагностическая прошивка не подключается к локальной сети. ESP32 создаёт
+// собственную открытую точку доступа, доступную только на время проверки.
+const char* diagnostic_ap_ssid = "ESP32C3_I2C";
 
 WebServer server(80);
 String lastScanResult = "";
@@ -176,29 +171,14 @@ void setup() {
   Wire.begin();
   Wire.setClock(100000);
 
-  // Wi-Fi
-  #if defined(sta_ssid)
-    Serial.printf("Connecting to %s...\n", sta_ssid);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(sta_ssid, sta_pass);
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 30) {
-      delay(500); Serial.print("."); tries++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
-    } else {
-      Serial.println("\nFailed. Falling back to AP mode.");
-      WiFi.mode(WIFI_AP);
-      WiFi.softAP(ap_ssid, ap_pass);
-      Serial.println("AP IP: " + WiFi.softAPIP().toString());
-    }
-  #else
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(ap_ssid, ap_pass);
-    Serial.println("AP mode. SSID: " + String(ap_ssid));
-    Serial.println("AP IP: " + WiFi.softAPIP().toString());
-  #endif
+  // Автономная точка доступа не требует реквизитов внешней Wi-Fi сети.
+  WiFi.mode(WIFI_AP);
+  if (!WiFi.softAP(diagnostic_ap_ssid)) {
+    Serial.println("ERROR: failed to start diagnostic access point");
+  } else {
+    Serial.println("AP mode. SSID: " + String(diagnostic_ap_ssid));
+    Serial.println("Open in browser: http://" + WiFi.softAPIP().toString());
+  }
 
   // HTTP
   server.on("/", handleRoot);

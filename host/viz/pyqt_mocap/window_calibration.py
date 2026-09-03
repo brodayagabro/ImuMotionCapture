@@ -15,9 +15,11 @@ from .calibration import (
 )
 from .guided_dialog import GuidedCalibrationDialog
 from .mocap_core import (
+    AXIS_MAPPING_REVISION,
     DEFAULT_AXIS_MAPS,
     DEFAULT_SENSOR_MAPPING,
     IDENTITY_QUATERNION,
+    LEGACY_SPINE_AXIS_MAP,
     LEGACY_SENSOR_MAPPING,
     SEGMENT_NAMES,
     SENSOR_MAPPING_REVISION,
@@ -82,6 +84,7 @@ class CalibrationWindowMixin:
             "render_fps": self.config.render_fps,
             "sensor_id_mode": self.config.sensor_id_mode,
             "sensor_mapping_revision": SENSOR_MAPPING_REVISION,
+            "axis_mapping_revision": AXIS_MAPPING_REVISION,
             "enabled_segments": sorted(self.config.enabled_segments),
             "sensor_mapping": dict(self.config.sensor_mapping),
         }
@@ -204,6 +207,7 @@ class CalibrationWindowMixin:
                     name: int(mapping[name]) for name in SEGMENT_NAMES
                 }
             mapping_revision = int(application.get("sensor_mapping_revision", 1))
+            axis_mapping_revision = int(application.get("axis_mapping_revision", 1))
             if (
                 mapping_revision < SENSOR_MAPPING_REVISION
                 and new_config.sensor_mapping == LEGACY_SENSOR_MAPPING
@@ -227,6 +231,10 @@ class CalibrationWindowMixin:
                 name: tuple(str(value) for value in raw_axis_maps[name])
                 for name in SEGMENT_NAMES
             }
+            axis_mapping_migrated = (
+                axis_mapping_revision < AXIS_MAPPING_REVISION
+                and new_config.axis_maps["spine"] == LEGACY_SPINE_AXIS_MAP
+            )
             alignment_quaternions = {
                 name: tuple(
                     float(value)
@@ -244,6 +252,10 @@ class CalibrationWindowMixin:
                     name: (1.0, 0.0, 0.0, 0.0) for name in SEGMENT_NAMES
                 }
                 drift_rates = {name: (0.0, 0.0, 0.0) for name in SEGMENT_NAMES}
+            elif axis_mapping_migrated:
+                new_config.axis_maps["spine"] = DEFAULT_AXIS_MAPS["spine"]
+                alignment_quaternions["spine"] = (1.0, 0.0, 0.0, 0.0)
+                drift_rates["spine"] = (0.0, 0.0, 0.0)
             if not new_config.device_ip.strip():
                 raise ValueError("IP-адрес или имя устройства не может быть пустым")
             if not 1 <= new_config.device_port <= 65535:
@@ -274,7 +286,8 @@ class CalibrationWindowMixin:
         except (KeyError, OSError, TypeError, ValueError) as error:
             QMessageBox.critical(self, "Ошибка импорта", str(error))
             return
-        self.calibration_document = None if mapping_migrated else document
+        profile_migrated = mapping_migrated or axis_mapping_migrated
+        self.calibration_document = None if profile_migrated else document
         self.last_calibration_result = None
         self.needs_redraw = True
         if mapping_migrated:
@@ -283,6 +296,12 @@ class CalibrationWindowMixin:
                 "комплексную калибровку N → T → руки вперёд."
             )
             monitor_state = "arm mapping migrated; guided calibration required"
+        elif axis_mapping_migrated:
+            status_message = (
+                "Направление осей spine в старом профиле исправлено. "
+                "Если датчик корпуса используется, повторите калибровку."
+            )
+            monitor_state = "spine axis mapping migrated; calibration required"
         else:
             status_message = (
                 "Профиль импортирован. Примите N-позу: она нужна заново после "

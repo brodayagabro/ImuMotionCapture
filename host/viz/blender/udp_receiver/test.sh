@@ -14,16 +14,16 @@ PYTHONPYCACHEPREFIX="$TEST_TMP_DIR/pycache" \
   python3 -m py_compile \
   "$SCRIPT_DIR/build_udp_blend.py" \
   "$SCRIPT_DIR/udp_mocap.py" \
-  "$SCRIPT_DIR/test_udp_mocap.py" \
-  "$SCRIPT_DIR/test_hardware.py"
+  "$SCRIPT_DIR/tests/test_udp_mocap.py" \
+  "$SCRIPT_DIR/tests/test_hardware.py"
 
 "$BLENDER_BIN" --background --python-exit-code 1 \
   --python "$SCRIPT_DIR/build_udp_blend.py" -- \
-  "$SCRIPT_DIR/Human_spine_N_sensors.blend1" \
+  "$SCRIPT_DIR/Human_spine_source.blend" \
   "$TEST_TMP_DIR/Human_spine_UDP.blend" \
   "$SCRIPT_DIR/udp_mocap.py"
 
-"$BLENDER_BIN" --background "$TEST_TMP_DIR/Human_spine_UDP.blend" \
+  "$BLENDER_BIN" --background "$TEST_TMP_DIR/Human_spine_UDP.blend" \
   --python-exit-code 1 \
-  --python "$SCRIPT_DIR/test_udp_mocap.py" -- \
+  --python "$SCRIPT_DIR/tests/test_udp_mocap.py" -- \
   "$SCRIPT_DIR/udp_mocap.py"

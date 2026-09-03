@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+*.blend[0-9]*
 build/
 develop-eggs/
 dist/

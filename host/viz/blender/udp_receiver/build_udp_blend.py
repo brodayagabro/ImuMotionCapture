@@ -1,10 +1,8 @@
 """Build the cleaned Human_spine_UDP.blend project.
 
 Usage:
-    blender --background --python blender/build_udp_blend.py -- \
-        blender/Human_spine_N_sensors.blend1 \
-        blender/Human_spine_UDP.blend \
-        blender/udp_mocap.py
+    blender --background --python build_udp_blend.py -- \
+        Human_spine_source.blend Human_spine_UDP.blend udp_mocap.py
 """
 
 import os
@@ -87,11 +85,11 @@ status_text.write(
     "Run udp_mocap.py from the Scripting workspace.\n"
     "Edit DEVICE_IP and AXIS_MAPS at the top of that text first.\n\n"
     "Canonical TCA channel map (raw IDs 1..5 are auto-detected):\n"
-    "  0 -> shoulder.L\n"
-    "  1 -> forearm.L\n"
+    "  0 -> shoulder.R\n"
+    "  1 -> forearm.R\n"
     "  2 -> spine\n"
-    "  6 -> forearm.R\n"
-    "  7 -> shoulder.R\n"
+    "  6 -> forearm.L\n"
+    "  7 -> shoulder.L\n"
 )
 
 # Make the cleaned driver visible when the Scripting workspace is opened.
@@ -107,17 +105,18 @@ if bpy.context.window is not None:
         bpy.context.window.workspace = scripting
 
 rig["udp_mocap_driver"] = "udp_mocap.py"
-rig["sensor_0"] = "shoulder.L"
-rig["sensor_1"] = "forearm.L"
+rig["sensor_0"] = "shoulder.R"
+rig["sensor_1"] = "forearm.R"
 rig["sensor_2"] = "spine"
-rig["sensor_6"] = "forearm.R"
-rig["sensor_7"] = "shoulder.R"
+rig["sensor_6"] = "forearm.L"
+rig["sensor_7"] = "shoulder.L"
 rig["udp_port"] = 4210
 rig["sensor_id_mode"] = "auto: tca_channel or sequential"
 
 scene = bpy.context.scene
 scene["neuromorph_udp_mocap"] = True
-scene["udp_mocap_build_version"] = 3
+scene["udp_mocap_build_version"] = 4
+scene["sensor_mapping_revision"] = 2
 scene["udp_mocap_protocol"] = "FRAME + Q, auto IDs: TCA 0/1/2/6/7 or sequential 1..5"
 scene["calibration_pose"] = "N-pose: upright, arms down, palms toward body"
 

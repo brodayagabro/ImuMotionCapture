@@ -1,80 +1,205 @@
-# Структура файлов
-```textgit 
+# IMU Motion Capture
+
+Система захвата движений верхней части тела на пяти MPU6050, подключённых к
+ESP32 через мультиплексор TCA9548A. Контроллер вычисляет кватернионы с помощью
+DMP и передаёт согласованные кадры по UDP. На компьютере доступны основной
+PyQt-визуализатор, диагностические кубики и демонстрационная Blender-сцена.
+
+Основной поддерживаемый тракт проекта:
+
+```text
+MPU6050 ×5 → TCA9548A → ESP32 → UDP → PyQt / Cube Viewer / Blender
+```
+
+## Структура проекта
+
+```text
 ImuMotionCapture/
-├── firmware/                     #  Заготовка под прошивки МК
-│   ├── platforms/
-│   │   ├── esp32/
-│   │   └── arduino/
-│   ├── lib/
-│   │   ├── imu/
-│   │   ├── comms/
-│   │   └── math/
-│   └── src/
-│       └── main.cpp              # ← Заглушка
-├── host/                         #  Python-приложение (ПК)
-│   ├── shared/
-│   │   ├── __init__.py
-│   │   ├── config.py             #  Константы (COM, UDP, BAUD, SAMPLE_RATE)
-│   │   └── data_parser.py        #  Очистка строк, извлечение 9 float
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── backends/
-│   │   │   ├── __init__.py
-│   │   │   ├── base.py           #  Абстрактный интерфейс бэкенда
-│   │   │   ├── serial.py         #  Чтение COM-порта
-│   │   │   └── udp.py            #  Чтение UDP-сокета
-│   │   └── reader.py             #  Координатор потоков + callback-диспетчер
-│   ├── processing/
-│   │   ├── __init__.py
-│   │   └── ahrs_processor.py     #  Обёртка над imufusion (AHRS/Euler)
-│   ├── storage/
-│   │   ├── __init__.py
-│   │   └── db_client.py          #  Заготовка под asyncpg/TimescaleDB
-│   └── viz/
-│       ├── __init__.py
-│       ├── main.py               #  Точка входа (запуск приложения)
-│       ├── app.py                #  Основной мульти-режимный UI
-│       ├── visualizer.py         #  Matplotlib 3D-куб + оси
-│       └── single_sensor_viz.py  #  Отдельное приложение: Raw + Processed
-├── schemas/
-│   └── sensor_data.fbs           #  Схема данных (FlatBuffers/Protobuf)
-├── tests/
-│   └── test_parser.py            #  Мок-тесты для парсера/бэкендов
-├── docs/
-├── deploy/
-├── requirements.txt              #  pip install -r requirements.txt
-└── README.md
+├── pyproject.toml                 # зависимости, установка пакетов и pytest
+├── sensors/
+│   └── esp32/
+│       ├── DMP_with_TCA9548A_udp/ # основная UDP-прошивка
+│       └── scan_bus_web/          # диагностика I2C и TCA9548A
+├── host/
+│   ├── viz/
+│   │   ├── pyqt_mocap/            # основное приложение захвата движений
+│   │   ├── cube_viewer/           # диагностическая визуализация кубиками
+│   │   └── blender/               # демонстрационная сцена и её сборщик
+│   ├── storage/                   # экспериментальный модуль PostgreSQL
+│   └── tools/                     # вспомогательные утилиты
+├── tools/
+│   └── benchmarks/udp_frequency/  # измерение и анализ частоты UDP
+└── docs/                           # дополнительная документация
 ```
-# Запуск тестов
-```cmd
-# 1. Установите dev-зависимости
-pip install -r requirements-dev.txt
 
-# 2. Запустите все тесты с покрытием
+Материалы в `sensors/arduino/` и `sensors/WT901WIFI/` относятся к прежним
+прототипам. Текущая рабочая прошивка находится в `sensors/esp32/`.
+
+## Установка Python-приложений
+
+Требуется Python 3.11 или новее. Из корня репозитория:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+Editable-установка добавляет пакеты из `host/viz` в окружение. После неё снова
+работает ожидаемая команда:
+
+```bash
+python -m pyqt_mocap
+```
+
+Также устанавливаются короткие консольные команды:
+
+```bash
+pyqt-mocap
+cube-viewer
+```
+
+На Ubuntu/Debian для GUI могут понадобиться системные пакеты:
+
+```bash
+sudo apt install libxcb-cursor0 python3-tk
+```
+
+Все Python-настройки сведены в корневой `pyproject.toml`. Дополнительные группы
+устанавливаются по необходимости:
+
+```bash
+python -m pip install -e ".[dev]"       # pytest и плагины
+python -m pip install -e ".[analysis]"  # pandas для анализа частоты
+python -m pip install -e ".[db]"        # asyncpg для PostgreSQL
+python -m pip install -e ".[tools]"     # pyserial для служебных утилит
+```
+
+Для полного окружения разработчика:
+
+```bash
+python -m pip install -e ".[dev,analysis,db,tools]"
+```
+
+## ESP32 и физический маппинг
+
+Основная прошивка:
+[`sensors/esp32/DMP_with_TCA9548A_udp`](sensors/esp32/DMP_with_TCA9548A_udp/README.md).
+Перед сборкой создайте локальный файл с параметрами Wi-Fi:
+
+```bash
+cd sensors/esp32/DMP_with_TCA9548A_udp
+cp wifi_secrets.example.h wifi_secrets.h
+```
+
+`wifi_secrets.h` игнорируется Git. В репозитории остаётся только безопасный
+пример без имени и пароля локальной сети.
+
+Утверждённый маппинг датчиков:
+
+| Канал TCA / UDP ID | Сегмент | Имя в приложениях |
+|---:|---|---|
+| 7 | левое плечо / верхняя часть руки | `shoulder.L` |
+| 6 | левое предплечье | `forearm.L` |
+| 2 | корпус / спина | `spine` |
+| 1 | правое предплечье | `forearm.R` |
+| 0 | правое плечо / верхняя часть руки | `shoulder.R` |
+
+Для проверки собранной I2C-системы используется отдельная прошивка
+[`scan_bus_web`](sensors/esp32/README.md). Она поднимает временную точку доступа
+ESP32 и показывает обнаруженные устройства на каждом канале TCA9548A.
+
+## Визуализаторы
+
+### PyQt MoCap
+
+Основное приложение отображает скелетную модель, принимает UDP-кадры,
+управляет потоком ESP32 и поддерживает комплексную N → T → «руки вперёд»
+калибровку:
+
+```bash
+python -m pyqt_mocap
+```
+
+Подробности: [`host/viz/pyqt_mocap/README.md`](host/viz/pyqt_mocap/README.md).
+
+### Cube Viewer
+
+Диагностическое Tk/Matplotlib-приложение показывает каждый датчик отдельным
+кубом. Оно удобно для проверки UDP, нумерации каналов и направлений вращения:
+
+```bash
+python -m cube_viewer
+```
+
+Подробности: [`host/viz/cube_viewer/README.md`](host/viz/cube_viewer/README.md).
+
+### Blender
+
+Готовая демонстрационная сцена находится в
+`host/viz/blender/udp_receiver/Human_spine_UDP.blend`. Встроенный скрипт
+принимает те же пять кватернионов и управляет ригом `Human_Rig`.
+
+Инструкции по запуску, калибровке и воспроизводимой пересборке:
+[`host/viz/blender/udp_receiver/README.md`](host/viz/blender/udp_receiver/README.md).
+
+ESP32 передаёт поток последнему зарегистрированному UDP-клиенту. Поэтому PyQt,
+Cube Viewer и Blender следует подключать к контроллеру по очереди.
+
+## Модуль БД
+
+`host/storage/db_client.py` содержит асинхронный клиент PostgreSQL/asyncpg и
+создание таблицы `imu_stream`. Сейчас это экспериментальная заготовка:
+подключение и схема таблицы реализованы, но `insert_batch()` ещё не записывает
+данные. Для продолжения разработки установите группу `db`:
+
+```bash
+python -m pip install -e ".[db]"
+```
+
+## Тесты
+
+Основной набор не требует контроллера или дисплея:
+
+```bash
+python -m pip install -e ".[dev]"
 pytest
-
-# 3. Запустить один файл
-pytest tests/test_data_parser.py -v
-
-# 4. Запустить с отчётом о покрытии (откроется htmlcov/index.html)
-pytest --cov=host --cov-report=html
-
-# 5. Запустить тесты с таймаутом 5 секунд на тест
-pytest --timeout=5
 ```
 
-## Blender visualize
-### 1-segment motion
-В репозитории в /host/blender прикреплен блендер-проект для визуализации данных в реальном времени(`Human_spine.blend1`). Скрипт посылает команду для начала передачи данных. Контроллер передает данные в формате квантерниона вращения. Скетч `MPU6050_DMP_cmd.ino` принимает команды с хостового компьтера, осуществляет калибровку передачу углов с digital motion processor. При запуске скрипта получаем четкое движение без видимых задержек левого предплечья.
+GUI smoke-тест PyQt запускается отдельно:
 
-### 4-segment motion
-В репозитории в /host/blender прикреплен блендер-проект для визуализации данных в реальном времени(`Human_spine_N_senseros.blend1`). Скрипт посылает команду для начала передачи данных. Контроллер передает данные в формате квантерниона вращения. Скетч `DMP_with_TCA9548A.ino` принимает команды с хостового компьтера, осуществляет калибровку передачу углов с digital motion processor. Получаем отклик со всех конечностей на движения датчиков с видимой задержкой в 0.5-1.5 секунды.
+```bash
+QT_QPA_PLATFORM=offscreen pytest -m gui \
+  host/viz/pyqt_mocap/tests/test_gui_udp_smoke.py
+```
 
-TODO:
-1. Согласовать оси контроллера и объекта управления!(DONE)
-2. Расширить на множетство датчиков(done): Расширено до 4х датчиков.
-3. Настройка системы визуализации квантернионов.
-4. Организация данных захвата движений.
-5. Решить проблему наличия видимой задержки.(DONE)
-6. Увеличить частоту дискретизации.(DONE)
-7. Провести оценки погрешностей захвата готовой системы.
+Headless-проверка Blender пересобирает проект во временный файл и тестирует
+риг, встроенный скрипт, UDP-парсер и команды контроллеру:
+
+```bash
+./host/viz/blender/udp_receiver/test.sh
+```
+
+## Измерение частоты UDP
+
+Аппаратный бенчмарк и анализ результатов находятся в
+`tools/benchmarks/udp_frequency/`:
+
+```bash
+python -m pip install -e ".[analysis]"
+python tools/benchmarks/udp_frequency/test_frequency.py IP_АДРЕС_ESP32
+python tools/benchmarks/udp_frequency/analyze_frequency.py
+```
+
+Скрипт измерения последовательно запрашивает частоты, сохраняет времена прихода
+кадров в CSV, а анализатор рассчитывает фактическую частоту и строит график.
+
+## Документация
+
+- [прошивки ESP32](sensors/esp32/README.md);
+- [протокол основной прошивки](sensors/esp32/DMP_with_TCA9548A_udp/README.md);
+- [визуализаторы](host/viz/README.md);
+- [PyQt-приложение и калибровка](host/viz/pyqt_mocap/README.md);
+- [Cube Viewer](host/viz/cube_viewer/README.md);
+- [Blender-демонстрация](host/viz/blender/udp_receiver/README.md).

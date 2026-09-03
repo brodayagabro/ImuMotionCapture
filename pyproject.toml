@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imu-motion-capture"
+version = "0.1.0"
+description = "UDP motion capture with ESP32, MPU6050 sensors and desktop visualizers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.10,<4",
+    "numpy>=2.0,<3",
+    "PyQt6>=6.7,<7",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "pandas>=2.2,<4",
+]
+db = [
+    "asyncpg>=0.29,<1",
+]
+tools = [
+    "pyserial>=3.5,<4",
+]
+dev = [
+    "pytest>=7.4,<10",
+    "pytest-cov>=4.1,<8",
+    "pytest-mock>=3.11,<4",
+    "pytest-timeout>=2.2,<3",
+]
+
+[project.scripts]
+pyqt-mocap = "pyqt_mocap.mpu_udp_viewer:main"
+cube-viewer = "cube_viewer.mpu_udp_viewer_tk:main"
+
+[tool.setuptools.packages.find]
+where = ["host/viz"]
+include = ["pyqt_mocap*", "cube_viewer*"]
+exclude = ["pyqt_mocap.tests*", "cube_viewer.tests*"]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "host/viz/pyqt_mocap/tests",
+    "host/viz/cube_viewer/tests",
+]
+pythonpath = ["host/viz"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "-m",
+    "not gui and not hardware",
+]
+markers = [
+    "gui: tests requiring a Qt event loop and local UDP sockets",
+    "hardware: tests requiring a physical ESP32 controller",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:matplotlib.*",
+]

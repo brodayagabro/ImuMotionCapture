@@ -31,6 +31,7 @@
 #include <Arduino.h>
 #include "WiFi.h"
 #include "AsyncUDP.h"
+#include "wifi_secrets.h"
 
 
 static const uint32_t BAUD_RATE = 115200UL;
@@ -67,11 +68,9 @@ static const uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000UL;
 // Set to false to use SENSOR_CHANNELS instead of scanning channels 0..7.
 static const bool AUTO_DETECT_CHANNELS = true;
 static const bool VERBOSE_I2C_SCAN = false;
-static const uint8_t SENSOR_CHANNELS[MAX_SENSORS] = {0U, 1U, 2U, 5U, 6U};
-
-// Change these two values before flashing if another WLAN is used.
-static const char *WIFI_SSID = "NeuroMorphMIPT";
-static const char *WIFI_PASSWORD = "31870016";
+// Canonical physical mounting:
+//   7 shoulder.L, 6 forearm.L, 2 spine, 1 forearm.R, 0 shoulder.R.
+static const uint8_t SENSOR_CHANNELS[MAX_SENSORS] = {0U, 1U, 2U, 6U, 7U};
 
 MPU6050 mpu(MPU_ADDR);
 AsyncUDP udp;

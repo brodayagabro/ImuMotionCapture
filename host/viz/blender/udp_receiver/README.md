@@ -6,8 +6,9 @@
 
 - `Human_spine_UDP.blend` — очищенный итоговый проект Blender 4.0;
 - `udp_mocap.py` — исходник скрипта, также встроенный в `.blend` как Text Block;
-- `build_udp_blend.py` — воспроизводимая сборка `.blend` из исходного `.blend1`;
-- `Human_spine_N_sensors.blend1` — исходный файл, оставленный без изменений.
+- `build_udp_blend.py` — воспроизводимая сборка итогового проекта;
+- `Human_spine_source.blend` — исходный риг без UDP-драйвера;
+- `tests/` — headless-проверка и аппаратный smoke-тест.
 
 Из итогового файла удалены дубли старых Serial-скриптов и неиспользуемая стандартная кость `Bone`. Сохранены арматура, камера, свет и Scripting workspace.
 
@@ -15,15 +16,15 @@
 
 | Канал TCA | ID текущего контроллера | Сегмент | Кость Blender | Родитель |
 |---:|---:|---|---|---|
-| 0 | 1 | левое плечо / верхняя часть руки | `shoulder.L` | спина |
-| 1 | 2 | левое предплечье | `forearm.L` | левое плечо |
+| 0 | 1 | правое плечо / верхняя часть руки | `shoulder.R` | спина |
+| 1 | 2 | правое предплечье | `forearm.R` | правое плечо |
 | 2 | 3 | спина / корпус | `spine` | neutral frame |
-| 6 | 4 | правое предплечье | `forearm.R` | правое плечо |
-| 7 | 5 | правое плечо / верхняя часть руки | `shoulder.R` | спина |
+| 6 | 4 | левое предплечье | `forearm.L` | левое плечо |
+| 7 | 5 | левое плечо / верхняя часть руки | `shoulder.L` | спина |
 
 Драйвер автоматически распознаёт оба встречающихся формата: физические номера
-каналов `0,1,2,6,7` и последовательные ID `1,2,3,4,5`, которые сейчас выдаёт
-контроллер `192.168.1.117`. Внутри рига оба формата приводятся к каналам TCA.
+каналов `0,1,2,6,7` и последовательные ID `1,2,3,4,5`. Внутри рига оба
+формата приводятся к физическим каналам TCA.
 
 Спина вращает всю верхнюю часть и руки через иерархию рига. Плечо вычисляется относительно спины, а локоть — относительно соответствующего плеча. Перед установкой в `rotation_quaternion` поворот переводится в rest-систему координат конкретной кости.
 
@@ -35,7 +36,7 @@
 4. В начале текста задайте:
 
    ```python
-   DEVICE_IP = "192.168.1.117"
+   DEVICE_IP = "IP_АДРЕС_ESP32"
    DEVICE_PORT = 4210
    ```
 
@@ -163,10 +164,11 @@ MPU6050 — 6-осевой прибор: акселерометр даёт на�
 После изменения внешнего `udp_mocap.py` встроите его в проект снова:
 
 ```bash
-blender --background --python blender/build_udp_blend.py -- \
-  blender/Human_spine_N_sensors.blend1 \
-  blender/Human_spine_UDP.blend \
-  blender/udp_mocap.py
+blender --background \
+  --python host/viz/blender/udp_receiver/build_udp_blend.py -- \
+  host/viz/blender/udp_receiver/Human_spine_source.blend \
+  host/viz/blender/udp_receiver/Human_spine_UDP.blend \
+  host/viz/blender/udp_receiver/udp_mocap.py
 ```
 
 ## Тестирование
@@ -176,21 +178,22 @@ blender --background --python blender/build_udp_blend.py -- \
 атомарный neutral frame, иерархические повороты корпуса/рук и команды устройству:
 
 ```bash
-./blender/test.sh
+./host/viz/blender/udp_receiver/test.sh
 ```
 
 Для запуска через нестандартный бинарник Blender:
 
 ```bash
-BLENDER_BIN=/path/to/blender ./blender/test.sh
+BLENDER_BIN=/path/to/blender ./host/viz/blender/udp_receiver/test.sh
 ```
 
 Проверка с включённым реальным контроллером:
 
 ```bash
-blender --background blender/Human_spine_UDP.blend --python-exit-code 1 \
-  --python blender/test_hardware.py -- \
-  blender/udp_mocap.py 192.168.1.117 4210 5
+blender --background host/viz/blender/udp_receiver/Human_spine_UDP.blend \
+  --python-exit-code 1 \
+  --python host/viz/blender/udp_receiver/tests/test_hardware.py -- \
+  host/viz/blender/udp_receiver/udp_mocap.py IP_АДРЕС_ESP32 4210 5
 ```
 
 ## Источники

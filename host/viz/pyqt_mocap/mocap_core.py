@@ -32,6 +32,7 @@ DEFAULT_ENABLED_SEGMENTS: Final = tuple(
 )
 
 SENSOR_MAPPING_REVISION: Final = 2
+AXIS_MAPPING_REVISION: Final = 2
 LEGACY_SENSOR_MAPPING: Final = {
     "shoulder.L": 0,
     "forearm.L": 1,
@@ -57,8 +58,9 @@ RAW_SENSOR_ID_PROFILES: Final = {
     "tca_channel": {0: 0, 1: 1, 2: 2, 6: 6, 7: 7},
     "sequential": {1: 0, 2: 1, 3: 2, 4: 6, 5: 7},
 }
+LEGACY_SPINE_AXIS_MAP: Final = ("+X", "-Z", "+Y")
 DEFAULT_AXIS_MAPS: Final = {
-    "spine": ("+X", "-Z", "+Y"),
+    "spine": ("+X", "+Z", "-Y"),
     "shoulder.L": ("+X", "+Y", "+Z"),
     "forearm.L": ("+X", "+Y", "+Z"),
     "shoulder.R": ("-X", "-Y", "+Z"),
@@ -610,7 +612,6 @@ class BodyPose:
     tracked_segments: dict[str, tuple[Vector, Vector]]
     static_segments: tuple[tuple[Vector, Vector], ...]
     joints: tuple[Vector, ...]
-    torso_faces: tuple[tuple[Vector, ...], ...]
     head_center: Vector
     axis_origins: dict[str, Vector]
     axis_frames: dict[str, Matrix3]
@@ -643,9 +644,9 @@ _ARM_FORWARD_TO_NEUTRAL: Final[Matrix3] = np.array(
 _LEFT_ARM_FORWARD_FRAME: Final[Matrix3] = np.eye(3, dtype=float)
 _RIGHT_ARM_FORWARD_FRAME: Final[Matrix3] = np.diag((-1.0, -1.0, 1.0))
 SENSOR_NEUTRAL_AXIS_FRAMES: Final = {
-    # Torso: X right, Y up, Z backward.
+    # Torso: X right, Y down, Z forward.
     "spine": np.array(
-        ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+        ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)),
         dtype=float,
     ),
     # Left arm when forward: X right, Y toward fingers, Z up.
@@ -657,7 +658,7 @@ SENSOR_NEUTRAL_AXIS_FRAMES: Final = {
 }
 
 def compute_body_pose(orientations: Mapping[str, Quaternion]) -> BodyPose:
-    """Return an articulated upper-body mannequin for the five tracked segments."""
+    """Return an articulated skeleton for the five tracked segments."""
     rotations = {
         name: quaternion_to_matrix(orientations.get(name, IDENTITY_QUATERNION))
         for name in SEGMENT_NAMES
@@ -686,7 +687,7 @@ def compute_body_pose(orientations: Mapping[str, Quaternion]) -> BodyPose:
     }
 
     neck = pelvis + rotations["spine"] @ np.array((0.0, 0.0, 0.68))
-    head_center = pelvis + rotations["spine"] @ np.array((0.0, 0.0, 0.84))
+    head_center = neck.copy()
     left_hip = pelvis + np.array((-0.13, 0.0, -0.04))
     right_hip = pelvis + np.array((0.13, 0.0, -0.04))
     left_knee = np.array((-0.14, 0.0, 0.48))
@@ -702,33 +703,8 @@ def compute_body_pose(orientations: Mapping[str, Quaternion]) -> BodyPose:
         (left_knee, left_ankle),
         (right_hip, right_knee),
         (right_knee, right_ankle),
-        (left_ankle, left_ankle + np.array((0.0, -0.13, 0.0))),
-        (right_ankle, right_ankle + np.array((0.0, -0.13, 0.0))),
-    )
-
-    neutral_corners = np.array(
-        (
-            (-0.17, -0.10, 0.0),
-            (0.17, -0.10, 0.0),
-            (0.17, 0.10, 0.0),
-            (-0.17, 0.10, 0.0),
-            (-0.28, -0.12, 0.52),
-            (0.28, -0.12, 0.52),
-            (0.28, 0.12, 0.52),
-            (-0.28, 0.12, 0.52),
-        )
-    )
-    corners = tuple(pelvis + rotations["spine"] @ corner for corner in neutral_corners)
-    torso_faces = tuple(
-        tuple(corners[index] for index in face)
-        for face in (
-            (0, 1, 2, 3),
-            (4, 5, 6, 7),
-            (0, 1, 5, 4),
-            (1, 2, 6, 5),
-            (2, 3, 7, 6),
-            (3, 0, 4, 7),
-        )
+        (left_ankle, left_ankle + np.array((0.0, 0.13, 0.0))),
+        (right_ankle, right_ankle + np.array((0.0, 0.13, 0.0))),
     )
 
     axis_origins = {
@@ -759,7 +735,6 @@ def compute_body_pose(orientations: Mapping[str, Quaternion]) -> BodyPose:
         tracked_segments=tracked,
         static_segments=static_segments,
         joints=joints,
-        torso_faces=torso_faces,
         head_center=head_center,
         axis_origins=axis_origins,
         axis_frames=axis_frames,

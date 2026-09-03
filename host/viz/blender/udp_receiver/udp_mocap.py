@@ -5,11 +5,11 @@ Run this text from Blender's Scripting workspace. The ESP32 protocol is:
     Q <sensor_id> <w> <x> <y> <z>
 
 Canonical physical mapping uses TCA9548A channels:
-    0 -> left upper arm
-    1 -> left forearm
+    0 -> right upper arm
+    1 -> right forearm
     2 -> back / torso
-    6 -> right forearm
-    7 -> right upper arm
+    6 -> left forearm
+    7 -> left upper arm
 
 The driver auto-detects both firmware ID formats:
     tca_channel: Q IDs 0, 1, 2, 6, 7
@@ -49,11 +49,11 @@ RIG_OBJECT = "Human_Rig"
 
 # The IDs are TCA9548A channel numbers emitted by the updated firmware.
 SENSOR_TO_BONE = {
-    0: "shoulder.L",
-    1: "forearm.L",
+    0: "shoulder.R",
+    1: "forearm.R",
     2: "spine",
-    6: "forearm.R",
-    7: "shoulder.R",
+    6: "forearm.L",
+    7: "shoulder.L",
 }
 
 # "auto" supports both the current sequential firmware on the controller and
@@ -80,11 +80,11 @@ RAW_SENSOR_ID_PROFILES = {
 # A bone uses its segment orientation relative to this parent segment.
 # None means an absolute root segment relative to the neutral pose.
 PARENT_SENSOR = {
-    0: 2,     # left upper arm relative to back
-    1: 0,     # left forearm relative to left upper arm
+    0: 2,     # right upper arm relative to back
+    1: 0,     # right forearm relative to right upper arm
     2: None,  # back is the root
-    6: 7,     # right forearm relative to right upper arm
-    7: 2,     # right upper arm relative to back
+    6: 7,     # left forearm relative to left upper arm
+    7: 2,     # left upper arm relative to back
 }
 
 # Signed coordinate permutation for each sensor.

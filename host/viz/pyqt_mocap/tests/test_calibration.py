@@ -111,7 +111,7 @@ class MountingAxisTests(unittest.TestCase):
         self.assertEqual(DEFAULT_AXIS_MAPS["forearm.L"], ("+X", "+Y", "+Z"))
         self.assertEqual(DEFAULT_AXIS_MAPS["shoulder.R"], ("-X", "-Y", "+Z"))
         self.assertEqual(DEFAULT_AXIS_MAPS["forearm.R"], ("-X", "-Y", "+Z"))
-        self.assertEqual(DEFAULT_AXIS_MAPS["spine"], ("+X", "-Z", "+Y"))
+        self.assertEqual(DEFAULT_AXIS_MAPS["spine"], ("+X", "+Z", "-Y"))
 
     def test_drawn_axes_match_mounting_when_arms_point_forward(self) -> None:
         forward = matrix_to_quaternion(rotation_x(math.pi / 2.0))
@@ -128,7 +128,7 @@ class MountingAxisTests(unittest.TestCase):
         right_frame = np.diag((-1.0, -1.0, 1.0))
         np.testing.assert_allclose(pose.axis_frames["shoulder.R"], right_frame, atol=1e-8)
         np.testing.assert_allclose(pose.axis_frames["forearm.R"], right_frame, atol=1e-8)
-        torso_frame = np.array(((1, 0, 0), (0, 0, -1), (0, 1, 0)))
+        torso_frame = np.array(((1, 0, 0), (0, 0, 1), (0, -1, 0)))
         np.testing.assert_allclose(pose.axis_frames["spine"], torso_frame, atol=1e-8)
 
 
@@ -278,4 +278,3 @@ class GuidedCalibrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

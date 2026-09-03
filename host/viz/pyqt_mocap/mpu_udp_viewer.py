@@ -19,7 +19,6 @@ matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from PyQt6.QtCore import QSettings, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
@@ -59,9 +58,11 @@ from .calibration import (
 )
 from .guided_dialog import GuidedCalibrationDialog
 from .mocap_core import (
+    AXIS_MAPPING_REVISION,
     DEFAULT_AXIS_MAPS,
     DEFAULT_ENABLED_SEGMENTS,
     DEFAULT_SENSOR_MAPPING,
+    LEGACY_SPINE_AXIS_MAP,
     LEGACY_SENSOR_MAPPING,
     SEGMENT_NAMES,
     SENSOR_MAPPING_REVISION,
@@ -143,6 +144,7 @@ def load_config(settings: QSettings) -> ViewerConfig:
             settings.value("sensors/id_mode", config.sensor_id_mode)
         )
         mapping_revision = int(settings.value("sensors/mapping_revision", 1))
+        axis_mapping_revision = int(settings.value("axes/mapping_revision", 1))
         for name in SEGMENT_NAMES:
             enabled = settings.value(
                 f"sensors/enabled/{name}",
@@ -168,6 +170,11 @@ def load_config(settings: QSettings) -> ViewerConfig:
         ):
             config.sensor_mapping = dict(DEFAULT_SENSOR_MAPPING)
             config.axis_maps = dict(DEFAULT_AXIS_MAPS)
+        elif (
+            axis_mapping_revision < AXIS_MAPPING_REVISION
+            and config.axis_maps["spine"] == LEGACY_SPINE_AXIS_MAP
+        ):
+            config.axis_maps["spine"] = DEFAULT_AXIS_MAPS["spine"]
         if not config.device_ip.strip():
             raise ValueError
         if not 1 <= config.device_port <= 65535:
@@ -190,6 +197,7 @@ def save_config(settings: QSettings, config: ViewerConfig) -> None:
     settings.setValue("display/render_fps", config.render_fps)
     settings.setValue("sensors/id_mode", config.sensor_id_mode)
     settings.setValue("sensors/mapping_revision", SENSOR_MAPPING_REVISION)
+    settings.setValue("axes/mapping_revision", AXIS_MAPPING_REVISION)
     for name in SEGMENT_NAMES:
         settings.setValue(
             f"sensors/enabled/{name}", name in config.enabled_segments
@@ -410,7 +418,7 @@ class SettingsDialog(QDialog):
 
 
 class HumanCanvas(QWidget):
-    """Matplotlib 3D mannequin with tracked segment names and local axes."""
+    """Matplotlib 3D skeleton with tracked segment names and local axes."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -432,7 +440,10 @@ class HumanCanvas(QWidget):
         self.figure.patch.set_facecolor("#f3f6fa")
         self.axes.set_facecolor("#f3f6fa")
         self.axes.set_title(
-            "Ориентация сегментов тела", pad=16, fontsize=13, fontweight="bold"
+            "Скелетная модель и ориентация сегментов",
+            pad=16,
+            fontsize=13,
+            fontweight="bold",
         )
         self.axes.set(
             xlim=(-1.05, 1.05),
@@ -443,7 +454,8 @@ class HumanCanvas(QWidget):
             zlabel="Z — вверх",
         )
         self.axes.set_box_aspect((2.1, 1.55, 1.95))
-        self.axes.view_init(elev=13, azim=-72)
+        # Front view: the subject's anatomical left is on the viewer's right.
+        self.axes.view_init(elev=13, azim=108)
         self.axes.grid(True, alpha=0.24)
         self.axes.plot(
             (-0.65, 0.65, 0.65, -0.65, -0.65),
@@ -466,18 +478,18 @@ class HumanCanvas(QWidget):
     def _create_artists(self) -> None:
         pose = compute_body_pose({})
         colors = {
-            "spine": "#2774b8",
+            "spine": "#e08c68",
             "shoulder.L": "#e08c68",
             "forearm.L": "#efad86",
             "shoulder.R": "#e08c68",
             "forearm.R": "#efad86",
         }
         widths = {
-            "spine": 12.0,
-            "shoulder.L": 10.0,
-            "forearm.L": 8.0,
-            "shoulder.R": 10.0,
-            "forearm.R": 8.0,
+            "spine": 5.0,
+            "shoulder.L": 5.0,
+            "forearm.L": 4.0,
+            "shoulder.R": 5.0,
+            "forearm.R": 4.0,
         }
         for name in SEGMENT_NAMES:
             start, end = pose.tracked_segments[name]
@@ -497,19 +509,11 @@ class HumanCanvas(QWidget):
                     (start[1], end[1]),
                     (start[2], end[2]),
                     color="#40536a",
-                    linewidth=7.0,
+                    linewidth=3.4,
                     solid_capstyle="round",
                     zorder=3,
                 )[0]
             )
-        self.torso = Poly3DCollection(
-            pose.torso_faces,
-            facecolors="#4d9bd3",
-            edgecolors="#22527a",
-            linewidths=0.8,
-            alpha=0.58,
-        )
-        self.axes.add_collection3d(self.torso)
         self.joints = self.axes.scatter(
             [point[0] for point in pose.joints],
             [point[1] for point in pose.joints],
@@ -523,10 +527,10 @@ class HumanCanvas(QWidget):
             (pose.head_center[0],),
             (pose.head_center[1],),
             (pose.head_center[2],),
-            s=720,
-            color="#efb18c",
-            edgecolor="#8b5d48",
-            linewidth=1.1,
+            s=260,
+            color="#f3f6fa",
+            edgecolor="#26384d",
+            linewidth=2.0,
             depthshade=True,
             zorder=7,
         )
@@ -567,7 +571,6 @@ class HumanCanvas(QWidget):
             line.set_data_3d(
                 (start[0], end[0]), (start[1], end[1]), (start[2], end[2])
             )
-        self.torso.set_verts(pose.torso_faces)
         self.joints._offsets3d = (
             [point[0] for point in pose.joints],
             [point[1] for point in pose.joints],
@@ -580,12 +583,15 @@ class HumanCanvas(QWidget):
         )
         for name in SEGMENT_NAMES:
             active = name in enabled
+            show_axes = active or name == "spine"
             self.tracked_lines[name].set_alpha(1.0 if active else 0.22)
             for line in self.axis_lines[name]:
-                line.set_visible(active)
+                line.set_visible(show_axes)
+                line.set_alpha(1.0 if active else 0.55)
             label = self.segment_labels[name]
-            label.set_visible(active)
-            if not active:
+            label.set_visible(show_axes)
+            label.set_alpha(1.0 if active else 0.65)
+            if not show_axes:
                 continue
             origin = pose.axis_origins[name]
             frame = pose.axis_frames[name]
@@ -596,7 +602,8 @@ class HumanCanvas(QWidget):
                     (origin[1], end[1]),
                     (origin[2], end[2]),
                 )
-            label.set_text(f"{name}  [S{sensor_mapping[name]}]")
+            state = "" if active else ""
+            label.set_text(f"{name}  [S{sensor_mapping[name]}{state}]")
             label.set_position((origin[0] + 0.025, origin[1] + 0.025))
             label.set_3d_properties(origin[2] + 0.035)
         self.canvas.draw_idle()

@@ -96,7 +96,8 @@ check(
     "embedded driver matches external source",
 )
 check(bpy.context.scene.get("neuromorph_udp_mocap") is True, "scene marker")
-check(bpy.context.scene.get("udp_mocap_build_version") == 3, "build version")
+check(bpy.context.scene.get("udp_mocap_build_version") == 4, "build version")
+check(bpy.context.scene.get("sensor_mapping_revision") == 2, "mapping revision")
 
 rig = bpy.data.objects.get("Human_Rig")
 check(rig is not None and rig.type == "ARMATURE", "Human_Rig armature")
@@ -125,11 +126,11 @@ check(runtime["_EXPECTED_SENSOR_IDS"] == SENSOR_IDS, "sensor ID set")
 check(
     runtime["SENSOR_TO_BONE"]
     == {
-        0: "shoulder.L",
-        1: "forearm.L",
+        0: "shoulder.R",
+        1: "forearm.R",
         2: "spine",
-        6: "forearm.R",
-        7: "shoulder.R",
+        6: "forearm.L",
+        7: "shoulder.L",
     },
     "sensor-to-bone map",
 )
@@ -230,13 +231,13 @@ check(
 # Isolated left-forearm motion must not leak into the upper arm or right side.
 forearm_rotation = Quaternion((1.0, 0.0, 0.0), math.radians(40.0))
 isolated_values = dict(neutral_values)
-isolated_values[1] = quaternion_values(forearm_rotation)
+isolated_values[6] = quaternion_values(forearm_rotation)
 runtime["_handle_datagram"](make_frame(3, isolated_values))
 check(
     runtime["_update_sensor_deltas"](runtime["_snapshot_samples"]()) is True,
     "isolated forearm frame accepted",
 )
-left_forearm_target = runtime["_target_basis_quaternion"](1)
+left_forearm_target = runtime["_target_basis_quaternion"](6)
 check(
     quaternion_distance(
         left_forearm_target, Quaternion((1.0, 0.0, 0.0, 0.0))
@@ -244,7 +245,7 @@ check(
     > math.radians(30.0),
     "left forearm receives isolated rotation",
 )
-for sensor_id in (0, 2, 6, 7):
+for sensor_id in (0, 1, 2, 7):
     check(
         quaternion_distance(
             runtime["_target_basis_quaternion"](sensor_id),
