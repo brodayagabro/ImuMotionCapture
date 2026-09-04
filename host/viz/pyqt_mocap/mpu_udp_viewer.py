@@ -672,7 +672,7 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         self.stop_action.triggered.connect(self.stop_stream)
         self.calibration_action = QAction("КАЛИБРОВКА…", self)
         self.calibration_action.triggered.connect(self.open_calibration_dialog)
-        self.guided_action = QAction("Комплексная N → T → вперёд…", self)
+        self.guided_action = QAction("Калибровка N → T → вперёд → вверх → P…", self)
         self.guided_action.triggered.connect(self.open_guided_calibration)
         self.status_action = QAction("Запросить STATUS", self)
         self.status_action.triggered.connect(lambda: self.send_command("STATUS"))
@@ -1050,7 +1050,7 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         neutral = box.addButton("Только N-поза", QMessageBox.ButtonRole.AcceptRole)
         gyro = box.addButton("Гироскоп + N-поза", QMessageBox.ButtonRole.ActionRole)
         guided = box.addButton(
-            "Комплексная N → T → вперёд", QMessageBox.ButtonRole.ActionRole
+            "Калибровка N → T → вперёд → вверх → P", QMessageBox.ButtonRole.ActionRole
         )
         full = box.addButton(
             "Полная MPU6050", QMessageBox.ButtonRole.DestructiveRole

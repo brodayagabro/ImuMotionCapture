@@ -293,7 +293,7 @@ class CalibrationWindowMixin:
         if mapping_migrated:
             status_message = (
                 "Руки в старом профиле переставлены. Выполните новую "
-                "комплексную калибровку N → T → руки вперёд."
+                "калибровку N → T → руки вперёд → руки вверх → P-позу."
             )
             monitor_state = "arm mapping migrated; guided calibration required"
         elif axis_mapping_migrated:

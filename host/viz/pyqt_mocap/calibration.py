@@ -1,4 +1,4 @@
-"""Three-pose host calibration and JSON profile persistence."""
+"""Five-pose host calibration and JSON profile persistence."""
 
 from __future__ import annotations
 
@@ -29,8 +29,9 @@ from .mocap_core import (
 Quaternion = NDArray[np.float64]
 Vector = NDArray[np.float64]
 PROFILE_SCHEMA = "neuromorph-pyqt-mocap-calibration"
-PROFILE_VERSION = 1
-POSE_NAMES = ("n_pose", "t_pose", "forward_pose")
+PROFILE_VERSION = 3
+SUPPORTED_PROFILE_VERSIONS = frozenset((1, 2, PROFILE_VERSION))
+POSE_NAMES = ("n_pose", "t_pose", "forward_pose", "arms_up_pose", "p_pose")
 MIN_SAMPLES_PER_SEGMENT = 15
 
 NEUTRAL_DIRECTIONS = {
@@ -55,6 +56,16 @@ TARGET_DIRECTIONS = {
             else np.array((0.0, 1.0, 0.0))
         )
         for name in SEGMENT_NAMES
+    },
+    "arms_up_pose": {
+        name: np.array((0.0, 0.0, 1.0)) for name in SEGMENT_NAMES
+    },
+    "p_pose": {
+        "spine": np.array((0.0, 0.0, 1.0)),
+        "shoulder.L": np.array((0.0, 0.0, -1.0)),
+        "shoulder.R": np.array((0.0, 0.0, -1.0)),
+        "forearm.L": np.array((math.sqrt(0.5), 0.0, math.sqrt(0.5))),
+        "forearm.R": np.array((-math.sqrt(0.5), 0.0, math.sqrt(0.5))),
     },
 }
 
@@ -242,7 +253,7 @@ def _estimate_axis_alignment(
     spec: Sequence[str],
     captures: Mapping[str, CapturedPose],
 ) -> NDArray[np.float64]:
-    """Align the observed N→T/forward rotation axes with the body axes."""
+    """Align observed N→T/forward rotation axes with the body axes."""
     if segment == "spine":
         return np.eye(3, dtype=float)
 
@@ -251,6 +262,10 @@ def _estimate_axis_alignment(
     )
     observed_axes: list[Vector] = []
     target_axes: list[Vector] = []
+    # These two rotations are deliberately non-collinear. The raised-arms
+    # pose is a half-turn about the same sagittal axis as the forward pose;
+    # use it to validate direction and choose axis maps, not to estimate this
+    # matrix because a 180-degree quaternion has an ambiguous rotation axis.
     for pose_name in ("t_pose", "forward_pose"):
         current = mapped_sensor_quaternion(
             captures[pose_name].average[segment], spec
@@ -295,7 +310,7 @@ def _direction_error_deg(
         alignment,
     )
     errors: list[float] = []
-    for pose_name in ("t_pose", "forward_pose"):
+    for pose_name in POSE_NAMES[1:]:
         current = _aligned_sensor_quaternion(
             captures[pose_name].average[segment],
             spec,
@@ -331,13 +346,15 @@ def _select_axis_map(
     return best, best_score, preferred_score
 
 
-def calibrate_three_poses(
+def calibrate_five_poses(
     captures: Mapping[str, CapturedPose],
     preferred_axis_maps: Mapping[str, Sequence[str]] = DEFAULT_AXIS_MAPS,
 ) -> CalibrationResult:
     """Choose axis permutations and estimate stationary drift from the N-pose."""
     if set(captures) != set(POSE_NAMES):
-        raise ValueError("calibration requires N, T, and forward pose captures")
+        raise ValueError(
+            "calibration requires N, T, forward, arms-up, and P-pose captures"
+        )
 
     axis_maps: dict[str, tuple[str, str, str]] = {}
     preferred_scores: dict[str, float] = {}

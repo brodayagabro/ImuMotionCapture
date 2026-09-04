@@ -1,0 +1,5 @@
+results/
+results_raw/
+firmware/mpu_gravity_benchmark/wifi_secrets.h
+firmware/mpu6500_raw_benchmark/wifi_secrets.h
+__pycache__/

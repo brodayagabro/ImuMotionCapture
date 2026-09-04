@@ -27,6 +27,7 @@
 #include "Wire.h"
 #include <string.h>
 #include <strings.h>
+#include <Preferences.h>
 #include <stdlib.h>
 #include <Arduino.h>
 #include "WiFi.h"
@@ -74,6 +75,21 @@ static const uint8_t SENSOR_CHANNELS[MAX_SENSORS] = {0U, 1U, 2U, 6U, 7U};
 
 MPU6050 mpu(MPU_ADDR);
 AsyncUDP udp;
+Preferences calibrationPreferences;
+
+static const char CALIBRATION_NVS_NAMESPACE[] = "mpu_offsets";
+struct CalibrationOffsets {
+  uint32_t magic;
+  int16_t accelX;
+  int16_t accelY;
+  int16_t accelZ;
+  int16_t gyroX;
+  int16_t gyroY;
+  int16_t gyroZ;
+};
+
+static const uint32_t CALIBRATION_OFFSETS_MAGIC = 0x4D505536UL;
+bool calibrationStorageReady = false;
 
 struct SensorState {
   uint8_t id;
@@ -422,7 +438,9 @@ void scanTCAChannels() {
 }
 
 bool isSupportedWhoAmI(uint8_t whoAmI) {
-  return whoAmI == 0x68U || whoAmI == 0x70U || whoAmI == 0x71U || whoAmI == 0x73U;
+  // MotionApps20 below is the MPU-6050 DMP image. MPU-6500 reports 0x70
+  // and must use the separate raw-register + Mahony firmware.
+  return whoAmI == 0x68U;
 }
 
 void addSensor(uint8_t channel) {
@@ -518,6 +536,57 @@ void printActiveOffsets(uint8_t sensorIndex) {
   Serial.println(mpu.getZGyroOffset());
 }
 
+void offsetStorageKey(char* key, size_t size, uint8_t channel) {
+  snprintf(key, size, "ch%u", (unsigned int)channel);
+}
+
+bool loadStoredOffsets(uint8_t sensorIndex) {
+  if (!calibrationStorageReady) {
+    return false;
+  }
+  CalibrationOffsets offsets;
+  char key[8];
+  offsetStorageKey(key, sizeof(key), sensors[sensorIndex].channel);
+  if (calibrationPreferences.getBytesLength(key) != sizeof(offsets)) {
+    return false;
+  }
+  calibrationPreferences.getBytes(key, &offsets, sizeof(offsets));
+  if (offsets.magic != CALIBRATION_OFFSETS_MAGIC) {
+    return false;
+  }
+  selectTCA(sensors[sensorIndex].channel);
+  mpu.setXAccelOffset(offsets.accelX);
+  mpu.setYAccelOffset(offsets.accelY);
+  mpu.setZAccelOffset(offsets.accelZ);
+  mpu.setXGyroOffset(offsets.gyroX);
+  mpu.setYGyroOffset(offsets.gyroY);
+  mpu.setZGyroOffset(offsets.gyroZ);
+  Serial.print(F("CAL:loaded offsets S"));
+  Serial.println(sensors[sensorIndex].id);
+  return true;
+}
+
+void saveStoredOffsets(uint8_t sensorIndex) {
+  if (!calibrationStorageReady) {
+    return;
+  }
+  SensorState& s = sensors[sensorIndex];
+  CalibrationOffsets offsets = {
+    CALIBRATION_OFFSETS_MAGIC,
+    mpu.getXAccelOffset(),
+    mpu.getYAccelOffset(),
+    mpu.getZAccelOffset(),
+    mpu.getXGyroOffset(),
+    mpu.getYGyroOffset(),
+    mpu.getZGyroOffset(),
+  };
+  char key[8];
+  offsetStorageKey(key, sizeof(key), s.channel);
+  calibrationPreferences.putBytes(key, &offsets, sizeof(offsets));
+  Serial.print(F("CAL:saved offsets S"));
+  Serial.println(s.id);
+}
+
 bool initSensorDMP(uint8_t sensorIndex) {
   SensorState& s = sensors[sensorIndex];
   selectTCA(s.channel);
@@ -533,17 +602,18 @@ bool initSensorDMP(uint8_t sensorIndex) {
   selectTCA(s.channel);
   whoAmI = printWhoAmI(sensorIndex);
 
+  if (!isSupportedWhoAmI(whoAmI)) {
+    Serial.print(F("ERR:S"));
+    Serial.print(s.id);
+    Serial.print(F(" expected MPU6050 WHOAMI 0x68, got "));
+    printHexByte(whoAmI);
+    Serial.println();
+    return false;
+  }
   if (!mpu.testConnection()) {
-    if (isSupportedWhoAmI(whoAmI)) {
-      Serial.print(F("WARN:S"));
-      Serial.print(s.id);
-      Serial.println(F(" WHOAMI_NOT_MPU6050 trying DMP anyway"));
-    } else {
-      Serial.print(F("ERR:S"));
-      Serial.print(s.id);
-      Serial.println(F(" MPU_CONNECTION"));
-      return false;
-    }
+    Serial.print(F("WARN:S"));
+    Serial.print(s.id);
+    Serial.println(F(" MPU6050_ID_WITH_FAILED_CONNECTION trying DMP anyway"));
   }
 
   selectTCA(s.channel);
@@ -564,15 +634,11 @@ bool initSensorDMP(uint8_t sensorIndex) {
     return false;
   }
 
-  Serial.print(F("CAL:S"));
-  Serial.print(s.id);
-  Serial.println(F(" BEGIN keep all sensors still"));
-
-  selectTCA(s.channel);
-  mpu.setDMPEnabled(false);
-  mpu.resetFIFO();
-  mpu.CalibrateAccel(CALIBRATION_LOOPS);
-  mpu.CalibrateGyro(CALIBRATION_LOOPS);
+  if (!loadStoredOffsets(sensorIndex)) {
+    Serial.print(F("CAL:S"));
+    Serial.print(s.id);
+    Serial.println(F(" no stored offsets; run CALIB flat Z-up"));
+  }
   printActiveOffsets(sensorIndex);
   mpu.setDMPEnabled(true);
   mpu.resetFIFO();
@@ -648,6 +714,7 @@ void calibrateAllSensors(bool calibrateAccelerometers) {
     }
     mpu.CalibrateGyro(CALIBRATION_LOOPS);
     printActiveOffsets(i);
+    saveStoredOffsets(i);
     mpu.setDMPEnabled(true);
     mpu.resetFIFO();
     sensors[i].hasQuat = false;
@@ -1165,6 +1232,11 @@ void setup() {
   while (!Serial && (uint32_t)(millis() - startedAt) < SERIAL_WAIT_MS) {
   }
 
+  calibrationStorageReady = calibrationPreferences.begin(CALIBRATION_NVS_NAMESPACE, false);
+  Serial.println(
+    calibrationStorageReady ? F("INIT:stored MPU offsets ready")
+                            : F("WARN:stored MPU offsets unavailable")
+  );
   #if defined(SDA) && defined(SCL)
     pinMode(SDA, INPUT_PULLUP);
     pinMode(SCL, INPUT_PULLUP);

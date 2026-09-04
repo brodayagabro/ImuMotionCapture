@@ -1,4 +1,4 @@
-"""PyQt dialog for the guided N -> T -> forward calibration workflow."""
+"""PyQt dialog for the guided N -> T -> forward -> arms-up workflow."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from .calibration import (
     CalibrationResult,
     CapturedPose,
     PoseRecorder,
-    calibrate_three_poses,
+    calibrate_five_poses,
 )
 from .mocap_core import DEFAULT_AXIS_MAPS
 
@@ -31,9 +31,11 @@ Snapshot = Mapping[str, tuple[object, float, int]]
 SnapshotProvider = Callable[[], Snapshot]
 
 POSE_TITLES = {
-    "n_pose": "1/3 — N-поза",
-    "t_pose": "2/3 — T-поза",
-    "forward_pose": "3/3 — руки вперёд",
+    "n_pose": "1/5 — N-поза",
+    "t_pose": "2/5 — T-поза",
+    "forward_pose": "3/5 — руки вперёд",
+    "arms_up_pose": "4/5 — руки вверх",
+    "p_pose": "5/5 — P-поза: ладони вместе",
 }
 POSE_INSTRUCTIONS = {
     "n_pose": (
@@ -48,11 +50,21 @@ POSE_INSTRUCTIONS = {
         "Вытяните обе прямые руки горизонтально вперёд. Оси Z датчиков рук "
         "должны смотреть вверх. После нажатия не двигайтесь 5 секунд."
     ),
+    "arms_up_pose": (
+        "Поднимите обе прямые руки вертикально вверх, рядом с головой. "
+        "Корпус держите прямо, локти не сгибайте. После нажатия не двигайтесь "
+        "5 секунд."
+    ),
+    "p_pose": (
+        "Прижмите плечи и локти к корпусу. Согните руки так, чтобы ладони "
+        "соприкасались перед центром груди, а предплечья были направлены вверх "
+        "и немного к центру. После нажатия не двигайтесь 5 секунд."
+    ),
 }
 
 
 class GuidedCalibrationDialog(QDialog):
-    """Record three stationary pose windows and emit a calibration result."""
+    """Record five stationary pose windows and emit a calibration result."""
 
     result_ready = pyqtSignal(object)
 
@@ -71,7 +83,7 @@ class GuidedCalibrationDialog(QDialog):
         self.capture_started_s = 0.0
         self.result: CalibrationResult | None = None
 
-        self.setWindowTitle("Комплексная калибровка N → T → вперёд")
+        self.setWindowTitle("Калибровка N → T → вперёд → вверх → P")
         self.setMinimumWidth(590)
         root = QVBoxLayout(self)
         self.title_label = QLabel()
@@ -166,7 +178,7 @@ class GuidedCalibrationDialog(QDialog):
 
     def _finish_calibration(self) -> None:
         try:
-            self.result = calibrate_three_poses(self.captures, DEFAULT_AXIS_MAPS)
+            self.result = calibrate_five_poses(self.captures, DEFAULT_AXIS_MAPS)
         except ValueError as error:
             QMessageBox.critical(self, "Ошибка калибровки", str(error))
             self.reject()
