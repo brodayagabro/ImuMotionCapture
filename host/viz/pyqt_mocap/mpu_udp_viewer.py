@@ -73,6 +73,7 @@ from .mocap_core import (
 
 
 from .window_calibration import CalibrationWindowMixin
+from .window_recording import RecordingWindowMixin
 DEFAULT_DEVICE_IP: Final = "192.168.1.117"
 DEFAULT_DEVICE_PORT: Final = 4210
 DEFAULT_STREAM_RATE_HZ: Final = 10
@@ -339,7 +340,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(table)
         note = QLabel(
             "Настройка совпадает с AXIS_MAPS Blender-драйвера. Каждая исходная "
-            "ось X/Y/Z должна использоваться один раз. После изменения нужна N-поза."
+            "ось X/Y/Z должна использоваться один раз. После изменения нужна A-поза."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -609,7 +610,7 @@ class HumanCanvas(QWidget):
         self.canvas.draw_idle()
 
 
-class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
+class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWindow):
     """Main GUI, UDP socket owner, and bridge to the pure motion model."""
 
     def __init__(self) -> None:
@@ -629,7 +630,7 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         self.receiver_thread: threading.Thread | None = None
         self.receiver_stop: threading.Event | None = None
         self.send_lock = threading.Lock()
-        self.events: queue.Queue[tuple[str, float, object, object]] = queue.Queue()
+        self.events: queue.Queue[tuple[str, float, object, object, float]] = queue.Queue()
         self.settings_dialog: SettingsDialog | None = None
         self.guided_dialog: GuidedCalibrationDialog | None = None
         self.last_calibration_result: CalibrationResult | None = None
@@ -637,9 +638,14 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         self.streaming_requested = False
         self.hardware_calibration_pending = False
         self.needs_redraw = True
+        self.bvh_recording = None
+        self.bvh_active = False
+        self.bvh_dirty = False
         self._build_actions()
         self._build_menu()
         self._build_ui()
+        self.bvh_label = QLabel("BVH: нет записи")
+        self.statusBar().addPermanentWidget(self.bvh_label)
         self._set_connected_controls(False)
         self.event_timer = QTimer(self)
         self.event_timer.timeout.connect(self._process_events)
@@ -649,6 +655,14 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         self._apply_render_fps()
 
     def _build_actions(self) -> None:
+        self.record_bvh_action = QAction("Начать запись BVH", self)
+        self.record_bvh_action.triggered.connect(self.start_bvh_recording)
+        self.stop_bvh_action = QAction("Остановить запись BVH", self)
+        self.stop_bvh_action.triggered.connect(self.stop_bvh_recording)
+        self.stop_bvh_action.setEnabled(False)
+        self.save_bvh_action = QAction("Экспорт записи в BVH…", self)
+        self.save_bvh_action.triggered.connect(self.save_bvh_recording)
+        self.save_bvh_action.setEnabled(False)
         self.connect_action = QAction("Подключиться", self)
         self.connect_action.setShortcut(QKeySequence("Ctrl+O"))
         self.connect_action.triggered.connect(self.connect_device)
@@ -663,17 +677,16 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         self.settings_action = QAction("Настройки…", self)
         self.settings_action.setShortcut(QKeySequence("Ctrl+,"))
         self.settings_action.triggered.connect(self.open_settings)
-        self.neutral_action = QAction("Запомнить N-позу", self)
-        self.neutral_action.setShortcut(QKeySequence("Ctrl+K"))
-        self.neutral_action.triggered.connect(self.capture_neutral_pose)
         self.start_action = QAction("START", self)
         self.start_action.triggered.connect(self.start_stream)
         self.stop_action = QAction("STOP", self)
         self.stop_action.triggered.connect(self.stop_stream)
         self.calibration_action = QAction("КАЛИБРОВКА…", self)
         self.calibration_action.triggered.connect(self.open_calibration_dialog)
-        self.guided_action = QAction("Калибровка N → T → вперёд → вверх → P…", self)
+        self.guided_action = QAction("Калибровка A → T → вперёд → P → A…", self)
         self.guided_action.triggered.connect(self.open_guided_calibration)
+        self.semaphore_action = QAction("Семафорная калибровка XZ…", self)
+        self.semaphore_action.triggered.connect(self.open_semaphore_calibration)
         self.status_action = QAction("Запросить STATUS", self)
         self.status_action.triggered.connect(lambda: self.send_command("STATUS"))
 
@@ -688,10 +701,11 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         file_menu.addAction(self.import_profile_action)
         file_menu.addAction(self.export_profile_action)
         file_menu.addSeparator()
+        file_menu.addActions((self.record_bvh_action, self.stop_bvh_action, self.save_bvh_action))
+        file_menu.addSeparator()
         file_menu.addAction(exit_action)
         edit_menu = self.menuBar().addMenu("Правка")
         edit_menu.addAction(self.settings_action)
-        edit_menu.addAction(self.neutral_action)
         device_menu = self.menuBar().addMenu("Устройство")
         device_menu.addActions(
             (
@@ -699,6 +713,7 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
                 self.stop_action,
                 self.calibration_action,
                 self.guided_action,
+                self.semaphore_action,
                 self.status_action,
             )
         )
@@ -748,6 +763,19 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         self.packet_label = QLabel("UDP: 0 · кадров: 0 · Q: 0")
         bar.addWidget(self.packet_label)
         outer.addWidget(controls)
+        recording_bar = QHBoxLayout()
+        self.record_bvh_button = QPushButton("Начать запись")
+        self.record_bvh_button.clicked.connect(self.toggle_bvh_recording)
+        self.save_bvh_button = QPushButton("Сохранить BVH…")
+        self.save_bvh_button.setEnabled(False)
+        self.save_bvh_button.clicked.connect(self.save_bvh_recording)
+        self.save_bvh_action.changed.connect(
+            lambda: self.save_bvh_button.setEnabled(self.save_bvh_action.isEnabled())
+        )
+        recording_bar.addWidget(self.record_bvh_button)
+        recording_bar.addWidget(self.save_bvh_button)
+        recording_bar.addStretch(1)
+        outer.addLayout(recording_bar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.human_canvas = HumanCanvas()
@@ -811,6 +839,7 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
             self.calibration_button,
             self.calibration_action,
             self.guided_action,
+            self.semaphore_action,
             self.status_action,
         ):
             widget.setEnabled(connected)
@@ -831,6 +860,8 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         self.settings_dialog = None
 
     def apply_configuration(self, new: ViewerConfig) -> None:
+        if self.bvh_active:
+            self.stop_bvh_recording()
         old = self.config
         endpoint_changed = (old.device_ip, old.device_port) != (
             new.device_ip,
@@ -926,6 +957,8 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         return True
 
     def disconnect_device(self, _checked: bool = False, log: bool = True) -> None:
+        if self.bvh_active:
+            self.stop_bvh_recording()
         sock = self.sock
         self.sock = None
         stop_event = self.receiver_stop
@@ -962,9 +995,9 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
                 continue
             except OSError as error:
                 if not stop_event.is_set() and self.sock is sock:
-                    self.events.put(("error", time.time(), str(error), None))
+                    self.events.put(("error", time.time(), str(error), None, time.monotonic()))
                 break
-            self.events.put(("packet", time.time(), payload, address))
+            self.events.put(("packet", time.time(), payload, address, time.monotonic()))
 
     def send_command(self, command: str, warn: bool = True) -> bool:
         command = command.strip()
@@ -1015,18 +1048,22 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
             else None,
         )
         self.statusBar().showMessage(
-            "START: примите N-позу и не двигайтесь до захвата общего кадра", 7000
+            "START: примите A-позу и не двигайтесь до захвата общего кадра", 7000
         )
 
     def stop_stream(self) -> None:
+        if self.bvh_active:
+            self.stop_bvh_recording()
         if self.send_command("STOP"):
             self.streaming_requested = False
             self.statusBar().showMessage("Команда STOP отправлена", 4000)
 
     def capture_neutral_pose(self) -> None:
+        if self.bvh_active:
+            self.stop_bvh_recording()
         if self.sock is None:
             QMessageBox.warning(
-                self, "Нет соединения", "Для N-позы нужен активный поток ESP32."
+                self, "Нет соединения", "Для A-позы нужен активный поток ESP32."
             )
             return
         self.model.request_neutral()
@@ -1035,37 +1072,34 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
             f"[{self._clock()}] N-POSE requested: корпус прямо, руки вниз"
         )
         self.statusBar().showMessage(
-            "Ожидание свежего общего кадра для N-позы…", 7000
+            "Ожидание свежего общего кадра для A-позы…", 7000
         )
 
     def open_calibration_dialog(self) -> None:
+        if self.bvh_active:
+            self.stop_bvh_recording()
         box = QMessageBox(self)
         box.setWindowTitle("Калибровка")
         box.setIcon(QMessageBox.Icon.Question)
         box.setText("Выберите тип калибровки")
         box.setInformativeText(
-            "N-поза не меняет offsets MPU6050. CALIB_GYRO подходит для надетых "
-            "датчиков. Полная CALIB — только для снятых модулей, лежащих Z вверх."
+            "Калибровка позами выполняется с надетыми датчиками. "
+            "Полная IMU-калибровка (CALIB) — только для снятых модулей, "
+            "лежащих неподвижно локальной Z вверх."
         )
-        neutral = box.addButton("Только N-поза", QMessageBox.ButtonRole.AcceptRole)
-        gyro = box.addButton("Гироскоп + N-поза", QMessageBox.ButtonRole.ActionRole)
         guided = box.addButton(
-            "Калибровка N → T → вперёд → вверх → P", QMessageBox.ButtonRole.ActionRole
+            "Калибровка A → T → вперёд → P → A", QMessageBox.ButtonRole.ActionRole
         )
         full = box.addButton(
-            "Полная MPU6050", QMessageBox.ButtonRole.DestructiveRole
+            "Полная IMU", QMessageBox.ButtonRole.DestructiveRole
         )
+        semaphore = box.addButton("Семафорная XZ", QMessageBox.ButtonRole.ActionRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
         box.exec()
         if box.clickedButton() is guided:
             self.open_guided_calibration()
-        elif box.clickedButton() is neutral:
-            self.capture_neutral_pose()
-        elif box.clickedButton() is gyro and self.send_command("CALIB_GYRO"):
-            self.hardware_calibration_pending = True
-            self.statusBar().showMessage(
-                "CALIB_GYRO: не двигайтесь до ACK … DONE", 10000
-            )
+        elif box.clickedButton() is semaphore:
+            self.open_semaphore_calibration()
         elif box.clickedButton() is full:
             answer = QMessageBox.warning(
                 self,
@@ -1080,7 +1114,7 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
     def _process_events(self) -> None:
         for _ in range(250):
             try:
-                event_type, timestamp, payload, address = self.events.get_nowait()
+                event_type, timestamp, payload, address, received_s = self.events.get_nowait()
             except queue.Empty:
                 break
             if event_type == "error":
@@ -1098,13 +1132,15 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
             )
             result = self.model.handle_datagram(raw, time.monotonic())
             self.needs_redraw = self.needs_redraw or result.pose_changed
+            if result.published and not self.model.neutral_pending:
+                self.capture_bvh_frame(received_s)
             if result.neutral_captured:
                 self._append_monitor(
                     f"[{self._clock()}] N-POSE captured for "
                     f"{len(self.config.enabled_segments)} enabled segments"
                 )
                 self.statusBar().showMessage(
-                    "N-поза захвачена для включённых датчиков",
+                    "A-поза захвачена для включённых датчиков",
                     6000,
                 )
             for message in result.messages:
@@ -1120,7 +1156,7 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
                     self.model.request_neutral()
                     self.needs_redraw = True
                     self.statusBar().showMessage(
-                        "Аппаратная калибровка завершена; примите N-позу", 9000
+                        "Аппаратная калибровка завершена; примите A-позу", 9000
                     )
         mode = self.model.active_sensor_id_mode or (
             "определение…"
@@ -1163,6 +1199,11 @@ class MotionCaptureWindow(CalibrationWindowMixin, QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self.bvh_active:
+            self.stop_bvh_recording()
+        if not self._confirm_bvh_discard():
+            event.ignore()
+            return
         if self.sock is not None and self.streaming_requested:
             self.send_command("STOP", warn=False)
         self.disconnect_device(log=False)

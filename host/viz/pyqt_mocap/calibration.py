@@ -1,8 +1,8 @@
-"""Five-pose host calibration and JSON profile persistence."""
+"""A -> T -> forward -> palms together -> A calibration and profiles."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import itertools
 import json
@@ -21,6 +21,7 @@ from .mocap_core import (
     matrix_to_quaternion,
     normalize_quaternion,
     quaternion_inverse,
+    quaternion_from_rotation_vector,
     quaternion_multiply,
     quaternion_to_matrix,
 )
@@ -29,9 +30,9 @@ from .mocap_core import (
 Quaternion = NDArray[np.float64]
 Vector = NDArray[np.float64]
 PROFILE_SCHEMA = "neuromorph-pyqt-mocap-calibration"
-PROFILE_VERSION = 3
-SUPPORTED_PROFILE_VERSIONS = frozenset((1, 2, PROFILE_VERSION))
-POSE_NAMES = ("n_pose", "t_pose", "forward_pose", "arms_up_pose", "p_pose")
+PROFILE_VERSION = 5
+SUPPORTED_PROFILE_VERSIONS = frozenset((1, 2, 3, 4, PROFILE_VERSION))
+POSE_NAMES = ("a_pose", "t_pose", "forward_pose", "p_pose", "return_a_pose")
 MIN_SAMPLES_PER_SEGMENT = 15
 
 NEUTRAL_DIRECTIONS = {
@@ -57,15 +58,13 @@ TARGET_DIRECTIONS = {
         )
         for name in SEGMENT_NAMES
     },
-    "arms_up_pose": {
-        name: np.array((0.0, 0.0, 1.0)) for name in SEGMENT_NAMES
-    },
+    "return_a_pose": NEUTRAL_DIRECTIONS,
+    # Upper arms down; forearms upward/inward, internal elbow angle 45 deg.
+    # Targets describe segment directions, not anthropometric wrist positions.
     "p_pose": {
-        "spine": np.array((0.0, 0.0, 1.0)),
-        "shoulder.L": np.array((0.0, 0.0, -1.0)),
-        "shoulder.R": np.array((0.0, 0.0, -1.0)),
-        "forearm.L": np.array((math.sqrt(0.5), 0.0, math.sqrt(0.5))),
-        "forearm.R": np.array((-math.sqrt(0.5), 0.0, math.sqrt(0.5))),
+        **NEUTRAL_DIRECTIONS,
+        "forearm.L": np.array((math.sqrt(.5), 0., math.sqrt(.5))),
+        "forearm.R": np.array((-math.sqrt(.5), 0., math.sqrt(.5))),
     },
 }
 
@@ -203,6 +202,9 @@ class CalibrationResult:
     captures: dict[str, CapturedPose]
     reference_s: float
     created_at: str
+    method: str = "guided_poses"
+    repeatability_deg: dict[str, float] = field(default_factory=dict)
+    closure_error_deg: dict[str, float] = field(default_factory=dict)
 
     @property
     def max_drift_deg_s(self) -> float:
@@ -253,19 +255,17 @@ def _estimate_axis_alignment(
     spec: Sequence[str],
     captures: Mapping[str, CapturedPose],
 ) -> NDArray[np.float64]:
-    """Align observed N→T/forward rotation axes with the body axes."""
+    """Initialize from A→T/forward, then refine forearms using the P-pose."""
     if segment == "spine":
         return np.eye(3, dtype=float)
 
     neutral = mapped_sensor_quaternion(
-        captures["n_pose"].average[segment], spec
+        captures["a_pose"].average[segment], spec
     )
     observed_axes: list[Vector] = []
     target_axes: list[Vector] = []
-    # These two rotations are deliberately non-collinear. The raised-arms
-    # pose is a half-turn about the same sagittal axis as the forward pose;
-    # use it to validate direction and choose axis maps, not to estimate this
-    # matrix because a 180-degree quaternion has an ambiguous rotation axis.
+    # Two non-collinear rotations estimate alignment; the final A-pose
+    # independently validates return to the initial direction.
     for pose_name in ("t_pose", "forward_pose"):
         current = mapped_sensor_quaternion(
             captures[pose_name].average[segment], spec
@@ -293,7 +293,55 @@ def _estimate_axis_alignment(
     if float(np.linalg.det(correction)) < 0.0:
         left[:, -1] *= -1.0
         correction = left @ right_transposed
+    if segment.startswith("forearm."):
+        correction = _refine_forearm_alignment(segment, spec, captures, correction)
     return correction
+
+
+def _refine_forearm_alignment(segment, spec, captures, initial):
+    """Fit one rigid alignment to T/forward/P directions without assuming twist.
+
+    Damped least squares on SO(3); each update is a proper rotation. The
+    final A-pose stays an independent check and is not fitted here.
+    """
+    neutral = mapped_sensor_quaternion(captures["a_pose"].average[segment], spec)
+    poses = ("t_pose", "forward_pose", "p_pose")
+    deltas = [quaternion_to_matrix(quaternion_multiply(
+        mapped_sensor_quaternion(captures[name].average[segment], spec),
+        quaternion_inverse(neutral))) for name in poses]
+
+    def residual(alignment):
+        return np.concatenate([
+            alignment @ delta @ alignment.T @ NEUTRAL_DIRECTIONS[segment]
+            - TARGET_DIRECTIONS[name][segment]
+            for name, delta in zip(poses, deltas)
+        ])
+
+    alignment = initial.copy()
+    epsilon = 1e-5
+    for _ in range(20):
+        error = residual(alignment)
+        if np.linalg.norm(error) < 1e-10:
+            break
+        jacobian = np.column_stack([
+            (residual(quaternion_to_matrix(quaternion_from_rotation_vector(axis * epsilon))
+                      @ alignment) - error) / epsilon
+            for axis in np.eye(3)
+        ])
+        step = np.linalg.solve(jacobian.T @ jacobian + 1e-4 * np.eye(3),
+                               -jacobian.T @ error)
+        norm = float(np.linalg.norm(step))
+        if norm < 1e-8:
+            break
+        step *= min(1., .15 / norm)
+        for factor in (1., .5, .25, .125):
+            candidate = quaternion_to_matrix(quaternion_from_rotation_vector(step * factor)) @ alignment
+            if np.linalg.norm(residual(candidate)) < np.linalg.norm(error):
+                alignment = candidate
+                break
+        else:
+            break
+    return alignment
 
 
 def _direction_error_deg(
@@ -305,7 +353,7 @@ def _direction_error_deg(
     if alignment is None:
         alignment = np.eye(3, dtype=float)
     neutral = _aligned_sensor_quaternion(
-        captures["n_pose"].average[segment],
+        captures["a_pose"].average[segment],
         spec,
         alignment,
     )
@@ -350,10 +398,10 @@ def calibrate_five_poses(
     captures: Mapping[str, CapturedPose],
     preferred_axis_maps: Mapping[str, Sequence[str]] = DEFAULT_AXIS_MAPS,
 ) -> CalibrationResult:
-    """Choose axis permutations and estimate stationary drift from the N-pose."""
+    """Fit A/T/forward/P, validate return to A and estimate stationary drift."""
     if set(captures) != set(POSE_NAMES):
         raise ValueError(
-            "calibration requires N, T, forward, arms-up, and P-pose captures"
+            "calibration requires initial A, T, forward, P, and final A captures"
         )
 
     axis_maps: dict[str, tuple[str, str, str]] = {}
@@ -391,10 +439,10 @@ def calibrate_five_poses(
         )
         scores[segment] = aligned_score
 
-    neutral_capture = captures["n_pose"]
+    neutral_capture = captures["return_a_pose"]
     duration_s = neutral_capture.ended_s - neutral_capture.started_s
     if duration_s < 1.0:
-        raise ValueError("N-pose capture is too short to estimate drift")
+        raise ValueError("Final A-pose capture is too short to estimate drift")
     drift_rates: dict[str, tuple[float, float, float]] = {}
     for segment in SEGMENT_NAMES:
         first = _aligned_sensor_quaternion(
@@ -446,6 +494,9 @@ def profile_document(
         "created_at": result.created_at,
         "application": dict(application_config),
         "calibration": {
+            "method": result.method,
+            "repeatability_deg": result.repeatability_deg,
+            "closure_error_deg": result.closure_error_deg,
             "axis_maps": {
                 name: list(result.axis_maps[name]) for name in SEGMENT_NAMES
             },
@@ -480,7 +531,7 @@ def load_profile(path: str | Path) -> dict[str, object]:
         raise ValueError("корень профиля должен быть JSON-объектом")
     if document.get("schema") != PROFILE_SCHEMA:
         raise ValueError("это не профиль Neuromorph PyQt mocap")
-    if document.get("version") != PROFILE_VERSION:
+    if document.get("version") not in SUPPORTED_PROFILE_VERSIONS:
         raise ValueError("неподдерживаемая версия профиля")
     application = document.get("application")
     calibration = document.get("calibration")

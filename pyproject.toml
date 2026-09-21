@@ -36,8 +36,8 @@ pyqt-mocap = "pyqt_mocap.mpu_udp_viewer:main"
 cube-viewer = "cube_viewer.mpu_udp_viewer_tk:main"
 
 [tool.setuptools.packages.find]
-where = ["host/viz"]
-include = ["pyqt_mocap*", "cube_viewer*"]
+where = ["host/viz", "host"]
+include = ["pyqt_mocap*", "cube_viewer*", "storage"]
 exclude = ["pyqt_mocap.tests*", "cube_viewer.tests*"]
 
 [tool.pytest.ini_options]
@@ -45,7 +45,7 @@ testpaths = [
     "host/viz/pyqt_mocap/tests",
     "host/viz/cube_viewer/tests",
 ]
-pythonpath = ["host/viz"]
+pythonpath = ["host/viz", "host"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]

@@ -53,7 +53,12 @@ class CalibrationWindowMixin:
                     )
         return snapshot
 
-    def open_guided_calibration(self) -> None:
+    def open_semaphore_calibration(self) -> None:
+        self.open_guided_calibration(semaphore=True)
+
+    def open_guided_calibration(self, checked=False, *, semaphore=False) -> None:
+        if self.bvh_active:
+            self.stop_bvh_recording()
         if self.sock is None or not self.streaming_requested:
             QMessageBox.warning(
                 self,
@@ -66,7 +71,13 @@ class CalibrationWindowMixin:
             self.guided_dialog.raise_()
             self.guided_dialog.activateWindow()
             return
-        dialog = GuidedCalibrationDialog(self._calibration_snapshot, self)
+        dialog = GuidedCalibrationDialog(
+            self._calibration_snapshot, self, semaphore=semaphore,
+            preferred_axis_maps=dict(self.config.axis_maps),
+            prior_alignment={name: value.copy() for name, value
+                             in self.model.axis_alignment_quaternion.items()},
+            enabled_segments=set(self.config.enabled_segments),
+        )
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.result_ready.connect(self._apply_guided_calibration)
         dialog.destroyed.connect(self._guided_dialog_closed)
@@ -94,7 +105,7 @@ class CalibrationWindowMixin:
         new_config.axis_maps = dict(result.axis_maps)
         self.apply_configuration(new_config)
         neutral_raw = {
-            name: result.captures["n_pose"].average[name]
+            name: result.captures["return_a_pose"].average[name]
             for name in SEGMENT_NAMES
         }
         self.model.set_guided_calibration(
@@ -131,8 +142,8 @@ class CalibrationWindowMixin:
                 f"Ошибка направления для {worst_segment} достигла "
                 f"{maximum_error:.1f}° (порог "
                 f"{HIGH_POSE_ERROR_WARNING_DEG:.0f}°). "
-                "Рекомендуется повторить мастер, точнее удерживая T-позу "
-                "и прямые руки вперёд.",
+                "Рекомендуется повторить выбранный мастер, точнее удерживая "
+                "показанные позы и не поворачивая корпус.",
             )
 
     def export_calibration_profile(self) -> None:
@@ -293,7 +304,7 @@ class CalibrationWindowMixin:
         if mapping_migrated:
             status_message = (
                 "Руки в старом профиле переставлены. Выполните новую "
-                "калибровку N → T → руки вперёд → руки вверх → P-позу."
+                "калибровку A → T → руки вперёд → P → A."
             )
             monitor_state = "arm mapping migrated; guided calibration required"
         elif axis_mapping_migrated:
@@ -304,7 +315,7 @@ class CalibrationWindowMixin:
             monitor_state = "spine axis mapping migrated; calibration required"
         else:
             status_message = (
-                "Профиль импортирован. Примите N-позу: она нужна заново после "
+                "Профиль импортирован. Примите A-позу: она нужна заново после "
                 "каждого запуска контроллера."
             )
             monitor_state = "fresh N-pose required"

@@ -11,6 +11,7 @@ import numpy as np
 
 from pyqt_mocap.calibration import (
     CapturedPose,
+    _direction_error_deg,
     calibrate_five_poses,
     load_profile,
     profile_document,
@@ -137,24 +138,21 @@ class GuidedCalibrationTests(unittest.TestCase):
         identity = {name: np.eye(3) for name in SEGMENT_NAMES}
         t_pose = dict(identity)
         forward_pose = dict(identity)
-        arms_up_pose = dict(identity)
         p_pose = dict(identity)
+        p_pose["forearm.L"] = rotation_y(-3 * math.pi / 4)
+        p_pose["forearm.R"] = rotation_y(3 * math.pi / 4)
         for name in ("shoulder.L", "forearm.L"):
             t_pose[name] = rotation_y(math.pi / 2.0)
-            arms_up_pose[name] = rotation_x(math.pi)
             forward_pose[name] = rotation_x(math.pi / 2.0)
         for name in ("shoulder.R", "forearm.R"):
             t_pose[name] = rotation_y(-math.pi / 2.0)
             forward_pose[name] = rotation_x(math.pi / 2.0)
-            arms_up_pose[name] = rotation_x(math.pi)
-        p_pose["forearm.L"] = rotation_y(-3.0 * math.pi / 4.0)
-        p_pose["forearm.R"] = rotation_y(3.0 * math.pi / 4.0)
         self.captures = {
-            "n_pose": captured_pose("n_pose", identity, 100.0),
+            "a_pose": captured_pose("a_pose", identity, 100.0),
             "t_pose": captured_pose("t_pose", t_pose, 110.0),
             "forward_pose": captured_pose("forward_pose", forward_pose, 120.0),
-            "arms_up_pose": captured_pose("arms_up_pose", arms_up_pose, 130.0),
-            "p_pose": captured_pose("p_pose", p_pose, 140.0),
+            "p_pose": captured_pose("p_pose", p_pose, 130.0),
+            "return_a_pose": captured_pose("return_a_pose", identity, 140.0),
         }
 
     def test_five_poses_keep_known_mounting_and_have_zero_error(self) -> None:
@@ -165,15 +163,70 @@ class GuidedCalibrationTests(unittest.TestCase):
         for rate in result.drift_rates_rad_s.values():
             np.testing.assert_allclose(rate, (0.0, 0.0, 0.0), atol=1e-10)
 
+    def test_final_a_is_checked_and_used_for_drift(self) -> None:
+        segment = "forearm.L"
+        final = self.captures["return_a_pose"]
+        final.average[segment] = raw_quaternion_for(rotation_x(.3), segment)
+        final.last[segment] = raw_quaternion_for(rotation_x(.05), segment)
+        result = calibrate_five_poses(self.captures)
+        self.assertGreater(result.scores_deg[segment], 1.)
+        self.assertGreater(np.linalg.norm(result.drift_rates_rad_s[segment]), 0.)
+        self.assertAlmostEqual(result.reference_s, (final.started_s + final.ended_s) / 2)
+
+    def test_p_pose_changes_continuous_forearm_alignment(self) -> None:
+        for segment, sign in (("forearm.L", -1), ("forearm.R", 1)):
+            with self.subTest(segment=segment):
+                self.setUp()
+                rotation = rotation_z(.18) @ rotation_y(sign * 3 * math.pi / 4)
+                self.captures["p_pose"].average[segment] = raw_quaternion_for(rotation, segment)
+                result = calibrate_five_poses(self.captures)
+                alignment = quaternion_to_matrix(np.asarray(result.axis_alignment_quaternions[segment]))
+                self.assertGreater(np.linalg.norm(alignment - np.eye(3)), .01)
+                before = _direction_error_deg(segment, result.axis_maps[segment], self.captures)
+                self.assertLess(result.scores_deg[segment], before)
+                np.testing.assert_allclose(alignment.T @ alignment, np.eye(3), atol=1e-8)
+                self.assertAlmostEqual(np.linalg.det(alignment), 1.)
+
+    def test_rotated_forearms_recover_p_pose_on_both_sides(self) -> None:
+        for segment, sign in (("forearm.L", -1), ("forearm.R", 1)):
+            with self.subTest(segment=segment):
+                self.setUp()
+                alignment = rotation_z(.2)
+                expected = {
+                    "a_pose": np.eye(3), "return_a_pose": np.eye(3),
+                    "t_pose": rotation_y(-sign * math.pi / 2),
+                    "forward_pose": rotation_x(math.pi / 2),
+                    "p_pose": rotation_y(sign * 3 * math.pi / 4),
+                }
+                for name, rotation in expected.items():
+                    raw = raw_quaternion_for(alignment.T @ rotation @ alignment, segment)
+                    capture = self.captures[name]
+                    capture.average[segment] = raw.copy()
+                    capture.first[segment] = raw.copy()
+                    capture.last[segment] = raw.copy()
+                result = calibrate_five_poses(self.captures)
+                actual = quaternion_to_matrix(np.asarray(result.axis_alignment_quaternions[segment]))
+                np.testing.assert_allclose(actual, alignment, atol=1e-8)
+                self.assertLess(result.scores_deg[segment], 1e-5)
+
+    def test_previous_profile_versions_can_be_loaded(self) -> None:
+        document = profile_document({}, calibrate_five_poses(self.captures))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            for version in (1, 2, 3, 4, 5):
+                document["version"] = version
+                save_profile(path, document)
+                self.assertEqual(load_profile(path)["version"], version)
+
     def test_five_poses_align_a_rotated_arm_sensor_frame(self) -> None:
         segment = "shoulder.L"
         expected_alignment = rotation_z(math.radians(18.0))
         expected_rotations = {
-            "n_pose": np.eye(3),
+            "a_pose": np.eye(3),
             "t_pose": rotation_y(math.pi / 2.0),
             "forward_pose": rotation_x(math.pi / 2.0),
-            "arms_up_pose": rotation_x(math.pi),
             "p_pose": np.eye(3),
+            "return_a_pose": np.eye(3),
         }
         observed_rotations = {}
         for pose_name, expected in expected_rotations.items():
@@ -190,7 +243,7 @@ class GuidedCalibrationTests(unittest.TestCase):
             np.asarray(result.axis_alignment_quaternions[segment])
         )
         self.assertLess(result.scores_deg[segment], 1.0e-6)
-        for pose_name in ("t_pose", "forward_pose", "arms_up_pose", "p_pose"):
+        for pose_name in ("t_pose", "forward_pose", "p_pose", "return_a_pose"):
             corrected = (
                 actual_alignment
                 @ observed_rotations[pose_name]
@@ -207,7 +260,7 @@ class GuidedCalibrationTests(unittest.TestCase):
         live_observed = expected_alignment.T @ live_expected @ expected_alignment
         live_raw = raw_quaternion_for(live_observed, segment)
         neutral_raw = {
-            name: self.captures["n_pose"].average[name]
+            name: self.captures["a_pose"].average[name]
             for name in SEGMENT_NAMES
         }
         model = MotionCaptureModel(

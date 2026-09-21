@@ -8,6 +8,7 @@ import sys
 
 
 PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if PACKAGE_PARENT not in sys.path:
     sys.path.insert(0, PACKAGE_PARENT)
 
