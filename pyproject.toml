@@ -11,7 +11,9 @@ requires-python = ">=3.11"
 dependencies = [
     "matplotlib>=3.10,<4",
     "numpy>=2.0,<3",
+    "PyOpenGL>=3.1.7,<4",
     "PyQt6>=6.7,<7",
+    "pyqtgraph>=0.13.7,<1",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +26,9 @@ db = [
 tools = [
     "pyserial>=3.5,<4",
 ]
+build = [
+    "pyinstaller>=6.11,<7",
+]
 dev = [
     "pytest>=7.4,<10",
     "pytest-cov>=4.1,<8",
@@ -33,6 +38,7 @@ dev = [
 
 [project.scripts]
 pyqt-mocap = "pyqt_mocap.mpu_udp_viewer:main"
+pyqt-mocap-gl = "pyqt_mocap.mpu_udp_viewer_gl:main"
 cube-viewer = "cube_viewer.mpu_udp_viewer_tk:main"
 
 [tool.setuptools.packages.find]

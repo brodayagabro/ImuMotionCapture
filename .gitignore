@@ -9,9 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 *.blend[0-9]*
-build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -32,6 +30,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!packaging/pyqt_mocap.spec
+!packaging/pyqt_mocap_gl.spec
 
 # Installer logs
 pip-log.txt

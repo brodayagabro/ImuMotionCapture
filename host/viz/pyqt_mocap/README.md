@@ -15,6 +15,16 @@ python -m pip install -e .
 python -m pyqt_mocap
 ```
 
+Для более быстрой GPU-отрисовки человека есть второй вариант на PyQtGraph
+OpenGL. UDP-приём, интерфейс, настройки и калибровка в нём общие с основным
+приложением:
+
+```bash
+python -m pyqt_mocap.mpu_udp_viewer_gl
+# или после установки пакета:
+pyqt-mocap-gl
+```
+
 Editable-установка нужна потому, что исходный пакет хранится в `host/viz`.
 Она также добавляет консольную команду `pyqt-mocap`. Прямой launcher без
 установки пакета можно вызвать так:
@@ -22,6 +32,68 @@ Editable-установка нужна потому, что исходный п�
 ```bash
 python host/viz/pyqt_mocap/run.py
 ```
+
+## Сборка для Windows
+
+### Требования
+
+- Windows 10/11 x64;
+- Python 3.11 или новее, доступный как `py` или `python`;
+- PowerShell;
+- исходный репозиторий целиком.
+
+Все команды ниже выполняются из корня репозитория. Скрипты автоматически
+создают виртуальное окружение `.venv`, устанавливают зависимости и запускают
+PyInstaller. На компьютере, где будет запускаться готовое приложение,
+устанавливать Python не требуется.
+
+### OpenGL-версия — рекомендуется
+
+Версия на PyQtGraph OpenGL обеспечивает наиболее плавную отрисовку человека:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build_windows_gl.ps1
+```
+
+После успешной сборки приложение находится здесь:
+
+```text
+dist\pyqt_mocap_gl\pyqt_mocap_gl.exe
+```
+
+Это папочная сборка. Для запуска на другом компьютере нужно скопировать весь
+каталог `dist\pyqt_mocap_gl`, включая папку `_internal`. Нельзя переносить
+только файл `pyqt_mocap_gl.exe`.
+
+### Классическая Matplotlib-версия
+
+Для сборки исходного варианта визуализатора выполните:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build_windows.ps1
+```
+
+Готовое приложение находится в:
+
+```text
+dist\pyqt_mocap\pyqt_mocap.exe
+```
+
+Для переноса также нужен весь каталог `dist\pyqt_mocap`.
+
+### Повторная сборка
+
+Если `.venv` уже создано и зависимости не менялись, установку можно пропустить:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build_windows_gl.ps1 -SkipInstall
+# или для классической версии:
+powershell -ExecutionPolicy Bypass -File .\packaging\build_windows.ps1 -SkipInstall
+```
+
+Обе сборки являются оконными: отдельная консоль при запуске не открывается.
+PyInstaller очищает промежуточные файлы соответствующей сборки и обновляет
+готовый каталог в `dist`.
 
 На Ubuntu/Debian для Qt 6 нужен системный пакет:
 
@@ -193,6 +265,8 @@ FPS интерфейса, активные датчики, соответств�
 ## Состав каталога
 
 - `mpu_udp_viewer.py` — главное окно и UDP-приёмник;
+- `mpu_udp_viewer_gl.py` — вариант окна с OpenGL-отрисовкой;
+- `human_canvas_gl.py` — GPU-сцена человека на PyQtGraph;
 - `run.py` — прямой launcher каталога;
 - `mocap_core.py` — протокол, кватернионы, дрейф и модель человека без Qt;
 - `calibration.py` — расчёт пяти этапов и JSON-профили;

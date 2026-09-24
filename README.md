@@ -74,6 +74,7 @@ python -m pip install -e ".[dev]"       # pytest и плагины
 python -m pip install -e ".[analysis]"  # pandas для анализа частоты
 python -m pip install -e ".[db]"        # asyncpg для PostgreSQL
 python -m pip install -e ".[tools]"     # pyserial для служебных утилит
+python -m pip install -e ".[build]"     # PyInstaller для Windows-сборки
 ```
 
 Для полного окружения разработчика:
@@ -128,7 +129,39 @@ A-поза → А → У → Ж → Е → Д → A-поза, один круг 
 python -m pyqt_mocap
 ```
 
+Второй вариант использует PyQtGraph и аппаратный OpenGL для отрисовки человека.
+Он сохраняет тот же UDP-протокол, настройки и калибровку, но лучше подходит для
+ноутбуков, на которых Matplotlib создаёт большую задержку:
+
+```bash
+python -m pyqt_mocap.mpu_udp_viewer_gl
+```
+
 Подробности: [`host/viz/pyqt_mocap/README.md`](host/viz/pyqt_mocap/README.md).
+
+#### Сборка для Windows
+
+В PowerShell из корня репозитория выполните:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build_windows.ps1
+```
+
+Скрипт создаёт виртуальное окружение `.venv`, если его ещё нет, устанавливает
+зависимости сборки и формирует оконное приложение без консоли непосредственно
+из пакета `host/viz/pyqt_mocap`. Готовый файл находится в
+`dist\pyqt_mocap\pyqt_mocap.exe`. Для переноса приложения нужен весь каталог
+`dist\pyqt_mocap`. Для повторной сборки без переустановки зависимостей добавьте
+параметр `-SkipInstall`.
+
+Для OpenGL-варианта используется отдельный скрипт:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build_windows_gl.ps1
+```
+
+Он создаёт папочную сборку `dist\pyqt_mocap_gl` с файлом
+`pyqt_mocap_gl.exe`. Переносить нужно весь каталог вместе с `_internal`.
 
 ### Cube Viewer
 

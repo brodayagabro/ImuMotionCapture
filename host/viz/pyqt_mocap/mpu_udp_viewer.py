@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import os
 import queue
 import socket
 import sys
@@ -12,13 +13,19 @@ import threading
 import time
 from typing import Collection, Final, Mapping
 
-import matplotlib
+# The OpenGL launcher skips the legacy renderer so its distribution and startup
+# do not pay the Matplotlib cost. The classic launcher keeps the original path.
+if os.environ.get("PYQT_MOCAP_RENDERER") != "opengl":
+    import matplotlib
 
-matplotlib.use("QtAgg")
+    matplotlib.use("QtAgg")
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
-from matplotlib.figure import Figure
-from matplotlib.lines import Line2D
+    from matplotlib.backends.backend_qtagg import (
+        FigureCanvasQTAgg,
+        NavigationToolbar2QT,
+    )
+    from matplotlib.figure import Figure
+    from matplotlib.lines import Line2D
 from PyQt6.QtCore import QSettings, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
@@ -613,6 +620,8 @@ class HumanCanvas(QWidget):
 class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWindow):
     """Main GUI, UDP socket owner, and bridge to the pure motion model."""
 
+    canvas_class = HumanCanvas
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("MPU6050 UDP — PyQt motion capture")
@@ -778,7 +787,7 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
         outer.addLayout(recording_bar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.human_canvas = HumanCanvas()
+        self.human_canvas = self.canvas_class()
         splitter.addWidget(self.human_canvas)
         monitor_panel = QWidget()
         monitor_layout = QVBoxLayout(monitor_panel)
