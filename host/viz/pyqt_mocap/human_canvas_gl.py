@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 from pyqtgraph.opengl import (
     GLGridItem,
     GLLinePlotItem,
+    GLMeshItem,
     GLScatterPlotItem,
     GLTextItem,
     GLViewWidget,
@@ -30,13 +31,6 @@ TRACKED_COLORS = {
     "shoulder.R": (0.88, 0.55, 0.41, 1.0),
     "forearm.R": (0.94, 0.68, 0.53, 1.0),
 }
-TRACKED_WIDTHS = {
-    "spine": 5.0,
-    "shoulder.L": 5.0,
-    "forearm.L": 4.0,
-    "shoulder.R": 5.0,
-    "forearm.R": 4.0,
-}
 AXIS_COLORS = (
     (0.84, 0.17, 0.17, 1.0),
     (0.16, 0.62, 0.33, 1.0),
@@ -50,6 +44,58 @@ def _segment_positions(segments) -> np.ndarray:
     return np.asarray(positions, dtype=np.float32).reshape((-1, 3))
 
 
+def bone_mesh(start, end, frame=None):
+    """Blender-like octahedron: joint tips and a square near the bone head.
+
+    The frame keeps the cross-section attached to the moving segment. All
+    coordinates remain in the model's space; this changes rendering only.
+    """
+    start, end = np.asarray(start, dtype=float), np.asarray(end, dtype=float)
+    delta = end - start
+    length = float(np.linalg.norm(delta))
+    if not np.isfinite(length) or length < 1e-8:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint32)
+    direction = delta / length
+    basis = np.eye(3) if frame is None else np.asarray(frame, dtype=float)
+    reference = basis[:, np.argmin(np.abs(direction @ basis))]
+    u = np.cross(direction, reference)
+    u /= np.linalg.norm(u)
+    v = np.cross(direction, u)
+    radius = min(length * .12, .045)
+    center = start + delta * .20
+    vertices = np.asarray((start, end, center + radius * u, center + radius * v,
+                           center - radius * u, center - radius * v), dtype=np.float32)
+    faces = []
+    for index in range(4):
+        a, b = 2 + index, 2 + (index + 1) % 4
+        faces.extend(((0, b, a), (1, a, b)))
+    return vertices, np.asarray(faces, dtype=np.uint32)
+
+
+def _static_bone_segments(pose):
+    """Split the model's shoulder bar into two outward-facing clavicles."""
+    left, right = pose.static_segments[1]
+    center = (left + right) * .5
+    return (pose.static_segments[0], (center, left), (center, right),
+            *pose.static_segments[2:])
+
+
+def _face_colors(color, count):
+    # Stable facet shading, independent of driver-specific scene lighting.
+    colors = np.tile(color, (count, 1)).astype(np.float32)
+    shades = np.resize(np.array((1., .90, .78, .70, .88, .80, .96, .85)), count)
+    colors[:, :3] *= shades[:, None]
+    return colors
+
+
+def _bone_item(start, end, color):
+    vertices, faces = bone_mesh(start, end)
+    return GLMeshItem(vertexes=vertices, faces=faces, color=color,
+                      faceColors=_face_colors(color, len(faces)),
+                      smooth=False, computeNormals=False, drawEdges=True,
+                      edgeColor=(.18, .24, .30, 1.), glOptions="opaque")
+
+
 class OpenGLHumanCanvas(QWidget):
     """Interactive OpenGL skeleton view with the same API as HumanCanvas."""
 
@@ -60,7 +106,7 @@ class OpenGLHumanCanvas(QWidget):
         layout.setSpacing(4)
 
         heading = QHBoxLayout()
-        title = QLabel("<b>Скелетная модель · OpenGL</b>")
+        title = QLabel("<b>Скелетная модель · OpenGL · Octahedral</b>")
         title.setAccessibleName("Скелетная модель OpenGL")
         legend = QLabel(
             '<span style="color:#d52b2b">X</span> · '
@@ -80,7 +126,8 @@ class OpenGLHumanCanvas(QWidget):
         self.view.setCameraPosition(distance=3.3, elevation=11.0, azimuth=-90.0)
         layout.addWidget(self.view, 1)
 
-        self.tracked_lines: dict[str, GLLinePlotItem] = {}
+        self.tracked_bones: dict[str, GLMeshItem] = {}
+        self.static_bones: list[GLMeshItem] = []
         self.axis_lines: tuple[GLLinePlotItem, GLLinePlotItem, GLLinePlotItem]
         self.segment_labels: dict[str, GLTextItem] = {}
         self._create_scene()
@@ -98,26 +145,14 @@ class OpenGLHumanCanvas(QWidget):
 
         for name in SEGMENT_NAMES:
             start, end = pose.tracked_segments[name]
-            line = GLLinePlotItem(
-                pos=np.asarray((start, end), dtype=np.float32),
-                color=TRACKED_COLORS[name],
-                width=TRACKED_WIDTHS[name],
-                mode="lines",
-                antialias=True,
-                glOptions="translucent",
-            )
-            self.tracked_lines[name] = line
-            self.view.addItem(line)
+            bone = _bone_item(start, end, TRACKED_COLORS[name])
+            self.tracked_bones[name] = bone
+            self.view.addItem(bone)
 
-        self.static_lines = GLLinePlotItem(
-            pos=_segment_positions(pose.static_segments),
-            color=(0.25, 0.33, 0.42, 1.0),
-            width=3.0,
-            mode="lines",
-            antialias=True,
-            glOptions="translucent",
-        )
-        self.view.addItem(self.static_lines)
+        for start, end in _static_bone_segments(pose):
+            bone = _bone_item(start, end, (0.38, 0.46, 0.55, 1.0))
+            self.static_bones.append(bone)
+            self.view.addItem(bone)
 
         self.joints = GLScatterPlotItem(
             pos=np.asarray(pose.joints, dtype=np.float32),
@@ -177,13 +212,19 @@ class OpenGLHumanCanvas(QWidget):
         for name, (start, end) in pose.tracked_segments.items():
             color = list(TRACKED_COLORS[name])
             if name not in enabled:
-                color[3] = 0.22
-            self.tracked_lines[name].setData(
-                pos=np.asarray((start, end), dtype=np.float32),
+                # Opaque muted bones keep depth testing reliable.
+                color = [0.70, 0.74, 0.79, 1.0]
+            vertices, faces = bone_mesh(start, end, pose.axis_frames[name])
+            self.tracked_bones[name].setMeshData(
+                vertexes=vertices, faces=faces,
                 color=tuple(color),
+                faceColors=_face_colors(color, len(faces)),
             )
 
-        self.static_lines.setData(pos=_segment_positions(pose.static_segments))
+        for bone, (start, end) in zip(self.static_bones, _static_bone_segments(pose), strict=True):
+            vertices, faces = bone_mesh(start, end)
+            bone.setMeshData(vertexes=vertices, faces=faces,
+                             faceColors=_face_colors(bone.opts["color"], len(faces)))
         self.joints.setData(pos=np.asarray(pose.joints, dtype=np.float32))
         self.head.setData(pos=np.asarray((pose.head_center,), dtype=np.float32))
 
