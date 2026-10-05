@@ -3,12 +3,12 @@
 Система захвата движений верхней части тела на пяти MPU6050, подключённых к
 ESP32 через мультиплексор TCA9548A. Контроллер вычисляет кватернионы с помощью
 DMP и передаёт согласованные кадры по UDP. На компьютере доступны основной
-PyQt-визуализатор, диагностические кубики и демонстрационная Blender-сцена.
+PyQt-визуализатор на OpenGL и демонстрационная Blender-сцена.
 
 Основной поддерживаемый тракт проекта:
 
 ```text
-MPU6050 ×5 → TCA9548A → ESP32 → UDP → PyQt / Cube Viewer / Blender
+MPU6050 ×5 → TCA9548A → ESP32 → UDP → PyQtGraph OpenGL / Blender
 ```
 
 ## Структура проекта
@@ -23,7 +23,6 @@ ImuMotionCapture/
 ├── host/
 │   ├── viz/
 │   │   ├── pyqt_mocap/            # основное приложение захвата движений
-│   │   ├── cube_viewer/           # диагностическая визуализация кубиками
 │   │   └── blender/               # демонстрационная сцена и её сборщик
 │   ├── storage/                   # экспериментальный модуль PostgreSQL
 │   └── tools/                     # вспомогательные утилиты
@@ -57,13 +56,13 @@ python -m pyqt_mocap
 
 ```bash
 pyqt-mocap
-cube-viewer
+pyqt-mocap-gl
 ```
 
 На Ubuntu/Debian для GUI могут понадобиться системные пакеты:
 
 ```bash
-sudo apt install libxcb-cursor0 python3-tk
+sudo apt install libxcb-cursor0
 ```
 
 Все Python-настройки сведены в корневой `pyproject.toml`. Дополнительные группы
@@ -129,9 +128,8 @@ A-поза → А → У → Ж → Е → Д → A-поза, один круг 
 python -m pyqt_mocap
 ```
 
-Второй вариант использует PyQtGraph и аппаратный OpenGL для отрисовки человека.
-Он сохраняет тот же UDP-протокол, настройки и калибровку, но лучше подходит для
-ноутбуков, на которых Matplotlib создаёт большую задержку:
+Приложение использует PyQtGraph и аппаратный OpenGL для отрисовки человека.
+Альтернативная команда запуска того же приложения:
 
 ```bash
 python -m pyqt_mocap.mpu_udp_viewer_gl
@@ -144,35 +142,12 @@ python -m pyqt_mocap.mpu_udp_viewer_gl
 В PowerShell из корня репозитория выполните:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build_windows.ps1
-```
-
-Скрипт создаёт виртуальное окружение `.venv`, если его ещё нет, устанавливает
-зависимости сборки и формирует оконное приложение без консоли непосредственно
-из пакета `host/viz/pyqt_mocap`. Готовый файл находится в
-`dist\pyqt_mocap\pyqt_mocap.exe`. Для переноса приложения нужен весь каталог
-`dist\pyqt_mocap`. Для повторной сборки без переустановки зависимостей добавьте
-параметр `-SkipInstall`.
-
-Для OpenGL-варианта используется отдельный скрипт:
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\packaging\build_windows_gl.ps1
 ```
 
-Он создаёт папочную сборку `dist\pyqt_mocap_gl` с файлом
+Скрипт создаёт папочную сборку `dist\pyqt_mocap_gl` с файлом
 `pyqt_mocap_gl.exe`. Переносить нужно весь каталог вместе с `_internal`.
-
-### Cube Viewer
-
-Диагностическое Tk/Matplotlib-приложение показывает каждый датчик отдельным
-кубом. Оно удобно для проверки UDP, нумерации каналов и направлений вращения:
-
-```bash
-python -m cube_viewer
-```
-
-Подробности: [`host/viz/cube_viewer/README.md`](host/viz/cube_viewer/README.md).
+Для повторной сборки без переустановки зависимостей добавьте `-SkipInstall`.
 
 ### Blender
 
@@ -183,8 +158,8 @@ python -m cube_viewer
 Инструкции по запуску, калибровке и воспроизводимой пересборке:
 [`host/viz/blender/udp_receiver/README.md`](host/viz/blender/udp_receiver/README.md).
 
-ESP32 передаёт поток последнему зарегистрированному UDP-клиенту. Поэтому PyQt,
-Cube Viewer и Blender следует подключать к контроллеру по очереди.
+ESP32 передаёт поток последнему зарегистрированному UDP-клиенту. Поэтому
+PyQt и Blender следует подключать к контроллеру по очереди.
 
 ## Модуль БД
 
@@ -232,7 +207,7 @@ python tools/benchmarks/udp_frequency/analyze_frequency.py
 ```
 
 Скрипт измерения последовательно запрашивает частоты, сохраняет времена прихода
-кадров в CSV, а анализатор рассчитывает фактическую частоту и строит график.
+кадров в CSV, а анализатор рассчитывает фактическую частоту и сохраняет статистику в CSV.
 
 ## Документация
 
@@ -240,5 +215,4 @@ python tools/benchmarks/udp_frequency/analyze_frequency.py
 - [протокол основной прошивки](sensors/esp32/DMP_with_TCA9548A_udp/README.md);
 - [визуализаторы](host/viz/README.md);
 - [PyQt-приложение и калибровка](host/viz/pyqt_mocap/README.md);
-- [Cube Viewer](host/viz/cube_viewer/README.md);
 - [Blender-демонстрация](host/viz/blender/udp_receiver/README.md).

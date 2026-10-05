@@ -5,27 +5,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import os
 import queue
 import socket
 import sys
 import threading
 import time
-from typing import Collection, Final, Mapping
+from typing import Final
 
-# The OpenGL launcher skips the legacy renderer so its distribution and startup
-# do not pay the Matplotlib cost. The classic launcher keeps the original path.
-if os.environ.get("PYQT_MOCAP_RENDERER") != "opengl":
-    import matplotlib
-
-    matplotlib.use("QtAgg")
-
-    from matplotlib.backends.backend_qtagg import (
-        FigureCanvasQTAgg,
-        NavigationToolbar2QT,
-    )
-    from matplotlib.figure import Figure
-    from matplotlib.lines import Line2D
 from PyQt6.QtCore import QSettings, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
@@ -64,6 +50,7 @@ from .calibration import (
     save_profile,
 )
 from .guided_dialog import GuidedCalibrationDialog
+from .human_canvas_gl import OpenGLHumanCanvas
 from .mocap_core import (
     AXIS_MAPPING_REVISION,
     DEFAULT_AXIS_MAPS,
@@ -75,7 +62,6 @@ from .mocap_core import (
     SENSOR_MAPPING_REVISION,
     MotionCaptureModel,
     axis_map_matrix,
-    compute_body_pose,
 )
 
 
@@ -425,206 +411,14 @@ class SettingsDialog(QDialog):
             self.accept()
 
 
-class HumanCanvas(QWidget):
-    """Matplotlib 3D skeleton with tracked segment names and local axes."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.figure = Figure(figsize=(8.5, 7.0), dpi=100)
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.axes = self.figure.add_subplot(111, projection="3d")
-        layout.addWidget(self.canvas, 1)
-        layout.addWidget(NavigationToolbar2QT(self.canvas, self))
-        self.tracked_lines: dict[str, Line2D] = {}
-        self.static_lines: list[Line2D] = []
-        self.axis_lines: dict[str, tuple[Line2D, Line2D, Line2D]] = {}
-        self.segment_labels: dict[str, object] = {}
-        self._configure_plot()
-        self._create_artists()
-
-    def _configure_plot(self) -> None:
-        self.figure.patch.set_facecolor("#f3f6fa")
-        self.axes.set_facecolor("#f3f6fa")
-        self.axes.set_title(
-            "Скелетная модель и ориентация сегментов",
-            pad=16,
-            fontsize=13,
-            fontweight="bold",
-        )
-        self.axes.set(
-            xlim=(-1.05, 1.05),
-            ylim=(-0.78, 0.78),
-            zlim=(0.0, 1.95),
-            xlabel="X — вправо",
-            ylabel="Y — вперёд",
-            zlabel="Z — вверх",
-        )
-        self.axes.set_box_aspect((2.1, 1.55, 1.95))
-        # Front view: the subject's anatomical left is on the viewer's right.
-        self.axes.view_init(elev=13, azim=108)
-        self.axes.grid(True, alpha=0.24)
-        self.axes.plot(
-            (-0.65, 0.65, 0.65, -0.65, -0.65),
-            (-0.45, -0.45, 0.35, 0.35, -0.45),
-            (0.0, 0.0, 0.0, 0.0, 0.0),
-            color="#aeb9c7",
-            linewidth=1.0,
-            alpha=0.65,
-        )
-        self.axes.legend(
-            handles=(
-                Line2D((0,), (0,), color="#d52b2b", lw=2.5, label="X"),
-                Line2D((0,), (0,), color="#2a9d55", lw=2.5, label="Y"),
-                Line2D((0,), (0,), color="#2676d2", lw=2.5, label="Z"),
-            ),
-            title="Локальные оси",
-            loc="upper left",
-        )
-
-    def _create_artists(self) -> None:
-        pose = compute_body_pose({})
-        colors = {
-            "spine": "#e08c68",
-            "shoulder.L": "#e08c68",
-            "forearm.L": "#efad86",
-            "shoulder.R": "#e08c68",
-            "forearm.R": "#efad86",
-        }
-        widths = {
-            "spine": 5.0,
-            "shoulder.L": 5.0,
-            "forearm.L": 4.0,
-            "shoulder.R": 5.0,
-            "forearm.R": 4.0,
-        }
-        for name in SEGMENT_NAMES:
-            start, end = pose.tracked_segments[name]
-            self.tracked_lines[name] = self.axes.plot(
-                (start[0], end[0]),
-                (start[1], end[1]),
-                (start[2], end[2]),
-                color=colors[name],
-                linewidth=widths[name],
-                solid_capstyle="round",
-                zorder=5,
-            )[0]
-        for start, end in pose.static_segments:
-            self.static_lines.append(
-                self.axes.plot(
-                    (start[0], end[0]),
-                    (start[1], end[1]),
-                    (start[2], end[2]),
-                    color="#40536a",
-                    linewidth=3.4,
-                    solid_capstyle="round",
-                    zorder=3,
-                )[0]
-            )
-        self.joints = self.axes.scatter(
-            [point[0] for point in pose.joints],
-            [point[1] for point in pose.joints],
-            [point[2] for point in pose.joints],
-            s=28,
-            color="#26384d",
-            depthshade=True,
-            zorder=6,
-        )
-        self.head = self.axes.scatter(
-            (pose.head_center[0],),
-            (pose.head_center[1],),
-            (pose.head_center[2],),
-            s=260,
-            color="#f3f6fa",
-            edgecolor="#26384d",
-            linewidth=2.0,
-            depthshade=True,
-            zorder=7,
-        )
-        for name in SEGMENT_NAMES:
-            self.axis_lines[name] = tuple(
-                self.axes.plot([], [], [], color=color, linewidth=2.2, zorder=9)[0]
-                for color in ("#d52b2b", "#2a9d55", "#2676d2")
-            )  # type: ignore[assignment]
-            origin = pose.axis_origins[name]
-            self.segment_labels[name] = self.axes.text(
-                origin[0],
-                origin[1],
-                origin[2],
-                name,
-                fontsize=8,
-                color="#172535",
-                ha="left",
-                va="bottom",
-                zorder=10,
-            )
-        self.update_pose({}, DEFAULT_SENSOR_MAPPING)
-
-    def update_pose(
-        self,
-        orientations: Mapping[str, object],
-        sensor_mapping: Mapping[str, int],
-        enabled_segments: Collection[str] = DEFAULT_ENABLED_SEGMENTS,
-    ) -> None:
-        pose = compute_body_pose(orientations)  # type: ignore[arg-type]
-        enabled = set(enabled_segments)
-        for name, (start, end) in pose.tracked_segments.items():
-            self.tracked_lines[name].set_data_3d(
-                (start[0], end[0]), (start[1], end[1]), (start[2], end[2])
-            )
-        for line, (start, end) in zip(
-            self.static_lines, pose.static_segments, strict=True
-        ):
-            line.set_data_3d(
-                (start[0], end[0]), (start[1], end[1]), (start[2], end[2])
-            )
-        self.joints._offsets3d = (
-            [point[0] for point in pose.joints],
-            [point[1] for point in pose.joints],
-            [point[2] for point in pose.joints],
-        )
-        self.head._offsets3d = (
-            (pose.head_center[0],),
-            (pose.head_center[1],),
-            (pose.head_center[2],),
-        )
-        for name in SEGMENT_NAMES:
-            active = name in enabled
-            show_axes = active or name == "spine"
-            self.tracked_lines[name].set_alpha(1.0 if active else 0.22)
-            for line in self.axis_lines[name]:
-                line.set_visible(show_axes)
-                line.set_alpha(1.0 if active else 0.55)
-            label = self.segment_labels[name]
-            label.set_visible(show_axes)
-            label.set_alpha(1.0 if active else 0.65)
-            if not show_axes:
-                continue
-            origin = pose.axis_origins[name]
-            frame = pose.axis_frames[name]
-            for axis_index, line in enumerate(self.axis_lines[name]):
-                end = origin + frame[:, axis_index] * 0.17
-                line.set_data_3d(
-                    (origin[0], end[0]),
-                    (origin[1], end[1]),
-                    (origin[2], end[2]),
-                )
-            state = "" if active else ""
-            label.set_text(f"{name}  [S{sensor_mapping[name]}{state}]")
-            label.set_position((origin[0] + 0.025, origin[1] + 0.025))
-            label.set_3d_properties(origin[2] + 0.035)
-        self.canvas.draw_idle()
-
-
 class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWindow):
     """Main GUI, UDP socket owner, and bridge to the pure motion model."""
 
-    canvas_class = HumanCanvas
+    canvas_class = OpenGLHumanCanvas
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("MPU6050 UDP — PyQt motion capture")
+        self.setWindowTitle("MPU6050 UDP — PyQtGraph OpenGL motion capture")
         self.resize(1500, 900)
         self.setMinimumSize(1080, 680)
         self.settings_store = QSettings("Neuromorph", "MPU UDP Viewer Guided")
@@ -1222,7 +1016,7 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
 def main() -> int:
     app = QApplication(sys.argv)
     app.setOrganizationName("Neuromorph")
-    app.setApplicationName("MPU UDP Viewer")
+    app.setApplicationName("MPU UDP Viewer OpenGL")
     window = MotionCaptureWindow()
     window.show()
     return app.exec()
