@@ -639,7 +639,7 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
         self.receiver_thread: threading.Thread | None = None
         self.receiver_stop: threading.Event | None = None
         self.send_lock = threading.Lock()
-        self.events: queue.Queue[tuple[str, float, object, object, float]] = queue.Queue()
+        self.events: queue.Queue[tuple[str, float, object, object, int, object]] = queue.Queue()
         self.settings_dialog: SettingsDialog | None = None
         self.guided_dialog: GuidedCalibrationDialog | None = None
         self.last_calibration_result: CalibrationResult | None = None
@@ -1004,9 +1004,18 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
                 continue
             except OSError as error:
                 if not stop_event.is_set() and self.sock is sock:
-                    self.events.put(("error", time.time(), str(error), None, time.monotonic()))
+                    self.events.put(("error", time.time(), str(error), None, time.monotonic_ns(), None))
                 break
-            self.events.put(("packet", time.time(), payload, address, time.monotonic()))
+            received_ns, context = self._stamp_packet()
+            self.events.put(("packet", time.time(), payload, address, received_ns, context))
+
+    def _stamp_packet(self) -> tuple[int, object]:
+        """Acquisition hook, called immediately after recvfrom (no GUI access)."""
+        return time.monotonic_ns(), None
+
+    def _on_datagram_processed(self, raw, address, wall_timestamp, received_ns,
+                               result, context) -> None:
+        """Optional acquisition consumer, independent of the render timer."""
 
     def send_command(self, command: str, warn: bool = True) -> bool:
         command = command.strip()
@@ -1046,7 +1055,9 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
             )
             return
         self.streaming_requested = True
-        self.model.request_neutral()
+        needs_reference = set(self.model.neutral_orientation) != set(SEGMENT_NAMES)
+        if needs_reference:
+            self.model.request_neutral()
         self.needs_redraw = True
         self.send_command(f"SET_RATE {self.config.stream_rate_hz}", warn=False)
         current_sock = self.sock
@@ -1057,7 +1068,8 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
             else None,
         )
         self.statusBar().showMessage(
-            "START: примите A-позу и не двигайтесь до захвата общего кадра", 7000
+            ("START: примите A-позу и не двигайтесь до захвата общего кадра" if needs_reference
+             else "START: поток возобновлён, калибровка сохранена"), 7000
         )
 
     def stop_stream(self) -> None:
@@ -1123,7 +1135,7 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
     def _process_events(self) -> None:
         for _ in range(250):
             try:
-                event_type, timestamp, payload, address, received_s = self.events.get_nowait()
+                event_type, timestamp, payload, address, received_ns, context = self.events.get_nowait()
             except queue.Empty:
                 break
             if event_type == "error":
@@ -1139,7 +1151,9 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
                 f"[{self._format_time(timestamp)}] RX {remote[0]}:{remote[1]} "
                 f"({len(raw)} B)\n{text}"
             )
-            result = self.model.handle_datagram(raw, time.monotonic())
+            received_s = received_ns / 1e9
+            result = self.model.handle_datagram(raw, received_s)
+            self._on_datagram_processed(raw, remote, timestamp, received_ns, result, context)
             self.needs_redraw = self.needs_redraw or result.pose_changed
             if result.published and not self.model.neutral_pending:
                 self.capture_bvh_frame(received_s)

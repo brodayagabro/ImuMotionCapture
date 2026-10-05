@@ -1,0 +1,138 @@
+diff --git a/demo/demo-py/MocapApi/mocap_api.egg-info/PKG-INFO b/demo/demo-py/MocapApi/mocap_api.egg-info/PKG-INFO
+index bd462ede23de8ba47bebdd86f05e46f52910a4da..4d1c5558e01d880102483f49c33e0a90b384d987 100644
+--- a/demo/demo-py/MocapApi/mocap_api.egg-info/PKG-INFO
++++ b/demo/demo-py/MocapApi/mocap_api.egg-info/PKG-INFO
+@@ -1,5 +1,5 @@
+ Metadata-Version: 2.4
+ Name: mocap_api
+-Version: 0.1.4
++Version: 0.1.5
+ Summary: mocap_api with dynamic library support
+ Dynamic: summary
+diff --git a/demo/demo-py/MocapApi/mocap_api/mocap_api.py b/demo/demo-py/MocapApi/mocap_api/mocap_api.py
+index 0daedeb47c95e50804c64c3af8834385bbca409c..3546a108a78c37455ea414534ad036096b12ef3b 100644
+--- a/demo/demo-py/MocapApi/mocap_api/mocap_api.py
++++ b/demo/demo-py/MocapApi/mocap_api/mocap_api.py
+@@ -558,7 +558,6 @@ class MCPAvatar(object):
+     second = c_uint32(0)  
+     millisecond = c_uint32(0)  
+     err = self.api.contents.GetAvatarPostureTime(byref(hour), byref(minute), byref(second), byref(millisecond), self.handle)
+-    print(f"get_avatar_posture_time err: {err}")
+     if err != MCPError.NoError:
+       raise RuntimeError('Can not get avatar posture time: {0}'.format(MCPError._fields[err]))
+     return hour.value, minute.value, second.value, millisecond.value
+@@ -1778,4 +1777,4 @@ def _handle_tracker_data():
+             quaternion = MCPPWRH.get_PWR_quaternion()
+             print('timestamp',timestamp,'id:', id, 'status:', status, 'position:', position, 'quaternion:', quaternion)
+ if __name__ == '__main__':
+-  test_mocap_api()
+\ No newline at end of file
++  test_mocap_api()
+diff --git a/demo/demo-py/mocap_demo.py b/demo/demo-py/mocap_demo.py
+index bd633839a5b8003dd0571cf2144fabd9417e54fb..5fc99b0df06506ccfbfd3ee94c3f2911c1bc8f1d 100644
+--- a/demo/demo-py/mocap_demo.py
++++ b/demo/demo-py/mocap_demo.py
+@@ -1,4 +1,5 @@
+ from MocapApi.mocap_api import *
++import time
+ 
+ def get_event_type_name(event_type_value):
+     """
+@@ -34,6 +35,9 @@ class MocapAxisDemo:
+         self.app = None
+         self.running = False
+         self.prev_posture_time_ms = None
++        self.frames_seen = 0
++        self.timestamp_warning_shown = False
++        self.last_report_time = 0.0
+     
+     def start(self, udp_port=7012):
+         """
+@@ -46,9 +50,14 @@ class MocapAxisDemo:
+         self.app = MCPApplication()
+         settings = MCPSettings()
+         settings.set_udp(udp_port)
++        # Keep these settings aligned with the native C++ demo.
++        settings.set_bvh_data(MCPBvhData.Binary)
++        settings.set_bvh_transformation(MCPBvhDisplacement.Enable)
+         settings.set_bvh_rotation(MCPBvhRotation.XYZ)
+         self.app.set_settings(settings)
+-        self.app.open()
++        opened, message = self.app.open()
++        if not opened:
++            raise RuntimeError(f"Could not open Mocap application: {message}")
+         print(f"Mocap application initialized, UDP port: {udp_port}")
+         
+         self.running = True
+@@ -73,12 +82,28 @@ class MocapAxisDemo:
+         """
+         avatar = MCPAvatar(evt.event_data.avatar_handle)
+         joints = avatar.get_joints()  # Get all joint data
+-        hour, minute, second, millisecond = avatar.get_avatar_posture_time()
+-        current_time_ms = ((hour * 3600 + minute * 60 + second) * 1000 + millisecond)
+-        if self.prev_posture_time_ms is not None:
+-            delta_ms = current_time_ms - self.prev_posture_time_ms
+-            print(f"=====Frame interval: {delta_ms} ms")
+-        self.prev_posture_time_ms = current_time_ms
++        try:
++            hour, minute, second, millisecond = avatar.get_avatar_posture_time()
++            current_time_ms = ((hour * 3600 + minute * 60 + second) * 1000 + millisecond)
++        except RuntimeError as error:
++            # Some streams provide posture updates without a usable timestamp.
++            current_time_ms = None
++            if not self.timestamp_warning_shown:
++                print(f"Posture time unavailable ({error}); reading joint data anyway.")
++                self.timestamp_warning_shown = True
++
++        if current_time_ms is not None:
++            if self.prev_posture_time_ms is not None:
++                delta_ms = current_time_ms - self.prev_posture_time_ms
++                print(f"=====Frame interval: {delta_ms} ms")
++            self.prev_posture_time_ms = current_time_ms
++
++        self.frames_seen += 1
++        now = time.monotonic()
++        report_frame = self.frames_seen == 1 or now - self.last_report_time >= 1.0
++        if report_frame:
++            self.last_report_time = now
++            print(f"AvatarUpdated frame {self.frames_seen}: {len(joints)} joints")
+         for joint in joints:
+             link_name = joint.get_name()  # Get joint name
+             
+@@ -86,12 +111,26 @@ class MocapAxisDemo:
+             position = joint.get_local_position()  # Get joint position
+             rotation = joint.get_local_rotation()  # Get joint rotation
+             
+-            # print(f"avatar data : joint: {link_name}, position: {position}, rotation: {rotation}")
++            if report_frame and link_name in ("Hips", "Spine", "Head", "LeftHand", "RightHand"):
++                print(f"{link_name}: position={position}, rotation={rotation}")
++
++            # Grounding metadata is not included in every BVH stream. It is
++            # optional and must not abort processing of the actual joint pose.
++            try:
++                grounding_state = joint.get_grounding_state()
++            except RuntimeError as error:
++                if "NoneMessage" not in str(error):
++                    raise
++                continue
+ 
+-            grounding_state = joint.get_grounding_state()  # Get joint grounding state
+             if grounding_state == 0:
++                try:
++                    groundable_points = joint.get_groundable_points()
++                except RuntimeError as error:
++                    if "NoneMessage" not in str(error):
++                        raise
++                    continue
+                 print(f"avatar data : joint: {link_name}, grounding_state: {grounding_state}")
+-                groundable_points = joint.get_groundable_points()  # Get joint groundable points
+                 print(f"avatar data : joint: {link_name}, groundable_points: {groundable_points}")
+ 
+ 
+@@ -109,4 +148,4 @@ if __name__ == "__main__":
+     # Create and run demo instance
+     demo = MocapAxisDemo()
+     print("Starting Mocap Axis Studio demo...") 
+-    demo.start()
+\ No newline at end of file
++    demo.start()

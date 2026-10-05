@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
@@ -12,6 +13,7 @@ from .calibration import (
     load_profile,
     profile_document,
     save_profile,
+    restore_profile_calibration,
 )
 from .guided_dialog import GuidedCalibrationDialog
 from .mocap_core import (
@@ -56,7 +58,7 @@ class CalibrationWindowMixin:
     def open_semaphore_calibration(self) -> None:
         self.open_guided_calibration(semaphore=True)
 
-    def open_guided_calibration(self, checked=False, *, semaphore=False) -> None:
+    def open_guided_calibration(self, checked=False, *, semaphore=False, t_pose_only=False) -> None:
         if self.bvh_active:
             self.stop_bvh_recording()
         if self.sock is None or not self.streaming_requested:
@@ -73,6 +75,7 @@ class CalibrationWindowMixin:
             return
         dialog = GuidedCalibrationDialog(
             self._calibration_snapshot, self, semaphore=semaphore,
+            t_pose_only=t_pose_only,
             preferred_axis_maps=dict(self.config.axis_maps),
             prior_alignment={name: value.copy() for name, value
                              in self.model.axis_alignment_quaternion.items()},
@@ -291,9 +294,13 @@ class CalibrationWindowMixin:
             if len(set(sensor_ids)) != len(sensor_ids):
                 raise ValueError("каждому сегменту нужен отдельный ID датчика")
             self.apply_configuration(new_config)
-            self.model.set_axis_alignment(alignment_quaternions)
-            self.model.set_drift_compensation(drift_rates)
-            self.model.request_neutral()
+            restored_reference = False
+            if mapping_migrated or axis_mapping_migrated:
+                self.model.set_axis_alignment(alignment_quaternions)
+                self.model.set_drift_compensation(drift_rates)
+                self.model.request_neutral()
+            else:
+                restored_reference = restore_profile_calibration(self.model, document, reference_s=time.monotonic())
         except (KeyError, OSError, TypeError, ValueError) as error:
             QMessageBox.critical(self, "Ошибка импорта", str(error))
             return
@@ -313,6 +320,9 @@ class CalibrationWindowMixin:
                 "Если датчик корпуса используется, повторите калибровку."
             )
             monitor_state = "spine axis mapping migrated; calibration required"
+        elif restored_reference:
+            status_message = "Профиль и сохранённая A-поза восстановлены. После перезапуска датчиков выполните калибровку заново."
+            monitor_state = "saved calibration reference restored"
         else:
             status_message = (
                 "Профиль импортирован. Примите A-позу: она нужна заново после "

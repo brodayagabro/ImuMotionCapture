@@ -1,0 +1,11 @@
+{
+  "repetitions": 3,
+  "timing": {"prepare": 2.0, "word_preview": 1.0, "transition": 0.4, "hold": 0.8, "post_trial": 1.5, "inter_trial": 1.5},
+  "randomize_words": true,
+  "mirror_mode": true,
+  "neutral_pose": {"left_angle_deg": 270, "right_angle_deg": 270},
+  "blocks": ["lower", "upper"],
+  "word_files": {"lower": "lower_words.json", "upper": "upper_words.json"},
+  "training_words": ["ВОДА", "БАТОН", "ЖУК", "ХМЕЛЬ"],
+  "sessions_dir": "records/semaphore"
+}

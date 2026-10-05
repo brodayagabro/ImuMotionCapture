@@ -14,6 +14,19 @@ from typing import Final, Iterable, Mapping, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from .quaternion_utils import (
+    normalize_quaternion,
+    validate_input_quaternion,
+    quaternion_multiply,
+    quaternion_inverse,
+    quaternion_from_rotation_vector,
+    quaternion_to_matrix,
+    matrix_to_quaternion,
+    quaternion_slerp,
+)
+from .orientation_frames import SegmentCalibration
+
+
 
 Vector = NDArray[np.float64]
 Quaternion = NDArray[np.float64]
@@ -68,133 +81,12 @@ DEFAULT_AXIS_MAPS: Final = {
 }
 
 
-def normalize_quaternion(values: Iterable[float]) -> Quaternion:
-    """Return a finite unit quaternion in ``w, x, y, z`` order."""
-    quaternion = np.asarray(tuple(values), dtype=float)
-    if quaternion.shape != (4,):
-        raise ValueError("quaternion must contain exactly four values")
-    norm = float(np.linalg.norm(quaternion))
-    if norm < 1.0e-9 or not math.isfinite(norm):
-        raise ValueError("invalid quaternion norm")
-    return quaternion / norm
 
 
-def validate_input_quaternion(values: Iterable[float]) -> Quaternion:
-    """Validate an MPU sample with the same norm bounds as the Blender driver."""
-    quaternion = np.asarray(tuple(values), dtype=float)
-    if quaternion.shape != (4,):
-        raise ValueError("quaternion must contain exactly four values")
-    norm_squared = float(np.dot(quaternion, quaternion))
-    if not math.isfinite(norm_squared) or not 0.25 <= norm_squared <= 2.25:
-        raise ValueError("invalid sensor quaternion norm")
-    return quaternion / math.sqrt(norm_squared)
 
 
-def quaternion_multiply(left: Quaternion, right: Quaternion) -> Quaternion:
-    lw, lx, ly, lz = left
-    rw, rx, ry, rz = right
-    return normalize_quaternion(
-        (
-            lw * rw - lx * rx - ly * ry - lz * rz,
-            lw * rx + lx * rw + ly * rz - lz * ry,
-            lw * ry - lx * rz + ly * rw + lz * rx,
-            lw * rz + lx * ry - ly * rx + lz * rw,
-        )
-    )
 
 
-def quaternion_inverse(quaternion: Quaternion) -> Quaternion:
-    normalized = normalize_quaternion(quaternion)
-    return normalized * np.array((1.0, -1.0, -1.0, -1.0))
-
-
-def quaternion_from_rotation_vector(rotation_vector: Iterable[float]) -> Quaternion:
-    """Convert an axis-angle rotation vector in radians to a quaternion."""
-    vector = np.asarray(tuple(rotation_vector), dtype=float)
-    if vector.shape != (3,) or not np.all(np.isfinite(vector)):
-        raise ValueError("rotation vector must contain three finite values")
-    angle = float(np.linalg.norm(vector))
-    if angle < 1.0e-12:
-        return IDENTITY_QUATERNION.copy()
-    half_angle = angle * 0.5
-    xyz = vector / angle * math.sin(half_angle)
-    return normalize_quaternion((math.cos(half_angle), xyz[0], xyz[1], xyz[2]))
-
-
-def quaternion_to_matrix(quaternion: Quaternion) -> Matrix3:
-    w, x, y, z = normalize_quaternion(quaternion)
-    return np.array(
-        (
-            (1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)),
-            (2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)),
-            (2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)),
-        ),
-        dtype=float,
-    )
-
-
-def matrix_to_quaternion(matrix: Matrix3) -> Quaternion:
-    """Convert a proper 3x3 rotation matrix to a unit quaternion."""
-    trace = float(np.trace(matrix))
-    if trace > 0.0:
-        scale = math.sqrt(trace + 1.0) * 2.0
-        values = (
-            0.25 * scale,
-            (matrix[2, 1] - matrix[1, 2]) / scale,
-            (matrix[0, 2] - matrix[2, 0]) / scale,
-            (matrix[1, 0] - matrix[0, 1]) / scale,
-        )
-    else:
-        diagonal = np.diag(matrix)
-        index = int(np.argmax(diagonal))
-        if index == 0:
-            scale = math.sqrt(max(0.0, 1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2])) * 2.0
-            values = (
-                (matrix[2, 1] - matrix[1, 2]) / scale,
-                0.25 * scale,
-                (matrix[0, 1] + matrix[1, 0]) / scale,
-                (matrix[0, 2] + matrix[2, 0]) / scale,
-            )
-        elif index == 1:
-            scale = math.sqrt(max(0.0, 1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2])) * 2.0
-            values = (
-                (matrix[0, 2] - matrix[2, 0]) / scale,
-                (matrix[0, 1] + matrix[1, 0]) / scale,
-                0.25 * scale,
-                (matrix[1, 2] + matrix[2, 1]) / scale,
-            )
-        else:
-            scale = math.sqrt(max(0.0, 1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1])) * 2.0
-            values = (
-                (matrix[1, 0] - matrix[0, 1]) / scale,
-                (matrix[0, 2] + matrix[2, 0]) / scale,
-                (matrix[1, 2] + matrix[2, 1]) / scale,
-                0.25 * scale,
-            )
-    return normalize_quaternion(values)
-
-
-def quaternion_slerp(left: Quaternion, right: Quaternion, alpha: float) -> Quaternion:
-    if alpha <= 0.0:
-        return normalize_quaternion(left)
-    if alpha >= 1.0:
-        return normalize_quaternion(right)
-
-    start = normalize_quaternion(left)
-    target = normalize_quaternion(right)
-    dot = float(np.dot(start, target))
-    if dot < 0.0:
-        target = -target
-        dot = -dot
-    dot = min(1.0, max(-1.0, dot))
-    if dot > 0.9995:
-        return normalize_quaternion(start + alpha * (target - start))
-    angle = math.acos(dot)
-    sine = math.sin(angle)
-    return normalize_quaternion(
-        math.sin((1.0 - alpha) * angle) / sine * start
-        + math.sin(alpha * angle) / sine * target
-    )
 
 
 def axis_map_matrix(axis_spec: Sequence[str]) -> Matrix3:
@@ -271,6 +163,10 @@ class MotionCaptureModel:
             name: np.zeros(3, dtype=float) for name in SEGMENT_NAMES
         }
         self.drift_reference_s: float | None = None
+        # Incoming orientations are authoritative. A measured rate is diagnostic
+        # unless a caller explicitly opts into legacy host-side extrapolation.
+        self.drift_compensation_enabled = False
+        self.segment_calibrations: dict[str, SegmentCalibration] = {}
         self.segment_delta: dict[str, Quaternion] = {
             name: IDENTITY_QUATERNION.copy() for name in SEGMENT_NAMES
         }
@@ -324,6 +220,7 @@ class MotionCaptureModel:
         }
         self.drift_reference_s = None
         self.reset_tracking(clear_samples=True)
+        self.drift_compensation_enabled = False
 
     def set_enabled_segments(self, enabled_segments: Iterable[str]) -> None:
         """Track only selected segments and hold every other segment neutral."""
@@ -344,6 +241,7 @@ class MotionCaptureModel:
             self.sensor_counts.clear()
             self.active_sensor_id_mode = None
         self.neutral_orientation.clear()
+        self.segment_calibrations.clear()
         self.applied_generation.clear()
         self.neutral_pending = False
         self.segment_delta = {
@@ -352,6 +250,7 @@ class MotionCaptureModel:
 
     def request_neutral(self) -> None:
         self.neutral_orientation.clear()
+        self.segment_calibrations.clear()
         self.applied_generation.clear()
         self.segment_delta = {
             name: IDENTITY_QUATERNION.copy() for name in SEGMENT_NAMES
@@ -378,13 +277,36 @@ class MotionCaptureModel:
         self,
         alignment_quaternions: Mapping[str, Sequence[float]],
     ) -> None:
-        """Set continuous sensor-to-segment coordinate corrections."""
+        """Set the left-hand world alignment; mounting is derived from reference."""
         if set(alignment_quaternions) != set(SEGMENT_NAMES):
             raise ValueError("axis alignment must define all five body segments")
         self.axis_alignment_quaternion = {
             name: normalize_quaternion(alignment_quaternions[name])
             for name in SEGMENT_NAMES
         }
+        self._refresh_segment_calibrations()
+
+    def _refresh_segment_calibrations(self) -> None:
+        self.segment_calibrations = {
+            name: SegmentCalibration(
+                tuple(float(v) for v in self.axis_alignment_quaternion[name]),
+                tuple(float(v) for v in quaternion_multiply(
+                    quaternion_inverse(self.axis_alignment_quaternion[name]),
+                    quaternion_inverse(neutral))),
+            )
+            for name, neutral in self.neutral_orientation.items()
+        }
+        self._calibration_signature = self.calibration_signature()
+
+    def calibration_signature(self):
+        """State that must remain constant between explicit reference changes."""
+        return tuple((name, self.axis_maps[name], tuple(self.axis_alignment_quaternion[name]),
+                      tuple(self.neutral_orientation.get(name, ())), self.segment_calibrations.get(name))
+                     for name in SEGMENT_NAMES)
+
+    def assert_calibration_invariant(self):
+        if self.segment_calibrations and self.calibration_signature() != self._calibration_signature:
+            raise AssertionError("Calibration changed outside an explicit calibration/reference operation")
 
     def _mapped_segment_quaternion(
         self,
@@ -405,6 +327,7 @@ class MotionCaptureModel:
         neutral_raw_quaternions: Mapping[str, Sequence[float]],
         reference_s: float,
         alignment_quaternions: Mapping[str, Sequence[float]] | None = None,
+        *, apply_drift_compensation: bool = False,
     ) -> None:
         """Apply a three-pose result and use its averaged N-pose immediately."""
         self.configure(
@@ -415,6 +338,7 @@ class MotionCaptureModel:
         if alignment_quaternions is not None:
             self.set_axis_alignment(alignment_quaternions)
         self.set_drift_compensation(drift_rates_rad_s)
+        self.drift_compensation_enabled = bool(apply_drift_compensation)
         captured = {
             name: self._mapped_segment_quaternion(
                 name, neutral_raw_quaternions[name]
@@ -422,6 +346,7 @@ class MotionCaptureModel:
             for name in SEGMENT_NAMES
         }
         self.neutral_orientation = captured
+        self._refresh_segment_calibrations()
         self.drift_reference_s = float(reference_s)
         self.segment_delta = {
             name: IDENTITY_QUATERNION.copy() for name in SEGMENT_NAMES
@@ -564,6 +489,7 @@ class MotionCaptureModel:
             return False
 
         self.neutral_orientation = captured
+        self._refresh_segment_calibrations()
         self.drift_reference_s = float(sum(timestamps) / len(timestamps))
         self.segment_delta = {
             name: IDENTITY_QUATERNION.copy() for name in SEGMENT_NAMES
@@ -577,6 +503,7 @@ class MotionCaptureModel:
     def _update_segment_deltas(self) -> bool:
         if self.neutral_pending or set(self.neutral_orientation) != set(SEGMENT_NAMES):
             return False
+        self.assert_calibration_invariant()
         changed = False
         for segment_name, sensor_id in self.sensor_mapping.items():
             if segment_name not in self.enabled_segments:
@@ -584,18 +511,14 @@ class MotionCaptureModel:
             sample = self.latest_samples.get(sensor_id)
             if sample is None or self.applied_generation.get(segment_name) == sample.generation:
                 continue
-            current = self._mapped_segment_quaternion(
-                segment_name, sample.quaternion
-            )
-            if self.drift_reference_s is not None:
+            q_world_sensor = mapped_sensor_quaternion(sample.quaternion, self.axis_maps[segment_name])
+            target = self.segment_calibrations[segment_name].apply(q_world_sensor)
+            if self.drift_compensation_enabled and self.drift_reference_s is not None:
                 elapsed_s = max(0.0, sample.received_s - self.drift_reference_s)
                 drift = quaternion_from_rotation_vector(
                     self.drift_rate_rad_s[segment_name] * elapsed_s
                 )
-                current = quaternion_multiply(quaternion_inverse(drift), current)
-            target = quaternion_multiply(
-                current, quaternion_inverse(self.neutral_orientation[segment_name])
-            )
+                target = quaternion_multiply(quaternion_inverse(drift), target)
             self.segment_delta[segment_name] = quaternion_slerp(
                 self.segment_delta[segment_name], target, self.smooth_alpha
             )

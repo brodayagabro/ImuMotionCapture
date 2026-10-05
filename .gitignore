@@ -207,3 +207,14 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Raw motion-capture experiment sessions
+/records/
+/recordings/
+
+# Generated local outputs
+/output/
+
+# External Noitom SDK checkout; pinned revision and local patch are documented
+# in scripts/noitom_comparison/README.md.
+/scripts/MocapApi/

@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 analysis = [
     "pandas>=2.2,<4",
+    "scipy>=1.11,<2",
 ]
 db = [
     "asyncpg>=0.29,<1",
@@ -50,8 +51,11 @@ exclude = ["pyqt_mocap.tests*", "cube_viewer.tests*"]
 testpaths = [
     "host/viz/pyqt_mocap/tests",
     "host/viz/cube_viewer/tests",
+    "scripts/noitom_comparison/tests",
+    "scripts/experiments/semaphore/tests",
+    "scripts/diagnostics/orientation",
 ]
-pythonpath = ["host/viz", "host"]
+pythonpath = ["host/viz", "host", "."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]

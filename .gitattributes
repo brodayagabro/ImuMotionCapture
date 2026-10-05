@@ -1,0 +1,2 @@
+# Preserve SDK patch bytes and upstream context whitespace.
+scripts/noitom_comparison/patches/*.patch -text -whitespace

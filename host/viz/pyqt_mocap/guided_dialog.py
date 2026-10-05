@@ -1,4 +1,4 @@
-"""PyQt dialog for the guided A -> T -> forward -> P -> A workflow."""
+"""PyQt dialog for full, T-only and semaphore guided calibration workflows."""
 
 from __future__ import annotations
 
@@ -24,12 +24,14 @@ from .calibration import (
     CapturedPose,
     PoseRecorder,
     calibrate_five_poses,
+    captured_pose_document,
 )
 from .mocap_core import DEFAULT_AXIS_MAPS
 from .pose_preview import PosePreview
 from .semaphore_calibration import (
     SEMAPHORE_POSES, LABELS, INSTRUCTIONS, base_pose, calibrate_semaphore,
 )
+from .t_pose_calibration import T_POSE_NAMES, ReturnPoseMismatch, calibrate_t_pose
 
 
 Snapshot = Mapping[str, tuple[object, float, int]]
@@ -69,9 +71,10 @@ POSE_INSTRUCTIONS = {
 
 
 class GuidedCalibrationDialog(QDialog):
-    """Record five stationary pose windows and emit a calibration result."""
+    """Record the selected stationary pose sequence and emit a calibration result."""
 
     result_ready = pyqtSignal(object)
+    diagnostic_event = pyqtSignal(str, object)
 
     def __init__(
         self,
@@ -83,10 +86,18 @@ class GuidedCalibrationDialog(QDialog):
         preferred_axis_maps=None,
         prior_alignment=None,
         enabled_segments=None,
+        t_pose_only: bool = False,
     ) -> None:
         super().__init__(parent)
+        if semaphore and t_pose_only:
+            raise ValueError("Choose one calibration workflow")
         self.semaphore = semaphore
-        self.pose_names = SEMAPHORE_POSES if semaphore else POSE_NAMES
+        self.t_pose_only = t_pose_only
+        self.pose_names = T_POSE_NAMES if t_pose_only else (SEMAPHORE_POSES if semaphore else POSE_NAMES)
+        self.pose_titles = {
+            name: f"{index}/{len(self.pose_names)} — {POSE_TITLES[name].split(' — ', 1)[1]}"
+            for index, name in enumerate(self.pose_names, 1) if name in POSE_TITLES
+        }
         self.preferred_axis_maps = preferred_axis_maps or DEFAULT_AXIS_MAPS
         self.prior_alignment = prior_alignment
         self.enabled_segments = enabled_segments
@@ -105,6 +116,8 @@ class GuidedCalibrationDialog(QDialog):
         self.result: CalibrationResult | None = None
 
         self.setWindowTitle("Калибровка A → T → вперёд → P → A")
+        if t_pose_only:
+            self.setWindowTitle("Калибровка A → T → A")
         if semaphore:
             self.setWindowTitle("Семафорная калибровка XZ — один круг")
         self.setMinimumWidth(590)
@@ -119,6 +132,8 @@ class GuidedCalibrationDialog(QDialog):
         self.preview = PosePreview(self)
         root.addWidget(self.preview)
         self.phase_label = QLabel("A → T → руки вперёд → P → A. Один запуск для всех этапов.")
+        if t_pose_only:
+            self.phase_label.setText("A → T → A. Один запуск для всех трёх этапов.")
         if semaphore:
             self.phase_label.setText("A-поза → А → У → Ж → Е → Д → A-поза")
         self.phase_label.setStyleSheet("font-weight: 700; font-size: 15px;")
@@ -134,9 +149,13 @@ class GuidedCalibrationDialog(QDialog):
         buttons = QHBoxLayout()
         self.capture_button = QPushButton("Начать калибровку")
         self.capture_button.clicked.connect(self._start_capture)
+        self.restart_button = QPushButton("Начать заново")
+        self.restart_button.clicked.connect(self._restart_calibration)
+        self.restart_button.hide()
         self.cancel_button = QPushButton("Отмена")
         self.cancel_button.clicked.connect(self.reject)
         buttons.addWidget(self.capture_button)
+        buttons.addWidget(self.restart_button)
         buttons.addStretch(1)
         buttons.addWidget(self.cancel_button)
         root.addLayout(buttons)
@@ -158,7 +177,7 @@ class GuidedCalibrationDialog(QDialog):
                 + " Корпус неподвижен. Левая рука на примере слева, правая справа."
             )
         else:
-            self.title_label.setText(POSE_TITLES[pose_name])
+            self.title_label.setText(self.pose_titles[pose_name])
             self.instruction_label.setText(POSE_INSTRUCTIONS[pose_name])
         self.progress.setValue(0)
         self.progress.setFormat("После запуска этапы записываются автоматически")
@@ -168,6 +187,7 @@ class GuidedCalibrationDialog(QDialog):
         self.preview.set_transition(previous, pose_name, 0.)
 
     def _start_capture(self) -> None:
+        self.restart_button.hide()
         self._show_stage()
         self.phase = "preparing"
         self.phase_started_s = time.monotonic()
@@ -177,6 +197,15 @@ class GuidedCalibrationDialog(QDialog):
         self.phase_label.setText(f"Примите позу · запись через {self.preparation_duration_s:g} с")
         self.sample_label.setText("Переход: данные пока не записываются")
         self.timer.start()
+
+    def _restart_calibration(self) -> None:
+        self.timer.stop()
+        self.diagnostic_event.emit("restarted", {})
+        self.captures.clear()
+        self.recorder = None
+        self.result = None
+        self.stage_index = 0
+        self._start_capture()
 
     def _begin_recording(self) -> None:
         snapshot = self.snapshot_provider()
@@ -197,6 +226,8 @@ class GuidedCalibrationDialog(QDialog):
         # The snapshot at the boundary may still belong to the movement phase.
         self.recorder.last_generation = {name: value[2] for name, value in snapshot.items()}
         self.capture_started_s = time.monotonic()
+        self.diagnostic_event.emit("pose_started", {"pose": self.pose_names[self.stage_index],
+                                                    "started_s": self.capture_started_s})
         self.phase = "recording"
         self.preview.set_transition(self.pose_names[self.stage_index], self.pose_names[self.stage_index], 1.)
         self.phase_label.setText("Запись — не двигайтесь")
@@ -239,6 +270,7 @@ class GuidedCalibrationDialog(QDialog):
         try:
             capture = self.recorder.finish(pose_name)
         except ValueError as error:
+            self.diagnostic_event.emit("pose_rejected", {"pose": pose_name, "error": str(error)})
             self.phase = "idle"
             self.recorder = None
             self.capture_button.setEnabled(True)
@@ -248,6 +280,7 @@ class GuidedCalibrationDialog(QDialog):
             QMessageBox.warning(self, "Повторите этап", str(error))
             return
         self.captures[pose_name] = capture
+        self.diagnostic_event.emit("pose_captured", {"pose": pose_name, **captured_pose_document(capture)})
         self.recorder = None
         self.stage_index += 1
         if self.stage_index < len(self.pose_names):
@@ -258,16 +291,45 @@ class GuidedCalibrationDialog(QDialog):
 
     def _finish_calibration(self) -> None:
         try:
-            if self.semaphore:
+            if self.t_pose_only:
+                self.result = calibrate_t_pose(
+                    self.captures, self.preferred_axis_maps,
+                    self.prior_alignment, self.enabled_segments,
+                )
+            elif self.semaphore:
                 self.result = calibrate_semaphore(
                     self.captures, self.preferred_axis_maps,
                     self.prior_alignment, self.enabled_segments,
                 )
             else:
-                self.result = calibrate_five_poses(self.captures, self.preferred_axis_maps)
+                self.result = calibrate_five_poses(self.captures, self.preferred_axis_maps,
+                                                  enabled_segments=self.enabled_segments)
         except ValueError as error:
-            QMessageBox.critical(self, "Ошибка калибровки", str(error))
-            self.reject()
+            self.result = None
+            self.diagnostic_event.emit("fit_rejected", {
+                "error": str(error), "method": "a_t_a_sensor_y" if self.t_pose_only else
+                    "semaphore" if self.semaphore else "guided_poses",
+                "axis_maps": dict(self.preferred_axis_maps),
+                "enabled_segments": sorted(self.enabled_segments if self.enabled_segments is not None
+                                           else DEFAULT_AXIS_MAPS),
+                "closure_error_deg": getattr(error, "errors_deg", {}),
+                "poses": {name: captured_pose_document(pose) for name, pose in self.captures.items()},
+            })
+            self.timer.stop()
+            self.phase = "idle"
+            self.stage_index = len(self.pose_names) - 1 if isinstance(error, ReturnPoseMismatch) else 0
+            self._show_stage()
+            if isinstance(error, ReturnPoseMismatch):
+                self.capture_button.setText("Повторить последнюю A-позу")
+                self.restart_button.show()
+            else:
+                self.captures.clear()
+                self.capture_button.setText("Начать заново")
+            self.phase_label.setText("Калибровка не применена")
+            self.sample_label.setText(str(error))
+            self.sample_label.setWordWrap(True)
+            self.progress.setFormat("Запись не принята")
+            QMessageBox.warning(self, "Калибровка не применена", str(error))
             return
         self.title_label.setText("Калибровка завершена")
         self.phase_label.setText(f"Все этапы записаны: {len(self.pose_names)}")
@@ -277,17 +339,25 @@ class GuidedCalibrationDialog(QDialog):
         self.instruction_label.setText(
             f"Максимальная ошибка направления: {score:.1f}°. "
             f"Поправка согласования осей: до {alignment:.1f}°. "
-            f"Оценка остаточного дрейфа: {drift:.3f}°/с. "
+            f"Изменение ориентации в конечной A-позе: {drift:.3f}°/с (диагностика, без компенсации). "
             "Профиль применён; сохраните его через меню «Файл»."
         )
         if self.semaphore:
+            self.instruction_label.setText(self.instruction_label.text() +
+                "Калибруется плоскость XZ; полное согласование в 3D по одному кругу не проверяется.")
+        if self.result.closure_error_deg:
             closure = max(self.result.closure_error_deg.values())
             self.instruction_label.setText(self.instruction_label.text() +
-                f" Ошибка возврата в A-позу: до {closure:.1f}°. "
-                "Калибруется плоскость XZ; полное согласование в 3D по одному кругу не проверяется.")
+                f" Ошибка возврата в A-позу: до {closure:.1f}°.")
             if closure > 15.:
                 self.instruction_label.setText(self.instruction_label.text() +
                     " Возврат отличается более чем на 15° — рекомендуется повторить калибровку.")
+        pose_errors = [(error, segment, pose) for segment, poses in self.result.pose_errors_deg.items()
+                       for pose, error in poses.items()]
+        if pose_errors:
+            error, segment, pose = max(pose_errors)
+            self.instruction_label.setText(self.instruction_label.text() +
+                f" Наибольшее отклонение: {segment}, {self.pose_titles[pose]} — {error:.1f}°.")
         self.progress.setValue(self.progress.maximum())
         self.progress.setFormat("Готово")
         self.capture_button.setText("Закрыть")
