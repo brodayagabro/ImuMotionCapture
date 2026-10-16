@@ -84,4 +84,3 @@ class ParticipantWindow(QWidget):
             caption = "Тренировка · " + caption
         self.caption.setText(caption)
         self.cue.setText(cue)
-
