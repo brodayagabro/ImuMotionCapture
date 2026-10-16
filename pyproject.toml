@@ -51,9 +51,9 @@ exclude = ["pyqt_mocap.tests*", "cube_viewer.tests*"]
 testpaths = [
     "host/viz/pyqt_mocap/tests",
     "host/viz/cube_viewer/tests",
-    "scripts/noitom_comparison/tests",
-    "scripts/experiments/semaphore/tests",
-    "scripts/diagnostics/orientation",
+    "scripts/ER2026/noitom_comparison/tests",
+    "scripts/ER2026/experiments/semaphore/tests",
+    "scripts/ER2026/diagnostics/orientation",
 ]
 pythonpath = ["host/viz", "host", "."]
 python_files = ["test_*.py"]

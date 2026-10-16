@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 import time
 import math
 
@@ -87,23 +88,31 @@ class GuidedCalibrationDialog(QDialog):
         prior_alignment=None,
         enabled_segments=None,
         t_pose_only: bool = False,
+        sample_series: bool = False,
     ) -> None:
         super().__init__(parent)
         if semaphore and t_pose_only:
             raise ValueError("Choose one calibration workflow")
         self.semaphore = semaphore
         self.t_pose_only = t_pose_only
+        self.sample_series = sample_series
         self.pose_names = T_POSE_NAMES if t_pose_only else (SEMAPHORE_POSES if semaphore else POSE_NAMES)
         self.pose_titles = {
             name: f"{index}/{len(self.pose_names)} — {POSE_TITLES[name].split(' — ', 1)[1]}"
             for index, name in enumerate(self.pose_names, 1) if name in POSE_TITLES
         }
+        if sample_series:
+            from scripts.ER2026.experiments.semaphore.frame_calibration import POSE_CAPTURE_S, POSE_PREPARATION_S
+            from scripts.ER2026.experiments.semaphore.calibration_protocol import POSE_SEQUENCE, POSE_TITLES as SERIES_TITLES
+            self.pose_names = POSE_SEQUENCE
+            self.pose_titles = {name: f'{i}/5 — {SERIES_TITLES[name]}' for i, name in enumerate(POSE_SEQUENCE, 1)}
+        self.frame_recorder = None
         self.preferred_axis_maps = preferred_axis_maps or DEFAULT_AXIS_MAPS
         self.prior_alignment = prior_alignment
         self.enabled_segments = enabled_segments
         self.snapshot_provider = snapshot_provider
-        self.capture_duration_s = float(capture_duration_s)
-        self.preparation_duration_s = float(preparation_duration_s)
+        self.capture_duration_s = POSE_CAPTURE_S if sample_series else float(capture_duration_s)
+        self.preparation_duration_s = POSE_PREPARATION_S if sample_series else float(preparation_duration_s)
         if not all(math.isfinite(v) and v > 0 for v in
                    (self.capture_duration_s, self.preparation_duration_s)):
             raise ValueError("Durations must be positive and finite")
@@ -118,6 +127,8 @@ class GuidedCalibrationDialog(QDialog):
         self.setWindowTitle("Калибровка A → T → вперёд → P → A")
         if t_pose_only:
             self.setWindowTitle("Калибровка A → T → A")
+        if sample_series:
+            self.setWindowTitle("Калибровка: A-поза → А → Т → У → A-поза")
         if semaphore:
             self.setWindowTitle("Семафорная калибровка XZ — один круг")
         self.setMinimumWidth(590)
@@ -129,11 +140,17 @@ class GuidedCalibrationDialog(QDialog):
         self.instruction_label.setWordWrap(True)
         self.instruction_label.setMinimumHeight(72)
         root.addWidget(self.instruction_label)
-        self.preview = PosePreview(self)
+        if sample_series:
+            from scripts.ER2026.experiments.semaphore.semaphore_renderer import SemaphoreRenderer
+            self.preview = SemaphoreRenderer(mirror_mode=True)
+        else:
+            self.preview = PosePreview(self)
         root.addWidget(self.preview)
         self.phase_label = QLabel("A → T → руки вперёд → P → A. Один запуск для всех этапов.")
         if t_pose_only:
             self.phase_label.setText("A → T → A. Один запуск для всех трёх этапов.")
+        if sample_series:
+            self.phase_label.setText(f"Пять положений · запись {self.capture_duration_s:g} с · {self.preparation_duration_s:g} с на принятие позы")
         if semaphore:
             self.phase_label.setText("A-поза → А → У → Ж → Е → Д → A-поза")
         self.phase_label.setStyleSheet("font-weight: 700; font-size: 15px;")
@@ -152,10 +169,18 @@ class GuidedCalibrationDialog(QDialog):
         self.restart_button = QPushButton("Начать заново")
         self.restart_button.clicked.connect(self._restart_calibration)
         self.restart_button.hide()
+        self.previous_button = QPushButton("Предыдущая поза")
+        self.previous_button.clicked.connect(self._previous_pose)
+        self.previous_button.setVisible(sample_series)
+        self.repeat_button = QPushButton("Повторить позу")
+        self.repeat_button.clicked.connect(self._repeat_pose)
+        self.repeat_button.setVisible(sample_series)
         self.cancel_button = QPushButton("Отмена")
         self.cancel_button.clicked.connect(self.reject)
         buttons.addWidget(self.capture_button)
         buttons.addWidget(self.restart_button)
+        buttons.addWidget(self.previous_button)
+        buttons.addWidget(self.repeat_button)
         buttons.addStretch(1)
         buttons.addWidget(self.cancel_button)
         root.addLayout(buttons)
@@ -167,6 +192,19 @@ class GuidedCalibrationDialog(QDialog):
 
     def _show_stage(self) -> None:
         pose_name = self.pose_names[self.stage_index]
+        if self.sample_series:
+            from scripts.ER2026.experiments.semaphore.calibration_protocol import displayed_pose
+            pose = displayed_pose(pose_name)
+            self.title_label.setText(self.pose_titles[pose_name])
+            self.instruction_label.setText('Примите показанную позу и стойте неподвижно. '
+                f'На принятие позы отведено {self.preparation_duration_s:g} секунды. '
+                'A-поза с руками вниз отличается от буквы А. Для записи нужны все пять датчиков.')
+            self.preview.set_pose(pose.left_angle_deg, pose.right_angle_deg)
+            self.progress.setRange(0, round(self.capture_duration_s * 1000))
+            self.progress.setValue(0)
+            self.progress.setFormat('Запись позы: %v / %m мс')
+            self.previous_button.setEnabled(self.stage_index > 0)
+            return
         if self.semaphore:
             base = base_pose(pose_name)
             label = (f"Буква {LABELS[base]}"
@@ -187,10 +225,26 @@ class GuidedCalibrationDialog(QDialog):
         self.preview.set_transition(previous, pose_name, 0.)
 
     def _start_capture(self) -> None:
+        if self.sample_series:
+            from scripts.ER2026.experiments.semaphore.frame_calibration import FramePoseRecorder
+            self._show_stage()
+            previous = self.captures.get(self.pose_names[self.stage_index - 1]) if self.stage_index else None
+            self.phase_started_s = time.perf_counter()
+            self.frame_recorder = FramePoseRecorder(self.pose_names[self.stage_index],
+                self.phase_started_s + self.preparation_duration_s, previous=previous,
+                duration_s=self.capture_duration_s)
+            self.phase = 'preparing'
+            self.phase_label.setText(f'Примите позу · запись через {self.preparation_duration_s:g} с')
+            self.sample_label.setText('Подготовка: кадры пока не записываются')
+            self.diagnostic_event.emit('pose_preparing', self._frame_evidence())
+            self.capture_button.setEnabled(False)
+            self.restart_button.show()
+            self.timer.start()
+            return
         self.restart_button.hide()
         self._show_stage()
         self.phase = "preparing"
-        self.phase_started_s = time.monotonic()
+        self.phase_started_s = time.perf_counter()
         self.capture_button.setEnabled(False)
         self.progress.setRange(0, round(self.preparation_duration_s * 1000))
         self.progress.setFormat("Подготовка: %v / %m мс")
@@ -203,9 +257,76 @@ class GuidedCalibrationDialog(QDialog):
         self.diagnostic_event.emit("restarted", {})
         self.captures.clear()
         self.recorder = None
+        self.frame_recorder = None
         self.result = None
         self.stage_index = 0
         self._start_capture()
+
+    def _repeat_pose(self):
+        if self.phase == 'finished':
+            return
+        self.timer.stop()
+        self.diagnostic_event.emit('pose_repeated', self._frame_evidence())
+        for name in self.pose_names[self.stage_index:]:
+            self.captures.pop(name, None)
+        self._start_capture()
+
+    def _previous_pose(self):
+        if self.stage_index and self.phase != 'finished':
+            self.diagnostic_event.emit('pose_back', self._frame_evidence())
+            self.stage_index -= 1
+            self._repeat_pose()
+
+    def _frame_evidence(self):
+        return {'pose': self.pose_names[min(self.stage_index, len(self.pose_names)-1)],
+                'preparation_started_s': self.phase_started_s,
+                'preparation_duration_s': self.preparation_duration_s,
+                'frame_diagnostics': self.frame_recorder.diagnostics() if self.frame_recorder else {}}
+
+    def _sample_failure(self, error):
+        self.diagnostic_event.emit('pose_rejected', {**self._frame_evidence(), 'error': str(error)})
+        self.timer.stop()
+        self.phase = 'idle'
+        self.frame_recorder = None
+        self.capture_button.setText('Повторить позу')
+        self.capture_button.setEnabled(True)
+        self.phase_label.setText(str(error))
+
+    def feed_measurement(self, samples, key, received_s):
+        if not self.sample_series or self.frame_recorder is None or self.phase not in ('preparing', 'settling', 'recording'):
+            return
+        # Use acquisition time, so delayed GUI processing cannot admit packets
+        # captured while the participant was moving into the new pose.
+        if received_s < self.frame_recorder.started_s:
+            return
+        before = self.frame_recorder.accepted
+        try:
+            capture = self.frame_recorder.add_frame(samples, key, received_s)
+        except ValueError as error:
+            self._sample_failure(error)
+            return
+        count = self.frame_recorder.accepted
+        self.phase = 'recording' if count else 'settling'
+        if count == 1 and before == 0:
+            self.diagnostic_event.emit('pose_started', {**self._frame_evidence(), 'started_s': received_s})
+        self.progress.setValue(min(self.progress.maximum(), round(self.frame_recorder.elapsed_s * 1000)))
+        self.phase_label.setText('Запись — не двигайтесь' if count else 'Примите позу · ожидание устойчивости')
+        self.sample_label.setText(f'Принято кадров: {count} · отклонено {sum(self.frame_recorder.rejected.values())}')
+        if capture is None:
+            return
+        name = self.pose_names[self.stage_index]
+        capture = replace(capture, frame_diagnostics={**capture.frame_diagnostics,
+            'preparation_started_s': self.phase_started_s, 'preparation_duration_s': self.preparation_duration_s})
+        self.captures[name] = capture
+        self.diagnostic_event.emit('pose_captured', {'pose': name, **captured_pose_document(capture)})
+        self.frame_recorder = None
+        self.stage_index += 1
+        if self.stage_index == len(self.pose_names):
+            self.timer.stop()
+            self.phase = 'finished'
+            self._finish_calibration()
+        else:
+            self._start_capture()
 
     def _begin_recording(self) -> None:
         snapshot = self.snapshot_provider()
@@ -225,7 +346,7 @@ class GuidedCalibrationDialog(QDialog):
         self.recorder = PoseRecorder()
         # The snapshot at the boundary may still belong to the movement phase.
         self.recorder.last_generation = {name: value[2] for name, value in snapshot.items()}
-        self.capture_started_s = time.monotonic()
+        self.capture_started_s = time.perf_counter()
         self.diagnostic_event.emit("pose_started", {"pose": self.pose_names[self.stage_index],
                                                     "started_s": self.capture_started_s})
         self.phase = "recording"
@@ -238,8 +359,23 @@ class GuidedCalibrationDialog(QDialog):
         self.timer.start()
 
     def _tick(self) -> None:
+        if self.sample_series:
+            if self.frame_recorder and self.phase == 'preparing':
+                remaining = self.frame_recorder.started_s - time.perf_counter()
+                self.phase_label.setText(f'Примите позу · запись через {max(0, math.ceil(remaining))} с')
+                if remaining > 0:
+                    return
+                self.phase = 'settling'
+                self.phase_label.setText('Ожидание устойчивых полных кадров · не двигайтесь')
+                self.sample_label.setText(f'Запись {self.capture_duration_s:g} с · принято кадров: 0')
+            if self.frame_recorder and self.phase in ('settling', 'recording'):
+                try:
+                    self.frame_recorder.timeout(time.perf_counter())
+                except ValueError as error:
+                    self._sample_failure(error)
+            return
         if self.phase == "preparing":
-            elapsed = time.monotonic() - self.phase_started_s
+            elapsed = time.perf_counter() - self.phase_started_s
             self.progress.setValue(min(self.progress.maximum(), round(elapsed * 1000)))
             self.phase_label.setText(f"Примите позу · запись через {max(0, math.ceil(self.preparation_duration_s - elapsed))} с")
             self.preview.set_transition(
@@ -253,7 +389,7 @@ class GuidedCalibrationDialog(QDialog):
         snapshot = {name: value for name, value in self.snapshot_provider().items()
                     if value[1] >= self.capture_started_s}
         self.recorder.add_snapshot(snapshot)
-        elapsed_s = time.monotonic() - self.capture_started_s
+        elapsed_s = time.perf_counter() - self.capture_started_s
         self.progress.setValue(
             min(self.progress.maximum(), round(elapsed_s * 1000))
         )
@@ -291,7 +427,10 @@ class GuidedCalibrationDialog(QDialog):
 
     def _finish_calibration(self) -> None:
         try:
-            if self.t_pose_only:
+            if self.sample_series:
+                from scripts.ER2026.experiments.semaphore.calibration_protocol import calibrate_series
+                self.result = calibrate_series(self.captures, self.preferred_axis_maps, self.prior_alignment)
+            elif self.t_pose_only:
                 self.result = calibrate_t_pose(
                     self.captures, self.preferred_axis_maps,
                     self.prior_alignment, self.enabled_segments,
@@ -307,7 +446,7 @@ class GuidedCalibrationDialog(QDialog):
         except ValueError as error:
             self.result = None
             self.diagnostic_event.emit("fit_rejected", {
-                "error": str(error), "method": "a_t_a_sensor_y" if self.t_pose_only else
+                "error": str(error), "method": 'neutral_a_semaphore_a_t_u_neutral_a_sensor_y' if self.sample_series else "a_t_a_sensor_y" if self.t_pose_only else
                     "semaphore" if self.semaphore else "guided_poses",
                 "axis_maps": dict(self.preferred_axis_maps),
                 "enabled_segments": sorted(self.enabled_segments if self.enabled_segments is not None
@@ -319,6 +458,7 @@ class GuidedCalibrationDialog(QDialog):
             self.phase = "idle"
             self.stage_index = len(self.pose_names) - 1 if isinstance(error, ReturnPoseMismatch) else 0
             self._show_stage()
+            self.capture_button.setEnabled(True)
             if isinstance(error, ReturnPoseMismatch):
                 self.capture_button.setText("Повторить последнюю A-позу")
                 self.restart_button.show()
@@ -368,8 +508,13 @@ class GuidedCalibrationDialog(QDialog):
             pass
         self.capture_button.clicked.connect(self.accept)
         self.cancel_button.setVisible(False)
+        self.previous_button.hide()
+        self.repeat_button.hide()
+        self.restart_button.hide()
         self.result_ready.emit(self.result)
 
     def reject(self) -> None:
+        if self.sample_series and self.phase != 'finished':
+            self.diagnostic_event.emit('cancelled', self._frame_evidence())
         self.timer.stop()
         super().reject()

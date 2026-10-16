@@ -58,7 +58,7 @@ class CalibrationWindowMixin:
     def open_semaphore_calibration(self) -> None:
         self.open_guided_calibration(semaphore=True)
 
-    def open_guided_calibration(self, checked=False, *, semaphore=False, t_pose_only=False) -> None:
+    def open_guided_calibration(self, checked=False, *, semaphore=False, t_pose_only=False, sample_series=False) -> None:
         if self.bvh_active:
             self.stop_bvh_recording()
         if self.sock is None or not self.streaming_requested:
@@ -76,6 +76,7 @@ class CalibrationWindowMixin:
         dialog = GuidedCalibrationDialog(
             self._calibration_snapshot, self, semaphore=semaphore,
             t_pose_only=t_pose_only,
+            sample_series=sample_series,
             preferred_axis_maps=dict(self.config.axis_maps),
             prior_alignment={name: value.copy() for name, value
                              in self.model.axis_alignment_quaternion.items()},
@@ -108,7 +109,7 @@ class CalibrationWindowMixin:
         new_config.axis_maps = dict(result.axis_maps)
         self.apply_configuration(new_config)
         neutral_raw = {
-            name: result.captures["return_a_pose"].average[name]
+            name: result.captures[result.neutral_pose_name].average[name]
             for name in SEGMENT_NAMES
         }
         self.model.set_guided_calibration(
@@ -185,6 +186,10 @@ class CalibrationWindowMixin:
         )
         if not path:
             return
+        self.load_calibration_profile(path)
+
+    def load_calibration_profile(self, path) -> None:
+        """Restore a saved profile through the same validation as the file dialog."""
         try:
             document = load_profile(path)
             application = document["application"]
@@ -300,7 +305,7 @@ class CalibrationWindowMixin:
                 self.model.set_drift_compensation(drift_rates)
                 self.model.request_neutral()
             else:
-                restored_reference = restore_profile_calibration(self.model, document, reference_s=time.monotonic())
+                restored_reference = restore_profile_calibration(self.model, document, reference_s=time.perf_counter())
         except (KeyError, OSError, TypeError, ValueError) as error:
             QMessageBox.critical(self, "Ошибка импорта", str(error))
             return

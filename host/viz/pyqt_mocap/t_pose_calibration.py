@@ -90,7 +90,7 @@ def _arm_alignment(segment, captures, axis_spec):
 
 
 def calibrate_t_pose(captures, preferred_axis_maps=DEFAULT_AXIS_MAPS,
-                     prior_alignment=None, enabled_segments=None):
+                     prior_alignment=None, enabled_segments=None, *, minimum_duration_s=1.):
     """Align the sensor-local arm axis in A and T with both target directions.
 
     Known longitudinal Y mounting supplies the constraint missing from the
@@ -106,7 +106,9 @@ def calibrate_t_pose(captures, preferred_axis_maps=DEFAULT_AXIS_MAPS,
     maps = {s: tuple(preferred_axis_maps[s]) for s in SEGMENT_NAMES}
     final = captures["return_a_pose"]
     duration = final.ended_s - final.started_s
-    if not math.isfinite(duration) or duration < 1.:
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError('Некорректный интервал заключительной A-позы')
+    if duration < minimum_duration_s:
         raise ValueError("Конечную A-позу необходимо удерживать не менее секунды")
     alignments, scores, preferred_scores, rates, closure, pose_errors = {}, {}, {}, {}, {}, {}
     raw_arm_closure = arm_return_errors_deg(captures)

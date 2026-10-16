@@ -1,2 +1,2 @@
 # Preserve SDK patch bytes and upstream context whitespace.
-scripts/noitom_comparison/patches/*.patch -text -whitespace
+scripts/ER2026/noitom_comparison/patches/*.patch -text -whitespace

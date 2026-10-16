@@ -7,7 +7,7 @@ easy to exercise in headless tests.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Final, Iterable, Mapping, Sequence
 
@@ -134,6 +134,8 @@ class DatagramResult:
     messages: tuple[str, ...]
     frame_header: str | None
     invalid_lines: int
+    calibration_samples: dict[str, Quaternion] = field(default_factory=dict)
+    measurement_key: tuple[int, int] | None = None
 
 
 class MotionCaptureModel:
@@ -355,12 +357,12 @@ class MotionCaptureModel:
         self.neutral_pending = False
 
     def _canonicalize(
-        self, raw_samples: list[tuple[int, Quaternion]]
+        self, raw_samples: list[tuple[int, Quaternion]], *, include_disabled=False
     ) -> list[tuple[int, Quaternion]]:
         if not raw_samples:
             return []
         enabled_sensor_ids = {
-            self.sensor_mapping[name] for name in self.enabled_segments
+            self.sensor_mapping[name] for name in (SEGMENT_NAMES if include_disabled else self.enabled_segments)
         }
         if self.sensor_id_mode == "raw":
             self.active_sensor_id_mode = "raw"
@@ -426,6 +428,18 @@ class MotionCaptureModel:
                 continue
             invalid_lines += 1
 
+        all_samples = self._canonicalize(raw_samples, include_disabled=True)
+        calibration_samples, measurement_key = {}, None
+        try:
+            header = (frame_header or "").split()
+            if len(header) == 4 and int(header[3]) == len(raw_samples) and not invalid_lines:
+                key = (int(header[1]), int(header[2]))
+                by_id = dict(all_samples)
+                if min(key) >= 0 and len(by_id) == len(all_samples) and len({sid for sid, _ in raw_samples}) == len(raw_samples):
+                    calibration_samples = {name: by_id[sid].copy() for name, sid in self.sensor_mapping.items()}
+                    measurement_key = key
+        except (ValueError, KeyError):
+            pass
         samples = self._canonicalize(raw_samples)
         published = bool(samples)
         if published:
@@ -451,6 +465,8 @@ class MotionCaptureModel:
         if not neutral_captured:
             pose_changed = self._update_segment_deltas() or pose_changed
         return DatagramResult(
+            calibration_samples=calibration_samples,
+            measurement_key=measurement_key,
             published=published,
             pose_changed=pose_changed,
             neutral_captured=neutral_captured,

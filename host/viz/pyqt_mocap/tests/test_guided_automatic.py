@@ -17,7 +17,7 @@ pytestmark = pytest.mark.gui
 def test_one_click_records_five_stages(monkeypatch):
     app = QApplication.instance() or QApplication([])
     clock = [100.]
-    monkeypatch.setattr(guided_dialog, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(guided_dialog, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
     fixture = fixtures.GuidedCalibrationTests()
     fixture.setUp()
     generation = [0]
@@ -64,7 +64,7 @@ def test_one_click_records_five_stages(monkeypatch):
 def test_missing_data_pauses_and_cancel_stops_timer(monkeypatch):
     app = QApplication.instance() or QApplication([])
     clock = [100.]
-    monkeypatch.setattr(guided_dialog, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(guided_dialog, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
     dialog = guided_dialog.GuidedCalibrationDialog(lambda: {})
@@ -85,7 +85,7 @@ def test_missing_data_pauses_and_cancel_stops_timer(monkeypatch):
 def test_unstable_pose_repeats_only_current_stage_without_applying_profile(monkeypatch):
     app = QApplication.instance() or QApplication([])
     clock = [100.]
-    monkeypatch.setattr(guided_dialog, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(guided_dialog, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
     fixture = fixtures.GuidedCalibrationTests()
@@ -138,7 +138,7 @@ def test_return_mismatch_keeps_wizard_and_evidence_then_applies_only_valid_resul
     from pyqt_mocap.mocap_core import SENSOR_NEUTRAL_AXIS_FRAMES, matrix_to_quaternion
     app = QApplication.instance() or QApplication([])
     clock = [100.]
-    monkeypatch.setattr(guided_dialog, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(guided_dialog, 'time', SimpleNamespace(perf_counter=lambda: clock[0]))
     warnings = []
     monkeypatch.setattr(QMessageBox, 'warning', lambda *args: warnings.append(args))
     captures = physical_captures()

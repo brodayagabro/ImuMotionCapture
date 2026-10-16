@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import itertools
 import json
 import math
+import uuid
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -32,8 +33,8 @@ from .mocap_core import (
 Quaternion = NDArray[np.float64]
 Vector = NDArray[np.float64]
 PROFILE_SCHEMA = "neuromorph-pyqt-mocap-calibration"
-PROFILE_VERSION = 7
-SUPPORTED_PROFILE_VERSIONS = frozenset((1, 2, 3, 4, 5, 6, PROFILE_VERSION))
+PROFILE_VERSION = 8
+SUPPORTED_PROFILE_VERSIONS = frozenset((1, 2, 3, 4, 5, 6, 7, PROFILE_VERSION))
 POSE_NAMES = ("a_pose", "t_pose", "forward_pose", "p_pose", "return_a_pose")
 FIT_POSE_NAMES = ("t_pose", "forward_pose", "p_pose")
 MIN_SAMPLES_PER_SEGMENT = 15
@@ -103,6 +104,7 @@ class CapturedPose:
     ended_s: float
     spread_deg: dict[str, float] = field(default_factory=dict)
     drift_interval_s: dict[str, float] = field(default_factory=dict)
+    frame_diagnostics: dict = field(default_factory=dict)
 
 
 class PoseRecorder:
@@ -206,6 +208,8 @@ class CalibrationResult:
     repeatability_deg: dict[str, float] = field(default_factory=dict)
     closure_error_deg: dict[str, float] = field(default_factory=dict)
     pose_errors_deg: dict[str, dict[str, float]] = field(default_factory=dict)
+    neutral_pose_name: str = "return_a_pose"
+    calibration_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
     def max_drift_deg_s(self) -> float:
@@ -519,6 +523,7 @@ def calibrate_five_poses(
 def captured_pose_document(capture: CapturedPose) -> dict[str, object]:
     """Serializable raw pose evidence, including attempts that were rejected."""
     return {
+        "frame_diagnostics": dict(capture.frame_diagnostics),
         "average_quaternions_wxyz": {s: [float(v) for v in capture.average[s]] for s in SEGMENT_NAMES},
         "first_quaternions_wxyz": {s: [float(v) for v in capture.first[s]] for s in SEGMENT_NAMES},
         "last_quaternions_wxyz": {s: [float(v) for v in capture.last[s]] for s in SEGMENT_NAMES},
@@ -542,6 +547,8 @@ def profile_document(
         "created_at": result.created_at,
         "application": dict(application_config),
         "calibration": {
+            "calibration_id": result.calibration_id,
+            "neutral_pose_name": result.neutral_pose_name,
             "method": result.method,
             "quaternion_convention": "Hamilton wxyz; q_AB maps B to A; right factor first",
             "drift_compensation_applied": False,
@@ -553,16 +560,16 @@ def profile_document(
                 }
                 for s in SEGMENT_NAMES
                 for transform in (SegmentCalibration.from_pose(
-                    mapped_sensor_quaternion(result.captures["return_a_pose"].average[s], result.axis_maps[s]),
+                    mapped_sensor_quaternion(result.captures[result.neutral_pose_name].average[s], result.axis_maps[s]),
                     q_world_alignment=result.axis_alignment_quaternions[s]),)
             },
             "neutral_raw_quaternions_wxyz": {
-                s: [float(v) for v in result.captures["return_a_pose"].average[s]] for s in SEGMENT_NAMES
+                s: [float(v) for v in result.captures[result.neutral_pose_name].average[s]] for s in SEGMENT_NAMES
             },
             "repeatability_deg": result.repeatability_deg,
             "closure_error_deg": result.closure_error_deg,
             "pose_errors_deg": result.pose_errors_deg,
-            "score_reference_pose": "return_a_pose",
+            "score_reference_pose": result.neutral_pose_name,
             "axis_maps": {
                 name: list(result.axis_maps[name]) for name in SEGMENT_NAMES
             },

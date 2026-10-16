@@ -792,7 +792,7 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
         monitor_panel = QWidget()
         monitor_layout = QVBoxLayout(monitor_panel)
         monitor_layout.setContentsMargins(4, 0, 0, 0)
-        monitor_header = QHBoxLayout()
+        self.monitor_header = monitor_header = QHBoxLayout()
         monitor_header.addWidget(QLabel("<b>Монитор UDP-пакетов</b>"))
         monitor_header.addStretch(1)
         clear_button = QPushButton("Очистить")
@@ -1004,14 +1004,14 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
                 continue
             except OSError as error:
                 if not stop_event.is_set() and self.sock is sock:
-                    self.events.put(("error", time.time(), str(error), None, time.monotonic_ns(), None))
+                    self.events.put(("error", time.time(), str(error), None, time.perf_counter_ns(), None))
                 break
             received_ns, context = self._stamp_packet()
             self.events.put(("packet", time.time(), payload, address, received_ns, context))
 
     def _stamp_packet(self) -> tuple[int, object]:
         """Acquisition hook, called immediately after recvfrom (no GUI access)."""
-        return time.monotonic_ns(), None
+        return time.perf_counter_ns(), None
 
     def _on_datagram_processed(self, raw, address, wall_timestamp, received_ns,
                                result, context) -> None:
@@ -1122,15 +1122,21 @@ class MotionCaptureWindow(RecordingWindowMixin, CalibrationWindowMixin, QMainWin
         elif box.clickedButton() is semaphore:
             self.open_semaphore_calibration()
         elif box.clickedButton() is full:
-            answer = QMessageBox.warning(
-                self,
-                "Полная калибровка",
-                "Все датчики сняты, лежат неподвижно локальной Z вверх?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer == QMessageBox.StandardButton.Yes and self.send_command("CALIB"):
-                self.hardware_calibration_pending = True
+            self.open_imu_calibration_dialog()
+
+    def open_imu_calibration_dialog(self) -> None:
+        """Shared hardware calibration action for the viewer and experiment UI."""
+        if self.bvh_active:
+            self.stop_bvh_recording()
+        answer = QMessageBox.warning(
+            self,
+            "Полная калибровка",
+            "Все датчики сняты, лежат неподвижно локальной Z вверх?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes and self.send_command("CALIB"):
+            self.hardware_calibration_pending = True
 
     def _process_events(self) -> None:
         for _ in range(250):

@@ -211,10 +211,27 @@ __marimo__/
 # Raw motion-capture experiment sessions
 /records/
 /recordings/
+/scripts/ER2026/records/
+/scripts/ER2026/recordings/
 
 # Generated local outputs
 /output/
+/scripts/ER2026/output/
 
 # External Noitom SDK checkout; pinned revision and local patch are documented
-# in scripts/noitom_comparison/README.md.
+# in scripts/ER2026/noitom_comparison/README.md.
 /scripts/MocapApi/
+
+# Local presentation sources, exports and temporary chart data
+/scripts/ER2026/presentation_er2026/
+/.chart-data-*/
+
+# Local GUI settings, calibration profiles and captured media
+*.ini
+*.blend
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.bvh
+!/examples/*.bvh
