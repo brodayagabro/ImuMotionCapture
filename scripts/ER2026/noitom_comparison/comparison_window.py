@@ -26,6 +26,7 @@ from .control_bridge import ControlBridge
 
 class MocapComparisonWindow(OpenGLMotionCaptureWindow):
     canvas_class = ComparisonOpenGLCanvas
+    settings_application_name = "MPU UDP Viewer ER2026"
 
     def __init__(self, options=None, *, client=None):
         self.options = options or ComparisonConfig()
@@ -140,13 +141,17 @@ class MocapComparisonWindow(OpenGLMotionCaptureWindow):
             # Delete-on-close is deferred; dispose the reference before opening.
             previous.destroyed.disconnect(self._guided_dialog_closed)
             self.guided_dialog = None
-        super().open_guided_calibration(checked, sample_series=True)
+        super().open_guided_calibration(checked)
         if self.guided_dialog is not None and self.guided_dialog is not previous:
             self.guided_dialog.diagnostic_event.connect(
                 lambda name, detail: self.recorder.event("own_calibration_" + name, {
                     **detail, "sensor_mapping": dict(self.config.sensor_mapping),
                     "sensor_id_mode": self.model.active_sensor_id_mode,
                 }))
+
+    def _create_guided_calibration_dialog(self, *args, **kwargs):
+        from scripts.ER2026.experiments.semaphore.guided_dialog import GuidedCalibrationDialog
+        return GuidedCalibrationDialog(*args, sample_series=True, **kwargs)
 
     def _control_status(self):
         calibration = (self.calibration_document or {}).get('calibration', {})

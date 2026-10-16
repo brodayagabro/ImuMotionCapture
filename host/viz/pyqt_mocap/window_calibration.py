@@ -58,7 +58,7 @@ class CalibrationWindowMixin:
     def open_semaphore_calibration(self) -> None:
         self.open_guided_calibration(semaphore=True)
 
-    def open_guided_calibration(self, checked=False, *, semaphore=False, t_pose_only=False, sample_series=False) -> None:
+    def open_guided_calibration(self, checked=False, *, semaphore=False, t_pose_only=False) -> None:
         if self.bvh_active:
             self.stop_bvh_recording()
         if self.sock is None or not self.streaming_requested:
@@ -73,10 +73,9 @@ class CalibrationWindowMixin:
             self.guided_dialog.raise_()
             self.guided_dialog.activateWindow()
             return
-        dialog = GuidedCalibrationDialog(
+        dialog = self._create_guided_calibration_dialog(
             self._calibration_snapshot, self, semaphore=semaphore,
             t_pose_only=t_pose_only,
-            sample_series=sample_series,
             preferred_axis_maps=dict(self.config.axis_maps),
             prior_alignment={name: value.copy() for name, value
                              in self.model.axis_alignment_quaternion.items()},
@@ -87,6 +86,9 @@ class CalibrationWindowMixin:
         dialog.destroyed.connect(self._guided_dialog_closed)
         self.guided_dialog = dialog
         dialog.show()
+
+    def _create_guided_calibration_dialog(self, *args, **kwargs):
+        return GuidedCalibrationDialog(*args, **kwargs)
 
     def _guided_dialog_closed(self) -> None:
         self.guided_dialog = None

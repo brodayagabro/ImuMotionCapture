@@ -11,6 +11,7 @@ QtWidgets = pytest.importorskip("PyQt6.QtWidgets")
 QApplication = QtWidgets.QApplication
 
 from pyqt_mocap.mpu_udp_viewer import MotionCaptureWindow
+from pyqt_mocap.human_canvas_gl import OpenGLHumanCanvas
 from pyqt_mocap.mocap_core import SEGMENT_NAMES
 
 
@@ -55,17 +56,13 @@ def test_window_command_and_frame_round_trip(tmp_path, monkeypatch) -> None:
     window.config.device_port = server.getsockname()[1]
     window.config.stream_rate_hz = 23
     try:
-        assert not hasattr(window.human_canvas, "torso")
-        assert window.human_canvas.axes.azim == 108
-        assert (
-            window.human_canvas.tracked_lines["spine"].get_color()
-            == window.human_canvas.tracked_lines["shoulder.L"].get_color()
-        )
+        assert isinstance(window.human_canvas, OpenGLHumanCanvas)
+        assert set(window.human_canvas.tracked_bones) == set(SEGMENT_NAMES)
         assert all(
-            line.get_visible()
-            for line in window.human_canvas.axis_lines["spine"]
+            line.visible()
+            for line in window.human_canvas.axis_lines
         )
-        assert window.human_canvas.segment_labels["spine"].get_visible()
+        assert window.human_canvas.segment_labels["spine"].text
         assert window.connect_device()
         hello, client = receive_command(app, server)
         status, status_client = receive_command(app, server)

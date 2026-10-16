@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""Calculate packet-arrival statistics and plot measured versus target rate."""
+"""Calculate packet-arrival statistics and save them as CSV."""
 
 from pathlib import Path
 
-import matplotlib
 import numpy as np
 import pandas as pd
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 
 
 script_directory = Path(__file__).resolve().parent
 input_path = script_directory / "frequency_timestamps.csv"
 statistics_path = script_directory / "frequency_analysis.csv"
-plot_path = script_directory / "frequency_analysis.png"
 
 # Each CSV column contains packet-arrival timestamps for one target frequency.
 timestamps = pd.read_csv(input_path).apply(pd.to_numeric, errors="raise")
@@ -51,22 +46,6 @@ statistics = pd.DataFrame(
 )
 statistics.to_csv(statistics_path, index=False, float_format="%.12g")
 
-plt.style.use("seaborn-v0_8-whitegrid")
-fig, ax = plt.subplots(figsize=(10, 6), sharex=True, layout="constrained")
-ax.plot(target_hz, target_hz, "--")
-statistics.plot(
-    x="target_frequency_hz",
-    y="actual_frequency_hz",
-    style="o-",
-    color='r',
-    ax=ax,
-)
-fig.suptitle("Частота прихода UDP-пакетов", fontsize=18, fontweight="bold")
-ax.set(title="Действительная частота", ylabel="Частота, Гц")
-ax.legend(["идеальная y = x", "измеренная"])
-fig.savefig(plot_path, dpi=180)
-plt.close(fig)
-
 print(
     statistics[
         [
@@ -78,4 +57,3 @@ print(
 if len(skipped_targets):
     print(f"Пропущены пустые столбцы: {', '.join(skipped_targets)} Гц")
 print(f"Статистика: {statistics_path}")
-print(f"Графики:    {plot_path}")

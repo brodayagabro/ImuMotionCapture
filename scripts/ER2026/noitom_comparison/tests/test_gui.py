@@ -30,10 +30,32 @@ def pump_until(app, predicate, timeout=3):
     raise AssertionError("Timed out waiting for condition")
 
 
+def test_experiment_settings_do_not_overwrite_main_viewer(tmp_path, monkeypatch):
+    def settings(organization, application):
+        return QSettings(str(tmp_path / (application + '.ini')), QSettings.Format.IniFormat)
+
+    monkeypatch.setattr(mpu_udp_viewer, 'QSettings', settings)
+    app = QApplication.instance() or QApplication([])
+    main_settings = settings('Neuromorph', mpu_udp_viewer.MotionCaptureWindow.settings_application_name)
+    config = mpu_udp_viewer.load_config(main_settings)
+    config.device_ip = '192.0.2.10'
+    mpu_udp_viewer.save_config(main_settings, config)
+    window = MocapComparisonWindow(ComparisonConfig(fake=True, recordings_dir=str(tmp_path / 'records')))
+    try:
+        assert window.config.device_ip != '192.0.2.10'
+        window.config.device_ip = '192.0.2.20'
+        mpu_udp_viewer.save_config(window.settings_store, window.config)
+        assert mpu_udp_viewer.load_config(main_settings).device_ip == '192.0.2.10'
+        assert window.settings_store.fileName() != main_settings.fileName()
+    finally:
+        window.close()
+        pump_until(app, lambda: window._allow_close)
+
+
 @pytest.mark.parametrize('fail_first', [False, True])
 def test_calibration_button_runs_five_measured_poses_and_applies_profile(tmp_path, monkeypatch, fail_first):
     from types import SimpleNamespace
-    from pyqt_mocap import guided_dialog
+    from scripts.ER2026.experiments.semaphore import guided_dialog
     from scripts.ER2026.experiments.semaphore.calibration_protocol import POSE_SEQUENCE as T_POSE_NAMES
     from scripts.ER2026.experiments.semaphore.tests.test_series_calibration import physical_series_captures as physical_captures
     from pyqt_mocap.mocap_core import matrix_to_quaternion, quaternion_to_matrix

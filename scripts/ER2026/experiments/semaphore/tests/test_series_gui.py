@@ -8,7 +8,7 @@ pytestmark = pytest.mark.gui
 
 def test_wizard_back_retry_restart_timeout_and_cancel(monkeypatch):
     from types import SimpleNamespace
-    from pyqt_mocap import guided_dialog
+    from scripts.ER2026.experiments.semaphore import guided_dialog
     app = QApplication.instance() or QApplication([])
     clock = [100.]
     monkeypatch.setattr(guided_dialog, 'time', SimpleNamespace(perf_counter=lambda: clock[0]))
@@ -41,7 +41,7 @@ def test_wizard_back_retry_restart_timeout_and_cancel(monkeypatch):
 
 def test_every_pose_gets_three_seconds_and_transition_packets_are_excluded(monkeypatch):
     from types import SimpleNamespace
-    from pyqt_mocap import guided_dialog
+    from scripts.ER2026.experiments.semaphore import guided_dialog
     from scripts.ER2026.experiments.semaphore.calibration_protocol import POSE_SEQUENCE
     app = QApplication.instance() or QApplication([])
     clock = [100.]

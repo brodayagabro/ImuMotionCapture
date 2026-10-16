@@ -97,7 +97,7 @@ def _bone_item(start, end, color):
 
 
 class OpenGLHumanCanvas(QWidget):
-    """Interactive OpenGL skeleton view with the same API as HumanCanvas."""
+    """Interactive OpenGL skeleton view with tracked segments and local axes."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
