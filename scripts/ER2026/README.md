@@ -46,6 +46,7 @@ ER2026/
   noitom_comparison/             — приём двух потоков, отображение, парный BVH
   experiments/semaphore/        — калибровка, наборы слов, окна эксперимента
   diagnostics/orientation/      — анализ калибровки и записанных ориентаций
+  processing/                   — офлайн-сравнение, ручная разметка, классификатор поз
   records/                      — пользовательские записи и records.csv
   output/                       — отчёты, профили и архивные результаты проверок
 ```
@@ -71,6 +72,10 @@ SDK Noitom — в `scripts/MocapApi`. Конфигурация автомати�
 - [Порядок эксперимента и формат данных](experiments/semaphore/README.md).
 - [Подключение Noitom и SDK](noitom_comparison/README.md).
 - [Диагностика ориентаций](diagnostics/orientation/DIAGNOSTIC_REPORT.md).
+- [Обработка датасета, ручная разметка и обучение](processing/README.md).
+- [Исследование текущих записей](processing/DATASET_REPORT.md).
+- [Ноутбук сравнения систем захвата движений](processing/motion_capture_analysis.ipynb).
+- [Ноутбук сравнения методов классификации букв](processing/semaphore_classification.ipynb).
 
 Все автоматические проверки, включая Qt и локальные UDP/TCP-сокеты:
 
