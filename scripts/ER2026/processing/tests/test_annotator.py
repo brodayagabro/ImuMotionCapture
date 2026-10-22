@@ -4,7 +4,8 @@ pytestmark = pytest.mark.gui
 
 
 @pytest.mark.parametrize('paired', [False, True])
-def test_manual_review_save_reload_edit_undo(tmp_path, paired):
+@pytest.mark.parametrize('beside_bvh', [False, True])
+def test_manual_review_save_reload_edit_undo(tmp_path, paired, beside_bvh, monkeypatch):
     from PyQt6.QtWidgets import QApplication
     from scripts.ER2026.processing.annotator import Annotator
     from scripts.ER2026.processing.annotations import new_document, save_document
@@ -13,7 +14,7 @@ def test_manual_review_save_reload_edit_undo(tmp_path, paired):
     from .test_processing import make_dataset, write_motion
 
     app = QApplication.instance() or QApplication([])
-    records, labels = make_dataset(tmp_path)
+    records, labels = make_dataset(tmp_path, beside_bvh=beside_bvh)
     if paired:
         write_motion(records / 'P1/custom.bvh', frames=201)
         fields = ('timestamp', 'subject_id', 'word_set_id', 'custom_bvh_path', 'noitom_bvh_path')
@@ -25,11 +26,13 @@ def test_manual_review_save_reload_edit_undo(tmp_path, paired):
         row = next(indexed_records(records))
         motions = {source: load_bvh(path) for source, path in row['paths'].items()}
         import json
-        path = labels / 'P1.json'
+        path = (records / 'P1' if beside_bvh else labels) / 'P1.json'
         document = new_document(row, motions)
         document['intervals'] = json.loads(path.read_text(encoding='utf-8'))['intervals']
         save_document(path, document, motions['noitom'].duration)
-    window = Annotator(records, labels)
+    before = {p: p.read_bytes() for p in records.glob('*/*.bvh')}
+    monkeypatch.chdir(tmp_path)
+    window = Annotator(records) if beside_bvh else Annotator(records, labels)
     window.show()
     app.processEvents()
     assert window.motion.count == 201
@@ -49,6 +52,7 @@ def test_manual_review_save_reload_edit_undo(tmp_path, paired):
     assert saved['annotation_source'] == 'noitom'
     assert saved['annotation_tool'] == 'qt'
     assert window.path.exists()
+    assert window.path == (records / 'P1' if beside_bvh else labels) / 'P1.json'
     window.undo_change()
     assert len(window.document['intervals']) == 3
     window.select_interval(0)
@@ -64,3 +68,4 @@ def test_manual_review_save_reload_edit_undo(tmp_path, paired):
     assert window.path.with_suffix('.json.bak').exists()
     window.close()
     app.processEvents()
+    assert all(p.read_bytes() == original for p, original in before.items())

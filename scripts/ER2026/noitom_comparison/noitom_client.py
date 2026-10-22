@@ -346,7 +346,7 @@ class NoitomReceiverThread(threading.Thread):
     def __init__(self, client, recorder, enabled_segments=SEGMENT_NAMES):
         super().__init__(name="noitom-receiver", daemon=True)
         self.client, self.recorder = client, recorder
-        self.client.stamp = recorder.stamp_packet
+        self.client.stamp = getattr(recorder, 'stamp_noitom_packet', recorder.stamp_packet)
         self.client.release_claim = recorder.release_claim
         self.commands, self.events = queue.Queue(), queue.Queue()
         self.capture_lock = threading.RLock()

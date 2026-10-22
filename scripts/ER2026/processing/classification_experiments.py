@@ -5,14 +5,13 @@ The notebook owns plots and experiment settings; this module owns validation.
 """
 from dataclasses import dataclass
 import hashlib
-from pathlib import Path
 from time import perf_counter
 import warnings
 
 import numpy as np
 import pandas as pd
 
-from .annotations import EXCLUDED, read_document
+from .annotations import EXCLUDED, annotation_path, read_document
 from .classifier import canonical, feature
 from .io import indexed_records
 from .motion import ARMS, load_bvh
@@ -37,7 +36,7 @@ class Dataset:
     manifest: list
 
 
-def build_dataset(records_root, labels_root, *, source='noitom', window_s=.25,
+def build_dataset(records_root, labels_root=None, *, source='noitom', window_s=.25,
                   step_s=.25, trim_s=.1, include_neutral=False, recording_ids=None):
     """Only complete windows inside reviewed intervals; source hashes are checked."""
     if source not in ('noitom', 'custom'):
@@ -53,7 +52,7 @@ def build_dataset(records_root, labels_root, *, source='noitom', window_s=.25,
     values, samples, holds, inventory, manifest = [], [], [], [], []
     for row in records:
         rid = row['recording_id']
-        label_path = Path(labels_root) / (rid + '.json')
+        label_path = annotation_path(row, labels_root)
         info = dict(recording_id=rid, subject_id=row['subject_id'], source=source,
                     intervals=0, usable_holds=0, windows=0)
         if source not in row['paths'] or not label_path.exists():

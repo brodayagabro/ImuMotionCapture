@@ -7,16 +7,17 @@ import numpy as np
 from .comparison import angle_degrees, compare, time_metrics
 from .io import atomic_json, indexed_records, write_csv
 from .motion import ARMS, load_bvh
-from .annotations import EXCLUDED, read_document
+from .annotations import EXCLUDED, annotation_path, read_document
 
 
-def run(root, output, labels=None):
+def run(root, output, labels=None, *, use_labels=False):
     root, output = Path(root).resolve(), Path(output).resolve()
     if output == root or output.is_relative_to(root):
         raise ValueError('Analysis output must be outside source records')
     output.mkdir(parents=True, exist_ok=True)
     if labels is not None and not Path(labels).is_dir():
         raise ValueError('Annotation directory does not exist; run annotate first')
+    use_labels = use_labels or labels is not None
     records = list(indexed_records(root))
     indexed = {p for row in records for p in row['paths'].values()}
     logs, log_errors = {}, []
@@ -62,7 +63,7 @@ def run(root, output, labels=None):
                 metrics.extend(pair_rows)
                 temporal.extend(time_metrics(motions['custom'], motions['noitom'], rid))
                 diagnostics[rid] = lag
-                label_path = Path(labels) / (rid + '.json') if labels is not None else None
+                label_path = annotation_path(row, labels) if use_labels else None
                 if label_path is not None and label_path.exists():
                     try:
                         document = read_document(label_path, row, motions)
@@ -104,7 +105,7 @@ def run(root, output, labels=None):
                                         p.name != 'semaphore' and not any(p.glob('*.bvh'))],
                   log_errors=log_errors,
                   legacy_archive=legacy,
-                  annotation_metrics=dict(requested=labels is not None, errors=annotation_errors,
+                  annotation_metrics=dict(requested=use_labels, errors=annotation_errors,
                       intervals=len({(r['recording_id'], r['interval_id']) for r in interval_metrics})),
                   acquisition={rid: [dict(status=e['status'], export=e.get('export'),
                                          error=e.get('error'), synthetic=e.get('noitom', {}).get('configuration', {}).get('fake'))

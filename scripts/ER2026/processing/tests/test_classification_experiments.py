@@ -10,10 +10,12 @@ from scripts.ER2026.processing.classification_experiments import (
 from .test_processing import make_dataset
 
 
-def test_features_use_reviewed_windows_and_preserve_inputs(tmp_path):
-    records, labels = make_dataset(tmp_path)
-    before = {p: p.read_bytes() for p in labels.glob('*.json')}
-    data = build_dataset(records, labels)
+@pytest.mark.parametrize('beside_bvh', [False, True])
+def test_features_use_reviewed_windows_and_preserve_inputs(tmp_path, beside_bvh):
+    records, labels = make_dataset(tmp_path, beside_bvh=beside_bvh)
+    paths = records.glob('*/*.json') if beside_bvh else labels.glob('*.json')
+    before = {p: p.read_bytes() for p in paths}
+    data = build_dataset(records) if beside_bvh else build_dataset(records, labels)
     assert set(data.samples['label']) == {'А', 'Б'}
     assert len(data.holds.query("status == 'excluded_label'")) == 2
     assert data.features['mean_std'].shape == (len(data.samples), 24)
@@ -22,7 +24,7 @@ def test_features_use_reviewed_windows_and_preserve_inputs(tmp_path):
     assert (data.samples['end_s'] <= data.samples['hold_end_s']).all()
     assert data.samples['sample_id'].is_unique
     assert all(p.read_bytes() == b for p, b in before.items())
-    path = labels / 'P1.json'
+    path = (records / 'P1' if beside_bvh else labels) / 'P1.json'
     document = json.loads(path.read_text(encoding='utf-8'))
     document['sources']['noitom']['sha256'] = 'changed'
     path.write_text(json.dumps(document), encoding='utf-8')

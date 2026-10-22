@@ -28,7 +28,7 @@ def own(recorder, clock, index, *, complete=True):
 
 
 def noitom(recorder, clock, index, *, invalid=False, heading=0.):
-    ns, claim = recorder.stamp_packet()
+    ns, claim = recorder.stamp_noitom_packet()
     frame = FakeNoitomClient.frame(index, ns)
     # Native hierarchy contains joints which do not appear in the five-segment view.
     joints = dict(frame.joints)
@@ -278,3 +278,62 @@ def test_noitom_matches_own_geometry_ignores_hands_root_translation_and_display_
 def test_invalid_export_limit_cannot_start(tmp_path, limit):
     with pytest.raises(ValueError, match='BVH'):
         PairedRecorder(watchdog=False).start(tmp_path, {'subject_id':'PTEST','word_set_id':'SET01','export_fps':limit})
+
+
+@pytest.mark.parametrize('source', ['custom', 'noitom'])
+def test_single_suit_exports_without_other_stream_and_repeats_index(tmp_path, source):
+    clock = Clock()
+    recorder = PairedRecorder(clock=clock, watchdog=False)
+    selected = own if source == 'custom' else noitom
+    excluded = noitom if source == 'custom' else own
+    excluded_name = 'noitom' if source == 'custom' else 'custom'
+    for repeat in range(2):
+        session = recorder.start(tmp_path, {'subject_id':'PTEST', 'word_set_id':'SET01',
+            'duration_s':1., 'recording_sources':[source]})
+        start = clock.now
+        for i in range(51):
+            clock.now = start + i * 20_000_000
+            selected(recorder, clock, i)
+            excluded(recorder, clock, i, **({'invalid': True} if excluded_name == 'noitom' else {'complete': False}))
+            recorder.event(('noitom' if excluded_name == 'noitom' else 'own') + '_disconnect', incomplete=True)
+            if i == 0:
+                assert session.ready.is_set() and session.t0_ns == start
+            assert session.pending == 0
+            assert not (session.noitom if excluded_name == 'noitom' else session.own)
+            recorder.tick()
+        assert session.done.wait(10) and not session.error, session.error
+        assert {path.name for path in session.path.iterdir()} == {source + '.bvh'}
+        _, frames, dt = read_bvh(session.path / (source + '.bvh'))
+        assert frames.shape == (51,45) and dt == .02
+        assert session.metadata['source_rates_hz'] == [50.]
+        assert session.metadata['recording_sources'] == [source]
+        assert session.export_progress['percent'] == 100
+        entries = list(csv.DictReader((tmp_path/'records.csv').open(encoding='utf-8')))
+        assert len(entries) == repeat + 1
+        assert entries[-1][source + '_bvh_path'] == f'{session.path.name}/{source}.bvh'
+        assert entries[-1][excluded_name + '_bvh_path'] == ''
+        append_index(tmp_path, entries[-1])
+        assert len(list(csv.DictReader((tmp_path/'records.csv').open(encoding='utf-8')))) == repeat + 1
+        clock.now += 20_000_000
+
+
+@pytest.mark.parametrize('source', ['custom', 'noitom'])
+def test_single_suit_gap_still_fails(tmp_path, source):
+    clock = Clock()
+    recorder = PairedRecorder(clock=clock, watchdog=False)
+    session = recorder.start(tmp_path, {'subject_id':'PTEST', 'word_set_id':'SET01',
+        'recording_sources':[source]})
+    (own if source == 'custom' else noitom)(recorder, clock, 0)
+    clock.now += 501_000_000
+    recorder.tick()
+    assert session.done.wait(3) and 'разрыв' in session.error
+    assert not (tmp_path/'records.csv').exists()
+
+
+@pytest.mark.parametrize('sources', [[], ['other'], ['custom', 'custom'], 'custom', None])
+def test_invalid_source_selection_cannot_start(tmp_path, sources):
+    recorder = PairedRecorder(watchdog=False)
+    with pytest.raises(ValueError, match='костюм'):
+        recorder.start(tmp_path, {'subject_id':'PTEST','word_set_id':'SET01', 'recording_sources':sources})
+    assert recorder.active is None and not recorder.sessions
+    assert not (tmp_path/'application.log').exists()

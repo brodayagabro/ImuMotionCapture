@@ -12,23 +12,22 @@ from PyQt6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QHBoxLayou
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSlider,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .annotations import (LABELS, angular_speed, candidates, interval, pose_hint,
+from .annotations import (LABELS, angular_speed, annotation_path, candidates, interval, pose_hint,
                           read_document, save_document, validate_intervals)
 from .io import indexed_records
 from .motion import load_bvh, require_pair
 
 
 class Annotator(QMainWindow):
-    def __init__(self, records, labels):
+    def __init__(self, records, labels=None):
         super().__init__()
         # Qt's offscreen Windows plugin does not discover system fonts.
         if not QFontDatabase.families():
             font = Path('C:/Windows/Fonts/segoeui.ttf')
             if font.exists() and QFontDatabase.addApplicationFont(str(font)) >= 0:
                 QApplication.instance().setFont(QFont('Segoe UI', 10))
-        self.root, self.labels_root = Path(records).resolve(), Path(labels).resolve()
-        if self.labels_root == self.root or self.labels_root.is_relative_to(self.root):
-            raise ValueError('Labels must be outside source records')
+        self.root = Path(records).resolve()
+        self.labels_root = Path(labels).resolve() if labels is not None else None
         self.records = [row for row in indexed_records(self.root) if 'noitom' in row['paths']]
         if not self.records:
             raise ValueError('No indexed Noitom recordings')
@@ -153,7 +152,7 @@ class Annotator(QMainWindow):
             motions = {source: load_bvh(path) for source, path in row['paths'].items()}
             if len(motions) == 2:
                 require_pair(motions['custom'], motions['noitom'])
-            path = self.labels_root / (row['recording_id'] + '.json')
+            path = annotation_path(row, self.labels_root)
             document = read_document(path, row, motions)
         except (OSError, ValueError, IndexError) as error:
             self.motion, self.document = None, None
@@ -344,7 +343,7 @@ class Annotator(QMainWindow):
             QMessageBox.warning(self, 'Метки не сохранены', str(error))
 
 
-def launch(records, labels):
+def launch(records, labels=None):
     app = QApplication.instance() or QApplication(sys.argv[:1])
     window = Annotator(records, labels)
     window.show()

@@ -12,12 +12,13 @@ def main():
     audit.add_argument('--output', type=Path, default=OUTPUT_ROOT / 'processing')
     audit.add_argument('--plots', action='store_true', help='Also render PNG/SVG figures (requires matplotlib)')
     audit.add_argument('--labels', type=Path, help='Also compare manually reviewed pose intervals in pairs')
+    audit.add_argument('--reviewed-labels', action='store_true', help='Compare reviewed intervals from JSON beside each BVH')
     annotate = commands.add_parser('annotate', help='Manual interval annotation with pose playback')
     annotate.add_argument('--records', type=Path, default=RECORDS_ROOT)
-    annotate.add_argument('--labels', type=Path, default=OUTPUT_ROOT / 'annotations')
+    annotate.add_argument('--labels', type=Path, help='Override JSON directory; default: beside each BVH')
     train = commands.add_parser('train', help='Train and evaluate a pose baseline on reviewed intervals')
     train.add_argument('--records', type=Path, default=RECORDS_ROOT)
-    train.add_argument('--labels', type=Path, default=OUTPUT_ROOT / 'annotations')
+    train.add_argument('--labels', type=Path, help='Override JSON directory; default: beside each BVH')
     train.add_argument('--output', type=Path, default=OUTPUT_ROOT / 'classifier')
     train.add_argument('--source', choices=['noitom', 'custom'], default='noitom')
     train.add_argument('--group', choices=['subject', 'recording'], default='subject')
@@ -28,13 +29,13 @@ def main():
     predict.add_argument('--output', type=Path, required=True)
     export = commands.add_parser('export-labels', help='Export reviewed mocap intervals and wall-clock hints')
     export.add_argument('--records', type=Path, default=RECORDS_ROOT)
-    export.add_argument('--labels', type=Path, default=OUTPUT_ROOT / 'annotations')
+    export.add_argument('--labels', type=Path, help='Override JSON directory; default: beside each BVH')
     export.add_argument('--output', type=Path, default=OUTPUT_ROOT / 'labels.csv')
     args = parser.parse_args()
     try:
         if args.command == 'analyze':
             from .pipeline import run
-            report = run(args.records, args.output, args.labels)
+            report = run(args.records, args.output, args.labels, use_labels=args.reviewed_labels)
             if args.plots:
                 from .plots import render
                 render(args.output)

@@ -4,13 +4,16 @@ import pytest
 from .test_processing import make_dataset, write_motion
 
 
-@pytest.fixture
-def editor(tmp_path, monkeypatch):
+@pytest.fixture(params=[False, True], ids=['shared_directory', 'beside_bvh'])
+def editor(tmp_path, monkeypatch, request):
     pytest.importorskip('ipywidgets')
     from scripts.ER2026.processing.notebook_annotation import NoitomAnnotator
-    records, labels = make_dataset(tmp_path)
+    records, labels = make_dataset(tmp_path, beside_bvh=request.param)
     monkeypatch.setattr(NoitomAnnotator, '_draw', lambda *args: None)
-    return NoitomAnnotator('P1', records, labels)
+    monkeypatch.chdir(tmp_path)
+    widget = NoitomAnnotator('P1', records) if request.param else NoitomAnnotator('P1', records, labels)
+    assert widget.path == (records / 'P1' if request.param else labels) / 'P1.json'
+    return widget
 
 
 def test_noitom_notebook_save_edit_delete_and_undo(editor):

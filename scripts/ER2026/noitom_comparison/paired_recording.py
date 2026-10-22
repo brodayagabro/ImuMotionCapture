@@ -34,11 +34,18 @@ class PairSession:
         self.ready, self.done = threading.Event(), threading.Event()
         self.error = None
         self.own, self.noitom = [], []
+        sources = metadata.get('recording_sources', ['custom', 'noitom'])
+        if (not isinstance(sources, (list, tuple)) or not sources
+                or any(name not in ('custom', 'noitom') for name in sources)
+                or len(set(sources)) != len(sources)):
+            raise ValueError('Выберите хотя бы один костюм: custom или noitom')
+        self.sources = tuple(name for name in ('custom', 'noitom') if name in sources)
         self.hierarchy = None
         self.avatar = self.heading = self.last_own_key = self.last_noitom_key = None
         self.rejected = {'custom': 0, 'noitom': 0}
         self.coalesced_timestamps = {'custom': 0, 'noitom': 0}
-        self.metadata = {**metadata, 'status': 'arming', 'session_id': self.session_id}
+        self.metadata = {**metadata, 'recording_sources': list(self.sources),
+                         'status': 'arming', 'session_id': self.session_id}
         self.closing = self.exporting = False
         self.closing_started_ns = None
         self.export_progress = {'percent': 0, 'phase': 'Ожидание окончания записи'}
@@ -52,14 +59,16 @@ class PairSession:
         row = dict(session_id=self.session_id, timestamp=self.timestamp, status=status,
                    subject_id=self.subject_id, word_set_id=self.word_set_id,
                    path=str(self.path), error=self.error, **extra)
+        row['recording_sources'] = list(self.sources)
         with (self.root / 'application.log').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + '\n')
 
     def initialize(self):
-        if self.ready.is_set() or not self.own or not self.noitom:
+        streams = self.streams()
+        if self.ready.is_set() or any(not stream for _, stream in streams):
             return
-        self.t0_ns = max(self.own[0][0], self.noitom[0][0])
-        for stream in (self.own, self.noitom):
+        self.t0_ns = max(stream[0][0] for _, stream in streams)
+        for _, stream in streams:
             while len(stream) > 1 and stream[1][0] <= self.t0_ns:
                 del stream[0]
             if self.t0_ns - stream[0][0] > self.max_gap_ns:
@@ -76,6 +85,9 @@ class PairSession:
                      noitom=self.metadata.get('noitom'))
         self.ready.set()
 
+    def streams(self):
+        return [(name, self.own if name == 'custom' else self.noitom) for name in self.sources]
+
     def finish(self):
         try:
             if not self.error:
@@ -89,7 +101,7 @@ class PairSession:
                              'max_source_gaps_ns', 't0_ns', 't1_ns', 'skeleton', 'skeleton_height_m',
                              'joints', 'channels', 'root_translation', 'tracked_segments', 'export_fps_limit') if k in self.metadata})
             if not self.error:
-                self.update_export_progress(100, 'Оба BVH сохранены, строка добавлена в таблицу')
+                self.update_export_progress(100, 'BVH сохранены, строка добавлена в таблицу')
             else:
                 self.update_export_progress(self.export_progress['percent'], 'Запись неполная')
             self.metadata['status'] = status
@@ -147,10 +159,14 @@ class PairedRecorder:
         while not session.done.wait(.02):
             self.tick()
 
-    def stamp_packet(self):
+    def stamp_noitom_packet(self):
+        return self.stamp_packet('noitom')
+
+    def stamp_packet(self, source='custom'):
+        # Unselected receivers keep running, without holding dataset claims.
         with self._lock:
             now, s = self.clock(), self.active
-            if s is None or s.closing:
+            if s is None or s.closing or source not in s.sources:
                 return now, None
             s.pending += 1
             return now, PairClaim(s, now)
@@ -179,7 +195,7 @@ class PairedRecorder:
         with self._lock:
             s = claim.session
             try:
-                if not s.closing and not (s.deadline_ns is not None and s.own and s.own[-1][0] >= s.deadline_ns):
+                if 'custom' in s.sources and not s.closing and not (s.deadline_ns is not None and s.own and s.own[-1][0] >= s.deadline_ns):
                     if frame is None or not frame.get('measurement_complete'):
                         s.rejected['custom'] += 1
                     else:
@@ -202,6 +218,9 @@ class PairedRecorder:
                      enabled_segments=None, heading_offset_rad=0.):
         claim = frame.capture_context
         if claim is None:
+            return
+        if 'noitom' not in claim.session.sources:
+            self.release_claim(claim)
             return
         # Retarget all five measured segments independently of display checkboxes.
         # Do this before taking the acquisition lock so ESP32 stamping cannot wait
@@ -259,6 +278,9 @@ class PairedRecorder:
             with self._lock:
                 self.tick()
                 if self.active:
+                    source = 'custom' if name.startswith('own_') else 'noitom' if name.startswith('noitom_') else None
+                    if source is not None and source not in self.active.sources:
+                        return
                     self._close(self.active, name + (': ' + str(details) if details else ''))
 
     def tick(self):
@@ -275,15 +297,16 @@ class PairedRecorder:
                 return
             if not s.ready.is_set():
                 if now - s.arm_ns > 3_000_000_000:
-                    self._close(s, 'За 3 секунды не получены валидные кадры обоих костюмов')
+                    self._close(s, 'За 3 секунды не получены валидные кадры выбранных костюмов')
                 return
-            if now >= s.deadline_ns and all(stream[-1][0] >= s.deadline_ns for stream in (s.own, s.noitom)):
+            streams = s.streams()
+            if now >= s.deadline_ns and all(stream[-1][0] >= s.deadline_ns for _, stream in streams):
                 self._close(s)
             elif now > s.deadline_ns + self.max_gap_ns:
                 self._close(s, 'Нет кадров для конца общего интервала T1')
-            elif now < s.deadline_ns and any(now - stream[-1][0] > self.max_gap_ns for stream in (s.own, s.noitom)):
+            elif now < s.deadline_ns and any(now - stream[-1][0] > self.max_gap_ns for _, stream in streams):
                 gaps = ', '.join(f'{name}: {(now - stream[-1][0]) / 1e6:.0f} мс'
-                    for name, stream in (('ESP32', s.own), ('Noitom', s.noitom))
+                    for name, stream in streams
                     if now - stream[-1][0] > self.max_gap_ns)
                 self._close(s, 'Длительный разрыв потока (' + gaps + ')')
 

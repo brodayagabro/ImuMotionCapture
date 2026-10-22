@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .annotations import EXCLUDED, read_document
+from .annotations import EXCLUDED, annotation_path, read_document
 from .io import atomic_json, indexed_records, write_csv
 from .motion import load_bvh
 
@@ -95,14 +95,16 @@ def grouped_evaluate(x, y, groups):
 
 
 def train(records, labels, output, source='noitom', group='subject', subjects=None):
-    records, labels, output = Path(records).resolve(), Path(labels).resolve(), Path(output).resolve()
-    if output == records or output.is_relative_to(records) or output == labels or output.is_relative_to(labels):
+    records, output = Path(records).resolve(), Path(output).resolve()
+    labels = Path(labels).resolve() if labels is not None else None
+    if (output == records or output.is_relative_to(records) or
+            (labels is not None and (output == labels or output.is_relative_to(labels)))):
         raise ValueError('Classifier output must be separate from records and annotation directories')
     mapping = json.loads(Path(subjects).read_text(encoding='utf-8')) if subjects else {}
     if not isinstance(mapping, dict) or any(not isinstance(v, str) or not v for v in mapping.values()):
         raise ValueError('Subject mapping must be a JSON object with non-empty string values')
     all_rows = list(indexed_records(records))
-    usable = [r for r in all_rows if source in r['paths'] and (labels / (r['recording_id'] + '.json')).exists()]
+    usable = [r for r in all_rows if source in r['paths'] and annotation_path(r, labels).exists()]
     raw_ids = {r['subject_id'] for r in usable}
     if group == 'subject' and any(s.endswith('_mio') and s[:-4] in raw_ids for s in raw_ids) and not subjects:
         raise ValueError('Provide --subjects mapping: IDs with/without _mio may refer to the same participant')
@@ -111,7 +113,7 @@ def train(records, labels, output, source='noitom', group='subject', subjects=No
     samples, values, targets, groups, manifests, skipped = [], [], [], [], [], []
     for row in usable:
         motion = load_bvh(row['paths'][source])
-        path = labels / (row['recording_id'] + '.json')
+        path = annotation_path(row, labels)
         document = read_document(path, row, {source: motion})
         manifests.append(dict(recording_id=row['recording_id'], source_sha256=motion.sha256,
                               annotation_sha256=hashlib.sha256(path.read_bytes()).hexdigest()))

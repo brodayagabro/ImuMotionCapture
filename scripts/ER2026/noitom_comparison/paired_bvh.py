@@ -109,7 +109,8 @@ def append_index(root, row):
             if reader.fieldnames is not None and reader.fieldnames != list(INDEX_FIELDS):
                 raise ValueError('records.csv имеет другую структуру; файл не изменён')
             for existing in reader:
-                if existing['custom_bvh_path'] == row['custom_bvh_path']:
+                if any(row[field] and existing[field] == row[field]
+                       for field in ('custom_bvh_path', 'noitom_bvh_path')):
                     if existing != row:
                         raise ValueError('Конфликт записи в records.csv')
                     return
@@ -153,13 +154,16 @@ def export_pair(session, progress=None):
         time.sleep(0)
 
     report(1, 'Проверка общей временной шкалы')
-    grid, fps, rates, gaps = common_grid((session.own, session.noitom), session.t0_ns,
+    streams = session.streams()
+    names = [name for name, _ in streams]
+    grid, fps, rates, gaps = common_grid([source for _, source in streams], session.t0_ns,
         session.stop_ns, session.max_gap_ns, session.max_fps)
     recordings = []
-    for number, (name, source) in enumerate((('custom', session.own), ('noitom', session.noitom))):
+    for number, (name, source) in enumerate(streams):
         recording = create_comparison_recording(fps)
         recordings.append(recording)
-        base = 2 + number * 40
+        span = 80 / len(streams)
+        base = 2 + number * span
         times = np.array([s[0] for s in source], dtype=np.int64)
         quaternions = np.asarray([s[1] for s in source])
         if quaternions.shape != (len(times), len(SEGMENTS), 4):
@@ -174,24 +178,25 @@ def export_pair(session, progress=None):
             matrices = quaternion_matrices(q)
             recording.append_batch((grid[start:stop] - session.t0_ns) / 1e9,
                 {segment: matrices[:, index] for index, segment in enumerate(SEGMENTS)})
-            report(base + 25 * stop / len(grid), f'Подготовка {name}.bvh')
+            report(base + span * .625 * stop / len(grid), f'Подготовка {name}.bvh')
         partial = session.path / (name + '.bvh.partial')
         recording.save(partial, uniform_grid=True,
-            progress=lambda fraction, base=base, name=name: report(base + 25 + 15 * fraction, f'Запись {name}.bvh'))
-    for index, (name, recording) in enumerate(zip(('custom', 'noitom'), recordings)):
+            progress=lambda fraction, base=base, name=name: report(base + span * (.625 + .375 * fraction), f'Запись {name}.bvh'))
+    for index, (name, recording) in enumerate(zip(names, recordings)):
         validate_bvh(session.path / (name + '.bvh.partial'), len(grid), fps, recording.joints,
-            progress=lambda fraction, index=index, name=name: report(82 + index * 6 + 6 * fraction, f'Проверка {name}.bvh'))
-    if recordings[0].joints != recordings[1].joints:
+            progress=lambda fraction, index=index, name=name: report(82 + (index + fraction) * 12 / len(streams), f'Проверка {name}.bvh'))
+    if any(recording.joints != recordings[0].joints for recording in recordings[1:]):
         raise ValueError('Скелеты BVH не совпадают')
-    report(95, 'Завершение сохранения двух файлов')
-    for name in ('custom', 'noitom'):
+    report(95, 'Завершение сохранения BVH')
+    for name in names:
         source, target = session.path / (name + '.bvh.partial'), session.path / (name + '.bvh')
         if target.exists():
             raise FileExistsError(target)
         source.rename(target)
     report(97, 'Добавление строки в таблицу')
     append_index(session.root, dict(zip(INDEX_FIELDS, (session.timestamp, session.subject_id, session.word_set_id,
-        f'{session.path.name}/custom.bvh', f'{session.path.name}/noitom.bvh'))))
+        f'{session.path.name}/custom.bvh' if 'custom' in names else '',
+        f'{session.path.name}/noitom.bvh' if 'noitom' in names else ''))))
     return {'frames': len(grid), 'fps': fps, 'frame_time': 1 / fps, 'source_rates_hz': rates,
             'max_source_gaps_ns': gaps, 't0_ns': session.t0_ns, 't1_ns': session.stop_ns,
             'skeleton': SKELETON_ID, 'skeleton_height_m': HEIGHT_M, 'joints': len(recordings[0].joints),

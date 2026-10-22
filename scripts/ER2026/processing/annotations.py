@@ -15,6 +15,18 @@ LABELS = tuple(SEMAPHORE_POSES) + SPECIAL
 EXCLUDED = frozenset(('TRANSITION', 'BAD', 'UNKNOWN'))
 
 
+def annotation_path(row, labels_root=None):
+    """JSON beside the indexed BVH; an explicit directory keeps the legacy layout."""
+    if labels_root is not None:
+        folder = Path(labels_root).resolve()
+    else:
+        folders = {Path(path).resolve().parent for path in row['paths'].values()}
+        if len(folders) != 1:
+            raise ValueError('Annotation sources must share one recording directory')
+        folder = folders.pop()
+    return folder / (row['recording_id'] + '.json')
+
+
 def validate_intervals(intervals, duration):
     previous = 0.
     ids = set()

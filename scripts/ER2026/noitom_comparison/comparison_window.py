@@ -156,6 +156,8 @@ class MocapComparisonWindow(OpenGLMotionCaptureWindow):
     def _control_status(self):
         calibration = (self.calibration_document or {}).get('calibration', {})
         return {**self.recorder.recording_state(),
+                'recording_sources': self._recording_sources(),
+                'last_recording_sources': list(self.session.sources) if self.session else [],
                 'recording_path': str(self.session.path) if self.session and self.experiment_recording_active else None,
                 'series_context': self.series_context,
                 'records_root': str(Path(self.options.recordings_dir).resolve()),
@@ -201,14 +203,24 @@ class MocapComparisonWindow(OpenGLMotionCaptureWindow):
             status = self._control_status()
             if self.experiment_recording_active or status['saving'] or status['calibration_running']:
                 raise ValueError('Завершите текущую запись или калибровку')
-            if not self.streaming_requested or not self.noitom_worker.streaming or not status['own_fresh'] or not status['noitom_fresh']:
-                raise ValueError('Нужны свежие кадры обоих костюмов')
-            if status['own_calibration_method'] != 'neutral_a_semaphore_a_t_u_neutral_a_sensor_y' or not self.noitom_calibration:
-                raise ValueError('Выполните пятиэтапную калибровку и подтвердите калибровку Noitom')
+            sources = self._recording_sources()
+            if not sources:
+                raise ValueError('Выберите хотя бы один костюм для записи в окне захвата')
+            if 'custom' in sources:
+                if not self.streaming_requested or not status['own_fresh']:
+                    raise ValueError('Нужны свежие кадры custom (ESP32)')
+                if status['own_calibration_method'] != 'neutral_a_semaphore_a_t_u_neutral_a_sensor_y':
+                    raise ValueError('Выполните пятиэтапную калибровку custom (ESP32)')
+            if 'noitom' in sources:
+                if not self.noitom_worker.streaming or not status['noitom_fresh']:
+                    raise ValueError('Нужны свежие кадры Noitom')
+                if not self.noitom_calibration:
+                    raise ValueError('Подтвердите калибровку Noitom')
             self.series_context = {'subject_id': payload.get('subject_id'),
                                    'word_set_id': payload.get('word_set_id'),
                                    'duration_s': payload.get('duration_s', 300.),
-                                   'export_fps': payload.get('export_fps', 50.)}
+                                   'export_fps': payload.get('export_fps', 50.),
+                                   'recording_sources': sources}
             try:
                 self.start_experiment_recording()
             except Exception:
@@ -224,8 +236,17 @@ class MocapComparisonWindow(OpenGLMotionCaptureWindow):
         return {**self._control_status(), 'series_context': self.series_context}
 
     def _build_comparison_controls(self):
+        self.own_record_check = QCheckBox('Custom · в датасет')
+        self.own_record_check.setChecked(True)
+        self.own_record_check.setToolTip('Записывать custom.bvh с ESP32. Снимите галочку для записи только Noitom.')
+        own_bar = self.connect_button.parentWidget().layout()
+        own_bar.insertWidget(0, self.own_record_check)
         bar = QHBoxLayout()
         bar.addWidget(QLabel("<b>Noitom</b>" + (" · SYNTHETIC" if self.options.fake else "")))
+        self.noitom_record_check = QCheckBox('В датасет')
+        self.noitom_record_check.setChecked(True)
+        self.noitom_record_check.setToolTip('Записывать noitom.bvh. Снимите галочку для записи только custom.')
+        bar.addWidget(self.noitom_record_check)
         self.noitom_buttons = {}
         for command, title in (("connect", "Connect"), ("disconnect", "Disconnect"),
                                ("start", "Start"), ("stop", "Stop")):
@@ -255,13 +276,17 @@ class MocapComparisonWindow(OpenGLMotionCaptureWindow):
         self.export_progress_bar.setValue(0)
         self.export_progress_bar.hide()
         self.centralWidget().layout().insertWidget(4, self.export_progress_bar)
-        # The main visualizer keeps manual BVH recording; this experiment exposes only paired capture.
+        # Dataset capture is controlled by the experiment presenter.
         self.record_bvh_button.hide()
         self.save_bvh_button.hide()
         self.bvh_label.hide()
         for action in (self.record_bvh_action, self.stop_bvh_action, self.save_bvh_action):
             action.setVisible(False)
         self._update_comparison_status()
+
+    def _recording_sources(self):
+        return [name for name, check in (('custom', self.own_record_check),
+                                        ('noitom', self.noitom_record_check)) if check.isChecked()]
 
     def _stamp_packet(self):
         return self.recorder.stamp_packet()
@@ -419,8 +444,11 @@ class MocapComparisonWindow(OpenGLMotionCaptureWindow):
         if not self.series_context:
             self.open_experiment_presenter()
             return
+        sources = self.series_context.get('recording_sources', ['custom', 'noitom'])
         self.session = self.recorder.start(self.options.recordings_dir,
-            {**self._metadata(), **self.series_context, 'max_fps': self.config.stream_rate_hz, 'require_heartbeat': True})
+            {**self._metadata(), **self.series_context,
+             'max_fps': self.config.stream_rate_hz if 'custom' in sources else 100.,
+             'require_heartbeat': True})
         self.recording_t0_ns = self.session.t0_ns
         self.export_progress_bar.setValue(0)
         self.export_progress_bar.hide()
@@ -428,10 +456,11 @@ class MocapComparisonWindow(OpenGLMotionCaptureWindow):
         self.experiment_button.setText("Открыть эксперимент…")
         self.session_label.setText("Запись: " + str(self.session.path))
         self._stale_sources.clear()
-        if not self.streaming_requested:
+        if 'custom' in self.session.sources and not self.streaming_requested:
             self.recorder.event("own_not_streaming_at_start", incomplete=True)
-        if not self.noitom_worker.streaming:
+        if 'noitom' in self.session.sources and not self.noitom_worker.streaming:
             self.recorder.event("noitom_not_streaming_at_start", incomplete=True)
+        self._update_comparison_status()
 
     def stop_experiment_recording(self):
         if not self.experiment_recording_active:
@@ -505,6 +534,10 @@ class MocapComparisonWindow(OpenGLMotionCaptureWindow):
 
     def _update_comparison_status(self):
         self._update_imu_calibration_button()
+        busy = (self.experiment_recording_active or bool(self.series_context)
+                or bool(self.session and not self.session.done.is_set()) or self._closing_requested)
+        for check in (self.own_record_check, self.noitom_record_check):
+            check.setEnabled(not busy)
         now = time.perf_counter_ns()
         summaries = []
         for source, stats, running, started in (

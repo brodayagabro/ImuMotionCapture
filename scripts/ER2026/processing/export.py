@@ -2,7 +2,7 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .annotations import EXCLUDED, read_document
+from .annotations import EXCLUDED, annotation_path, read_document
 from .io import indexed_records, write_csv
 from .motion import load_bvh
 
@@ -18,7 +18,7 @@ def export_labels(records, labels, output):
         raise ValueError('Label export must be outside source records')
     rows = []
     for row in indexed_records(root):
-        path = Path(labels) / (row['recording_id'] + '.json')
+        path = annotation_path(row, labels)
         if not path.exists():
             continue
         # Check hashes before exporting labels for downstream work.

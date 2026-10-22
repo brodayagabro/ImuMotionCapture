@@ -1,4 +1,4 @@
-"""Independent timed recordings: one word set, two BVHs, one CSV row."""
+"""Independent timed recordings: one word set, selected suits, one CSV row."""
 from dataclasses import replace
 from pathlib import Path
 import csv
@@ -35,7 +35,7 @@ class PresenterWindow(QMainWindow):
         self.client = RecorderClient(self, continuous_control=True)
         self.client.controlled.connect(self._controlled)
         self.client.failed.connect(self._connection_failed)
-        self.setWindowTitle('Семафор · запись двух костюмов' + (' · ПРЕДПРОСМОТР' if debug else ''))
+        self.setWindowTitle('Семафор · запись костюмов' + (' · ПРЕДПРОСМОТР' if debug else ''))
         self.resize(850, 690)
         self.setStyleSheet("QWidget { font-family: 'Segoe UI'; font-size: 13px; } QPushButton { padding: 8px; }")
         root = QWidget()
@@ -59,7 +59,7 @@ class PresenterWindow(QMainWindow):
         self.export_fps_spin.setDecimals(1)
         self.export_fps_spin.setSuffix(' кадр/с')
         self.export_fps_spin.setValue(config.export_fps)
-        self.export_fps_spin.setToolTip('Общий предел частоты двух BVH. Если костюм передаёт реже, частота обоих файлов будет снижена.')
+        self.export_fps_spin.setToolTip('Предел частоты выбранных BVH. Если выбранный костюм передаёт реже, частота файлов будет снижена.')
         self.transition_spin = QDoubleSpinBox()
         self.transition_spin.setRange(.01, 10)
         self.transition_spin.setDecimals(2)
@@ -175,10 +175,17 @@ class PresenterWindow(QMainWindow):
             self.starting = False
         own = 'поток есть' if message.get('own_fresh') else 'нет свежих данных'
         noitom = 'поток есть' if message.get('noitom_fresh') else 'нет свежих данных'
+        sources = message.get('recording_sources', ['custom', 'noitom'])
+        if 'custom' not in sources:
+            own = 'не записывается'
+        if 'noitom' not in sources:
+            noitom = 'не записывается'
         self.source_label.setText(f'ESP32: {own}    |    Noitom: {noitom}')
         own_cal = message.get('own_calibration_method') == 'neutral_a_semaphore_a_t_u_neutral_a_sensor_y'
+        own_cal_text = ('готова' if own_cal else 'нужна') if 'custom' in sources else 'не требуется'
+        noitom_cal_text = ('подтверждена' if message.get('noitom_calibration') else 'нужна') if 'noitom' in sources else 'не требуется'
         self.calibration_label.setText('Калибровка: ' + ('выполняется' if message.get('calibration_running') else
-            f'ESP32 {"готова" if own_cal else "нужна"} · Noitom {"подтверждена" if message.get("noitom_calibration") else "нужна"}'))
+            f'ESP32 {own_cal_text} · Noitom {noitom_cal_text}'))
         if self.session_id and message.get('last_recording_id') == self.session_id:
             if message.get('ready') and not self.display_started:
                 self.deadline_ns = message['recording_t1_ns']
@@ -192,7 +199,8 @@ class PresenterWindow(QMainWindow):
                 self._end_display()
                 if status == 'complete':
                     data = message.get('last_export', {})
-                    self.result_label.setText(f'Сохранены custom.bvh и noitom.bvh · {data.get("frames")} кадров · '
+                    files = ' и '.join(name + '.bvh' for name in message.get('last_recording_sources', ['custom', 'noitom']))
+                    self.result_label.setText(f'Сохранено: {files} · {data.get("frames")} кадров · '
                         f'{data.get("fps", 0):.3f} Гц\n{message.get("last_recording_path")}')
                     self.participant_window.show_status('Запись сохранена', 'Спасибо за участие')
                 else:
@@ -225,8 +233,8 @@ class PresenterWindow(QMainWindow):
         self.deadline_ns = None
         self.export_progress.setValue(0)
         self.export_progress.hide()
-        self.result_label.setText('Ожидание подтверждения записи обоих костюмов…')
-        self.participant_window.show_status('Приготовьтесь', 'Ожидание начала записи обоих костюмов…')
+        self.result_label.setText('Ожидание подтверждения записи выбранных костюмов…')
+        self.participant_window.show_status('Приготовьтесь', 'Ожидание начала записи выбранных костюмов…')
         self._show_participant()
         if self.debug:
             self.session_id = 'preview'
@@ -290,16 +298,22 @@ class PresenterWindow(QMainWindow):
     def _refresh(self):
         busy = bool(self.starting or self.session_id or self.status.get('saving') or self.status.get('arming') or self.status.get('ready'))
         cal_busy = self.status.get('calibration_running')
-        ready = (self.status.get('own_fresh') and self.status.get('noitom_fresh') and
-                 self.status.get('own_calibration_method') == 'neutral_a_semaphore_a_t_u_neutral_a_sensor_y' and
-                 self.status.get('noitom_calibration'))
+        sources = self.status.get('recording_sources', ['custom', 'noitom'])
+        own_ready = (self.status.get('own_streaming', self.status.get('own_fresh')) and
+                     self.status.get('own_fresh') and
+                     self.status.get('own_calibration_method') == 'neutral_a_semaphore_a_t_u_neutral_a_sensor_y')
+        noitom_ready = (self.status.get('noitom_streaming', self.status.get('noitom_fresh')) and
+                        self.status.get('noitom_fresh') and self.status.get('noitom_calibration'))
+        ready = (bool(sources) and ('custom' not in sources or own_ready)
+                 and ('noitom' not in sources or noitom_ready))
         self.start_button.setEnabled(bool(not busy and not cal_busy and (self.debug or ready)))
         self.stop_button.setEnabled(bool(self.session_id) and not self.status.get('saving'))
         for widget in (self.participant_edit, self.word_set_combo, self.duration_spin, self.export_fps_spin, self.transition_spin,
                        self.mirror_check, self.screen_combo, self.fullscreen_check):
             widget.setEnabled(not busy)
         for button in (self.calibrate_button, self.imu_button, self.noitom_button):
-            button.setEnabled(not busy and not cal_busy and not self.debug)
+            source = 'noitom' if button is self.noitom_button else 'custom'
+            button.setEnabled(not busy and not cal_busy and not self.debug and source in sources)
 
     def _load_records(self):
         path = self.sessions_root / 'records.csv'

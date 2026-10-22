@@ -9,20 +9,19 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.ER2026.paths import OUTPUT_ROOT, RECORDS_ROOT
-from .annotations import (LABELS, angular_speed, candidates, interval, read_document,
+from scripts.ER2026.paths import RECORDS_ROOT
+from .annotations import (LABELS, angular_speed, annotation_path, candidates, interval, read_document,
                           save_document, validate_intervals)
 from .io import indexed_records
 from .motion import load_bvh, require_pair
 
 
 class NoitomAnnotator:
-    def __init__(self, recording_id=None, records_root=RECORDS_ROOT, labels_root=OUTPUT_ROOT / 'annotations'):
+    def __init__(self, recording_id=None, records_root=RECORDS_ROOT, labels_root=None):
         import ipywidgets as w
 
-        self.records_root, self.labels_root = Path(records_root).resolve(), Path(labels_root).resolve()
-        if self.labels_root == self.records_root or self.labels_root.is_relative_to(self.records_root):
-            raise ValueError('Labels must be outside source records')
+        self.records_root = Path(records_root).resolve()
+        self.labels_root = Path(labels_root).resolve() if labels_root is not None else None
         self.rows = {r['recording_id']: r for r in indexed_records(self.records_root) if 'noitom' in r['paths']}
         if not self.rows:
             raise ValueError('No indexed Noitom recordings')
@@ -92,7 +91,7 @@ class NoitomAnnotator:
             if len(motions) == 2:
                 require_pair(motions['custom'], motions['noitom'])
             motion = motions['noitom']
-            path = self.labels_root / (recording_id + '.json')
+            path = annotation_path(row, self.labels_root)
             document = read_document(path, row, motions)
             self.motion, self.document, self.path = motion, document, path
             self.positions, self.rotations = motion.body_positions(), motion.body_rotations()

@@ -121,7 +121,7 @@ def test_unseen_test_class_is_reported():
     assert report['folds'][0]['unseen_test_classes'] == ['А']
 
 
-def make_dataset(tmp_path):
+def make_dataset(tmp_path, *, beside_bvh=False):
     records = tmp_path / 'records'
     labels = tmp_path / 'labels'
     records.mkdir()
@@ -139,12 +139,14 @@ def make_dataset(tmp_path):
         motion = load_bvh(row['paths']['noitom'])
         document = new_document(row, {'noitom': motion})
         document['intervals'] = [interval(.1, 1.5, 'А'), interval(2., 3.5, 'Б'), interval(3.5, 4., 'BAD')]
-        save_document(labels / (row['recording_id'] + '.json'), document, motion.duration)
-    return records, labels
+        folder = records / row['recording_id'] if beside_bvh else labels
+        save_document(folder / (row['recording_id'] + '.json'), document, motion.duration)
+    return records, None if beside_bvh else labels
 
 
-def test_training_and_prediction_end_to_end(tmp_path):
-    records, labels = make_dataset(tmp_path)
+@pytest.mark.parametrize('beside_bvh', [False, True])
+def test_training_and_prediction_end_to_end(tmp_path, beside_bvh):
+    records, labels = make_dataset(tmp_path, beside_bvh=beside_bvh)
     output = tmp_path / 'model'
     report = train(records, labels, output)
     assert report['status'] == 'evaluated'
@@ -184,9 +186,10 @@ def test_index_rejects_path_escape(tmp_path):
         list(indexed_records(tmp_path))
 
 
-def test_reviewed_label_export_preserves_bvh_time_basis(tmp_path):
+@pytest.mark.parametrize('beside_bvh', [False, True])
+def test_reviewed_label_export_preserves_bvh_time_basis(tmp_path, beside_bvh):
     from scripts.ER2026.processing.export import export_labels
-    records, labels = make_dataset(tmp_path)
+    records, labels = make_dataset(tmp_path, beside_bvh=beside_bvh)
     rows = export_labels(records, labels, tmp_path / 'export.csv')
     assert len(rows) == 6
     assert all(r['time_basis'] == 'BVH seconds; half-open [start_s,end_s)' for r in rows)
@@ -217,8 +220,9 @@ def test_static_pair_has_no_invented_lag(tmp_path):
     assert report['lag_diagnostics']['P1']['best_lag_s'] is None
 
 
-def test_comparison_of_reviewed_intervals(tmp_path):
-    records, labels = make_dataset(tmp_path)
+@pytest.mark.parametrize('beside_bvh', [False, True])
+def test_comparison_of_reviewed_intervals(tmp_path, beside_bvh):
+    records, labels = make_dataset(tmp_path, beside_bvh=beside_bvh)
     folder = records / 'P1'
     write_motion(folder / 'custom.bvh', frames=201)
     rows = list(indexed_records(records))
@@ -230,8 +234,8 @@ def test_comparison_of_reviewed_intervals(tmp_path):
     motions = {s: load_bvh(p) for s, p in row['paths'].items()}
     document = new_document(row, motions)
     document['intervals'] = [interval(.1, 1.5, 'А'), interval(2, 3, 'BAD')]
-    save_document(labels / 'P1.json', document, 4.)
-    report = run(records, tmp_path / 'interval_analysis', labels)
+    save_document((folder if beside_bvh else labels) / 'P1.json', document, 4.)
+    report = run(records, tmp_path / 'interval_analysis', labels, use_labels=True)
     assert report['annotation_metrics'] == dict(requested=True, errors={}, intervals=1)
 
 

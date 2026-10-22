@@ -24,7 +24,8 @@ pytestmark = pytest.mark.gui
 
 
 @pytest.mark.parametrize('control', ['tcp', 'builtin'])
-def test_tcp_control_udp_acquisition_loop_export_repeat_early_stop_and_reopen(tmp_path, monkeypatch, control):
+@pytest.mark.parametrize('sources', [('custom','noitom'), ('custom',), ('noitom',)])
+def test_tcp_control_udp_acquisition_loop_export_repeat_early_stop_and_reopen(tmp_path, monkeypatch, control, sources):
     monkeypatch.setattr(mpu_udp_viewer, 'QSettings', lambda *a: QSettings(str(tmp_path/'viewer.ini'), QSettings.Format.IniFormat))
     app = QApplication.instance() or QApplication([])
     window = MocapComparisonWindow(ComparisonConfig(fake=True, recordings_dir=str(tmp_path/'records')),
@@ -39,18 +40,23 @@ def test_tcp_control_udp_acquisition_loop_export_repeat_early_stop_and_reopen(tm
     udp.bind(('127.0.0.1',0))
     udp.settimeout(1)
     window.config.device_ip, window.config.device_port = udp.getsockname()
+    window.own_record_check.setChecked('custom' in sources)
+    window.noitom_record_check.setChecked('noitom' in sources)
     stopping = threading.Event()
     producer = reopened = None
     try:
-        assert window.connect_device()
-        _, address = udp.recvfrom(1024)
         captures = physical_series_captures()
-        window._apply_guided_calibration(calibrate_series(captures))
-        profile_path = tmp_path / 'saved_calibration.json'
-        profile_path.write_text(json.dumps(window.calibration_document), encoding='utf-8')
-        window.load_calibration_profile(profile_path)
-        assert abs(window.model.drift_reference_s - time.perf_counter()) < 1.
-        assert window._control_status()['own_calibration_method'] == 'neutral_a_semaphore_a_t_u_neutral_a_sensor_y'
+        if 'custom' in sources:
+            assert window.connect_device()
+            _, address = udp.recvfrom(1024)
+            window._apply_guided_calibration(calibrate_series(captures))
+            profile_path = tmp_path / 'saved_calibration.json'
+            profile_path.write_text(json.dumps(window.calibration_document), encoding='utf-8')
+            window.load_calibration_profile(profile_path)
+            assert abs(window.model.drift_reference_s - time.perf_counter()) < 1.
+            assert window._control_status()['own_calibration_method'] == 'neutral_a_semaphore_a_t_u_neutral_a_sensor_y'
+        else:
+            window.config.stream_rate_hz = 10  # An unused ESP32 must not cap Noitom export.
         values = captures['neutral_a_pose'].average
         def stream():
             index = 0
@@ -59,14 +65,18 @@ def test_tcp_control_udp_acquisition_loop_export_repeat_early_stop_and_reopen(tm
                 payload = f'FRAME {index} {index*20} 5\n'+'\n'.join(
                     f'Q {sid} '+' '.join(map(str,values[name])) for name,sid in DEFAULT_SENSOR_MAPPING.items())
                 udp.sendto(payload.encode(), address)
-        window.start_stream()
-        producer = threading.Thread(target=stream, daemon=True)
-        producer.start()
-        window.noitom_worker.command('connect')
-        window.noitom_worker.command('start')
-        pump_until(app, lambda: window.noitom_stats.frames>3 and window.own_stats.frames>3 and
+        if 'custom' in sources:
+            window.start_stream()
+            producer = threading.Thread(target=stream, daemon=True)
+            producer.start()
+        if 'noitom' in sources:
+            window.noitom_worker.command('connect')
+            window.noitom_worker.command('start')
+        pump_until(app, lambda: ('noitom' not in sources or window.noitom_stats.frames>3) and
+                   ('custom' not in sources or window.own_stats.frames>3) and
                    (control == 'builtin' or presenter.client.control_supported))
-        presenter._send('confirm_noitom_calibration')
+        if 'noitom' in sources:
+            presenter._send('confirm_noitom_calibration')
         pump_until(app, presenter.start_button.isEnabled)
         saved = []
         for i in range(2):
@@ -78,6 +88,7 @@ def test_tcp_control_udp_acquisition_loop_export_repeat_early_stop_and_reopen(tm
             pump_until(app, lambda: presenter.loop is not None)
             assert session.ready.is_set() and presenter.deadline_ns == session.deadline_ns
             assert not window.imu_calibration_button.isEnabled()
+            assert not window.own_record_check.isEnabled() and not window.noitom_record_check.isEnabled()
             assert not presenter.word_set_combo.isEnabled()
             poses = set()
             def avatar_moves():
@@ -87,11 +98,18 @@ def test_tcp_control_udp_acquisition_loop_export_repeat_early_stop_and_reopen(tm
             pump_until(app, lambda: presenter.loop is not None and presenter.loop.cycles>=2)
             pump_until(app, lambda: session.done.is_set() and presenter.session_id is None, timeout=8)
             assert session.metadata['status']=='complete', session.error
-            assert (session.path/'custom.bvh').exists() and (session.path/'noitom.bvh').exists()
+            assert {p.name for p in session.path.iterdir()} == {name + '.bvh' for name in sources}
+            assert session.sources == sources
+            if sources == ('noitom',):
+                assert session.metadata['fps'] > 10
+                assert 'custom.bvh' not in presenter.result_label.text()
+            elif sources == ('custom',):
+                assert 'noitom.bvh' not in presenter.result_label.text()
             assert session.stop_ns-session.t0_ns==3_000_000_000
             assert presenter.participant_window.caption.text() == 'Запись сохранена'
             assert presenter.export_progress.value() == 100
             pump_until(app, presenter.start_button.isEnabled)
+            assert window.own_record_check.isEnabled() and window.noitom_record_check.isEnabled()
         assert saved[0].path != saved[1].path
         presenter.duration_spin.setValue(3)
         presenter._start()
@@ -105,13 +123,16 @@ def test_tcp_control_udp_acquisition_loop_export_repeat_early_stop_and_reopen(tm
         with (tmp_path/'records/records.csv').open(encoding='utf-8') as f:
             rows=list(csv.DictReader(f))
         assert len(rows)==2 and [r['word_set_id'] for r in rows]==['SET01','SET02']
+        for row in rows:
+            for name in ('custom', 'noitom'):
+                assert bool(row[name + '_bvh_path']) == (name in sources)
         assert not list((tmp_path/'records').rglob('*.jsonl'))
         assert not list((tmp_path/'records').rglob('events.csv'))
         presenter.close()
         reopened = PresenterWindow(config, backend=window._handle_control)
         reopened._poll()
         assert reopened.records_table.rowCount()==2
-        assert window.model.segment_calibrations
+        assert bool(window.model.segment_calibrations) == ('custom' in sources)
     finally:
         presenter.close()
         if reopened: reopened.close()
@@ -198,3 +219,27 @@ def test_start_rejection_is_visible_on_participant_screen(tmp_path):
     finally:
         presenter.participant_window.close()
         presenter.close()
+
+
+def test_empty_suit_selection_blocks_start_and_does_not_create_dataset(tmp_path, monkeypatch):
+    monkeypatch.setattr(mpu_udp_viewer, 'QSettings', lambda *a: QSettings(str(tmp_path/'viewer.ini'), QSettings.Format.IniFormat))
+    app = QApplication.instance() or QApplication([])
+    window = MocapComparisonWindow(ComparisonConfig(fake=True, recordings_dir=str(tmp_path/'records')))
+    presenter = PresenterWindow(load_config(), backend=window._handle_control)
+    try:
+        assert window.own_record_check.isChecked() and window.noitom_record_check.isChecked()
+        window.own_record_check.setChecked(False)
+        window.noitom_record_check.setChecked(False)
+        presenter._poll()
+        assert presenter.status['recording_sources'] == []
+        assert not presenter.start_button.isEnabled()
+        assert not presenter.calibrate_button.isEnabled() and not presenter.noitom_button.isEnabled()
+        assert 'не записывается' in presenter.source_label.text()
+        with pytest.raises(ValueError, match='хотя бы один'):
+            window._handle_control({'command':'start_recording', 'subject_id':'PTEST', 'word_set_id':'SET01'})
+        assert window.session is None and window.series_context is None
+        assert not (tmp_path/'records').exists()
+    finally:
+        presenter.close()
+        window.close()
+        pump_until(app, lambda: window._allow_close)
