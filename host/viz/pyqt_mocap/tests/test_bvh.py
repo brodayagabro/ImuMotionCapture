@@ -125,6 +125,42 @@ def test_export_height_is_170cm_and_feet_are_on_floor(tmp_path):
     assert recording.units_per_meter == 1.
 
 
+def test_batch_export_matches_scalar_rotations_across_chunks_and_gimbal_lock():
+    scalar, batched = create_recording(50), create_recording(50)
+    angles = np.linspace(-4*math.pi, 4*math.pi, 601)
+    angles[300:302] = (math.pi/2, -math.pi/2)
+    matrices = np.array([rotation('Z', .7) @ rotation('X', a) @ rotation('Y', -.4) for a in angles])
+    for i, matrix in enumerate(matrices):
+        scalar.append(i/50, dict.fromkeys(SEGMENT_NAMES, matrix))
+    for start in range(0,len(matrices),63):
+        stop = min(start+63,len(matrices))
+        batched.append_batch(np.arange(start,stop)/50, dict.fromkeys(SEGMENT_NAMES,matrices[start:stop]))
+    np.testing.assert_allclose(batched.frames, scalar.frames, atol=1e-6)
+    assert batched.times == scalar.times
+
+
+def test_comparison_skeleton_height_and_forearm_endpoints(tmp_path):
+    from scripts.ER2026.noitom_comparison.bvh_skeleton import create_comparison_recording
+    recording = create_comparison_recording(50)
+    recording.append(0., {name:np.eye(3) for name in SEGMENT_NAMES})
+    path = tmp_path/'comparison.bvh'
+    recording.save(path)
+    joints,frames,_ = read_bvh(path)
+    points = positions(joints,frames[0])
+    text = path.read_text()
+    head = text.split('JOINT Head',1)[1].split('End Site',1)[1]
+    top = points['Head'] + np.fromstring(re.search(r'OFFSET\s+([^\n]+)',head)[1],sep=' ')
+    assert top[1] == pytest.approx(1.70,abs=1e-7)
+    assert points['LeftFoot'][1] == pytest.approx(0.,abs=1e-7)
+    assert not any('Hand' in j[0] for j in joints)
+    reference = compute_body_pose({})
+    scale,origin = export_geometry()
+    for name,index in (('LeftForeArm',7),('RightForeArm',8)):
+        end = text.split('JOINT '+name,1)[1].split('End Site',1)[1]
+        tip = points[name] + np.fromstring(re.search(r'OFFSET\s+([^\n]+)',end)[1],sep=' ')
+        np.testing.assert_allclose(tip,TO_BVH @ ((reference.joints[index]-origin)*scale),atol=1e-7)
+
+
 def test_leaf_end_sites_have_explicit_lengths(tmp_path):
     recording = create_recording(40)
     recording.append(0., {name: np.eye(3) for name in SEGMENT_NAMES})

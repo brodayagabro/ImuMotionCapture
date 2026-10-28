@@ -213,7 +213,7 @@ class GuidedCalibrationTests(unittest.TestCase):
         document = profile_document({}, calibrate_five_poses(self.captures))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profile.json"
-            for version in (1, 2, 3, 4, 5):
+            for version in (1, 2, 3, 4, 5, 6):
                 document["version"] = version
                 save_profile(path, document)
                 self.assertEqual(load_profile(path)["version"], version)
@@ -326,7 +326,7 @@ class GuidedCalibrationTests(unittest.TestCase):
         model = MotionCaptureModel(
             DEFAULT_SENSOR_MAPPING, identity_maps, "raw", smooth_alpha=1.0
         )
-        model.set_guided_calibration(identity_maps, rates, neutral, 0.0)
+        model.set_guided_calibration(identity_maps, rates, neutral, 0.0, apply_drift_compensation=True)
         drifted = quaternion_from_rotation_vector((0.0, 0.0, 1.0))
         lines = ["FRAME 1 10000 5"]
         for sensor_id in DEFAULT_SENSOR_MAPPING.values():

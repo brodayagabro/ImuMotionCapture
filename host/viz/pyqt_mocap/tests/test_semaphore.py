@@ -146,7 +146,7 @@ def test_automatic_semaphore_wizard(monkeypatch):
     from PyQt6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
     clock = [100.]
-    monkeypatch.setattr(guided_dialog, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(guided_dialog, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
     captures = semaphore_captures()
     generation = [0]
 

@@ -28,6 +28,9 @@ ImuMotionCapture/
 │   └── tools/                     # вспомогательные утилиты
 ├── tools/
 │   └── benchmarks/udp_frequency/  # измерение и анализ частоты UDP
+├── scripts/
+│   ├── ER2026/                   # эксперимент двух костюмов к конференции ER2026
+│   └── MocapApi/                 # внешний SDK Noitom (локальная зависимость)
 └── docs/                           # дополнительная документация
 ```
 
@@ -115,6 +118,18 @@ cp wifi_secrets.example.h wifi_secrets.h
 ESP32 и показывает обнаруженные устройства на каждом канале TCA9548A.
 
 ## Визуализаторы
+
+### Эксперимент ER2026
+
+Код эксперимента, настройки, диагностика и тесты находятся в
+[`scripts/ER2026`](scripts/ER2026/README.md). Запуск из корня репозитория:
+
+```powershell
+.venv\Scripts\python.exe scripts\ER2026\main.py
+```
+
+Парные BVH и таблица сохраняются в `scripts/ER2026/records/`.
+Эта папка и результаты диагностики `scripts/ER2026/output/` исключены из Git.
 
 ### PyQt MoCap
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
@@ -12,6 +13,7 @@ from .calibration import (
     load_profile,
     profile_document,
     save_profile,
+    restore_profile_calibration,
 )
 from .guided_dialog import GuidedCalibrationDialog
 from .mocap_core import (
@@ -56,7 +58,7 @@ class CalibrationWindowMixin:
     def open_semaphore_calibration(self) -> None:
         self.open_guided_calibration(semaphore=True)
 
-    def open_guided_calibration(self, checked=False, *, semaphore=False) -> None:
+    def open_guided_calibration(self, checked=False, *, semaphore=False, t_pose_only=False) -> None:
         if self.bvh_active:
             self.stop_bvh_recording()
         if self.sock is None or not self.streaming_requested:
@@ -71,8 +73,9 @@ class CalibrationWindowMixin:
             self.guided_dialog.raise_()
             self.guided_dialog.activateWindow()
             return
-        dialog = GuidedCalibrationDialog(
+        dialog = self._create_guided_calibration_dialog(
             self._calibration_snapshot, self, semaphore=semaphore,
+            t_pose_only=t_pose_only,
             preferred_axis_maps=dict(self.config.axis_maps),
             prior_alignment={name: value.copy() for name, value
                              in self.model.axis_alignment_quaternion.items()},
@@ -83,6 +86,9 @@ class CalibrationWindowMixin:
         dialog.destroyed.connect(self._guided_dialog_closed)
         self.guided_dialog = dialog
         dialog.show()
+
+    def _create_guided_calibration_dialog(self, *args, **kwargs):
+        return GuidedCalibrationDialog(*args, **kwargs)
 
     def _guided_dialog_closed(self) -> None:
         self.guided_dialog = None
@@ -105,7 +111,7 @@ class CalibrationWindowMixin:
         new_config.axis_maps = dict(result.axis_maps)
         self.apply_configuration(new_config)
         neutral_raw = {
-            name: result.captures["return_a_pose"].average[name]
+            name: result.captures[result.neutral_pose_name].average[name]
             for name in SEGMENT_NAMES
         }
         self.model.set_guided_calibration(
@@ -182,6 +188,10 @@ class CalibrationWindowMixin:
         )
         if not path:
             return
+        self.load_calibration_profile(path)
+
+    def load_calibration_profile(self, path) -> None:
+        """Restore a saved profile through the same validation as the file dialog."""
         try:
             document = load_profile(path)
             application = document["application"]
@@ -291,9 +301,13 @@ class CalibrationWindowMixin:
             if len(set(sensor_ids)) != len(sensor_ids):
                 raise ValueError("каждому сегменту нужен отдельный ID датчика")
             self.apply_configuration(new_config)
-            self.model.set_axis_alignment(alignment_quaternions)
-            self.model.set_drift_compensation(drift_rates)
-            self.model.request_neutral()
+            restored_reference = False
+            if mapping_migrated or axis_mapping_migrated:
+                self.model.set_axis_alignment(alignment_quaternions)
+                self.model.set_drift_compensation(drift_rates)
+                self.model.request_neutral()
+            else:
+                restored_reference = restore_profile_calibration(self.model, document, reference_s=time.perf_counter())
         except (KeyError, OSError, TypeError, ValueError) as error:
             QMessageBox.critical(self, "Ошибка импорта", str(error))
             return
@@ -313,6 +327,9 @@ class CalibrationWindowMixin:
                 "Если датчик корпуса используется, повторите калибровку."
             )
             monitor_state = "spine axis mapping migrated; calibration required"
+        elif restored_reference:
+            status_message = "Профиль и сохранённая A-поза восстановлены. После перезапуска датчиков выполните калибровку заново."
+            monitor_state = "saved calibration reference restored"
         else:
             status_message = (
                 "Профиль импортирован. Примите A-позу: она нужна заново после "

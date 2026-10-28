@@ -175,8 +175,11 @@ def calibrate_semaphore(captures, preferred_axis_maps=DEFAULT_AXIS_MAPS,
         alignments[segment] = tuple(float(v) for v in matrix_to_quaternion(alignment))
         first = mapped_sensor_quaternion(final.first[segment], maps[segment])
         last = mapped_sensor_quaternion(final.last[segment], maps[segment])
+        interval = final.drift_interval_s.get(segment, duration)
+        if interval <= 0. or not math.isfinite(interval):
+            raise ValueError(f"{segment}: некорректный интервал оценки дрейфа")
         rate = alignment @ quaternion_to_rotation_vector(
-            quaternion_multiply(last, quaternion_inverse(first))) / duration
+            quaternion_multiply(last, quaternion_inverse(first))) / interval
         rates[segment] = tuple(float(v) for v in rate) if segment in enabled else (0., 0., 0.)
     return CalibrationResult(
         axis_maps=maps, axis_alignment_quaternions=alignments, drift_rates_rad_s=rates,
