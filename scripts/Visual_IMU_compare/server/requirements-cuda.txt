@@ -1,0 +1,4 @@
+-r requirements.txt
+# ORT 1.31.1 extras require CUDA 13.x and cuDNN 9 for CUDA 13.
+# NVIDIA's driver must support that runtime; Jetson/JetPack needs its own build.
+onnxruntime-gpu[cuda,cudnn]==1.31.1

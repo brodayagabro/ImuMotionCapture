@@ -1,0 +1,11 @@
+{
+  "mediamtx": {
+    "version": "1.21.3",
+    "base_url": "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/",
+    "sha256": {
+      "linux_amd64": "0a2ea7eba96023631efa1bea7804823a9145b043b6646a8a05798d4ac24ed635",
+      "linux_arm64": "27f038237cb5f77a724f6afc58eca2798f2bc4edf9989895631a80eeb41a4fe2",
+      "linux_armv7": "134b53bfdb26583d02e1c27fc256d587cf3482e80c9e3b49083595e19a096284"
+    }
+  }
+}

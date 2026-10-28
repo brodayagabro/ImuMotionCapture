@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """RTSP → pretrained RTMPose → FreeMoCap triangulation → WebGL.
 
-One application file, including the browser UI. See SERVER.md for deployment,
+One application file, including the browser UI. See README.md for deployment,
 camera calibration, timing limitations and the JSON/WebSocket contract.
-Python >= 3.11. --setup installs into a NEW, separate virtual environment.
+Python >= 3.11. Run ./setup.sh --device cpu or cuda to install dependencies.
 """
 from __future__ import annotations
 
@@ -22,11 +22,9 @@ import os
 from pathlib import Path
 import re
 import socket
-import subprocess
 import sys
 import threading
 import time
-import venv
 import uuid
 
 HERE = Path(__file__).resolve().parent
@@ -41,17 +39,11 @@ EDGES = [(0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6), (5, 6), (5, 7), (7, 9),
 
 
 def default_repos():
-    for parent in HERE.parents:
-        candidate = parent / "equipment" / "VisualMoCap"
-        if candidate.is_dir():
-            return candidate
     return HERE / "repositories"
 
 
 def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--setup", choices=["cpu", "cuda"], help="Create isolated environment and install dependencies; then exit")
-    p.add_argument("--venv", type=Path, help="New environment directory for --setup")
     p.add_argument("--repos", type=Path, default=default_repos())
     p.add_argument("--camera", action="append", default=[], metavar="NAME=RTSP_URL", help="Repeat for each camera; USB index or video path also accepted")
     p.add_argument("--config", type=Path, help='JSON: {"cameras": [{"id": "cam1", "source": "rtsp://...", "offset_ms": 0}]}')
@@ -97,32 +89,8 @@ def arguments(argv=None):
     return args
 
 
-def setup_environment(args):
-    target = (args.venv or HERE / f".venv-visual-{args.setup}").resolve()
-    if target.exists():
-        raise ValueError(f"Environment already exists: {target}. Use it or choose a new --venv path.")
-    if not (args.repos / "rtmlib" / "rtmlib" / "__init__.py").is_file():
-        raise ValueError(f"Missing cloned rtmlib in {args.repos}")
-    venv.EnvBuilder(with_pip=True).create(target)
-    python = target / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    runtime = "onnxruntime>=1.21,<2" if args.setup == "cpu" else "onnxruntime-gpu[cuda,cudnn]>=1.21,<2"
-    packages = ["numpy>=2,<3", "opencv-contrib-python-headless>=4.10,<5",
-                "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "websockets>=14,<17", "tqdm>=4.66,<5", runtime]
-    subprocess.run([str(python), "-m", "pip", "install", *packages], check=True)
-    # RTMlib is imported directly from the checkout. Its pip metadata would
-    # install both OpenCV distributions and CPU ONNX Runtime even on CUDA.
-    print(f"\nReady. Run:\n{python} {Path(__file__).resolve()} --device {args.setup} --demo")
-    print("For real sources replace --demo with --camera cam1=rtsp://... --camera cam2=rtsp://...")
-
-
 if __name__ == "__main__":
     CLI_ARGS = arguments()
-    if CLI_ARGS.setup:
-        try:
-            setup_environment(CLI_ARGS)
-        except (ValueError, subprocess.CalledProcessError) as exc:
-            sys.exit(str(exc))
-        sys.exit(0)
 
 try:
     import cv2
@@ -130,7 +98,7 @@ try:
     from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
     from fastapi.responses import HTMLResponse, Response, StreamingResponse
 except ImportError as exc:
-    raise SystemExit(f"Missing dependency: {exc}. Run this file with --setup cpu or --setup cuda first.") from exc
+    raise SystemExit(f"Missing dependency: {exc}. Run ./setup.sh --device cpu (or cuda) in the server directory.") from exc
 
 
 @dataclass(frozen=True)
@@ -448,12 +416,13 @@ class PoseModel:
         if not (root / "rtmlib/__init__.py").is_file():
             raise ValueError(f"Missing RTMlib checkout: {root}")
         sys.path.insert(0, str(root))
+        os.environ.setdefault("TORCH_HOME", str(HERE / ".cache" / "rtmlib"))
         import onnxruntime as ort
         if args.device.startswith("cuda"):
             if hasattr(ort, "preload_dlls"):
                 ort.preload_dlls(directory="")
             if "CUDAExecutionProvider" not in ort.get_available_providers():
-                raise RuntimeError("CUDAExecutionProvider unavailable. Use --setup cuda and a supported NVIDIA driver; --device cpu is explicit CPU mode.")
+                raise RuntimeError("CUDAExecutionProvider unavailable. Use ./setup.sh --device cuda and a supported NVIDIA driver; --device cpu is explicit CPU mode.")
         from rtmlib import Body
         config = Body.MODE[args.preset]
         self.body = Body(mode=args.preset, backend="onnxruntime", device=args.device,
@@ -481,9 +450,10 @@ class PoseModel:
 
 
 def load_bvh_module():
-    path = HERE.parents[1] / "host/storage/bvh.py"
-    if not path.is_file():
-        raise ValueError(f"Missing host BVH exporter: {path}")
+    path = next((parent / "host/storage/bvh.py" for parent in HERE.parents
+                 if (parent / "host/storage/bvh.py").is_file()), None)
+    if path is None:
+        raise ValueError("Missing ImuMotionCapture/host/storage/bvh.py; keep the server inside the full repository")
     name = "_visual_mocap_host_bvh"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)

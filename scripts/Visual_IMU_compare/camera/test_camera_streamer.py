@@ -73,15 +73,10 @@ def test_invalid_options_rejected(extra):
         options(*extra)
 
 
-def test_required_parameters_and_relay_mode():
+def test_required_parameters_and_ipv6():
     with pytest.raises(SystemExit):
         s.arguments(["--server", "localhost"])
-    assert s.arguments(["--relay"]).port == 8554
     assert s.rtsp_url("::1", 8554, "cam1") == "rtsp://[::1]:8554/cam1"
-    text = s.relay_config("::1", 8554)
-    assert '"[::1]:8554"' in text
-    assert "overridePublisher: false" in text
-    assert "hls: no" in text and "webrtc: no" in text
 
 
 def test_supervisor_drains_both_pipes():

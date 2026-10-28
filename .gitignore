@@ -227,8 +227,12 @@ __marimo__/
 /.chart-data-*/
 
 # Local GUI settings, calibration profiles and captured media
-/scripts/Visual_IMU_compare/.venv-visual-*/
-/scripts/Visual_IMU_compare/runtime/
+/scripts/Visual_IMU_compare/**/.venv*/
+/scripts/Visual_IMU_compare/**/.env*/
+/scripts/Visual_IMU_compare/**/.cache/
+/scripts/Visual_IMU_compare/**/.tools/
+/scripts/Visual_IMU_compare/**/repositories/
+/scripts/Visual_IMU_compare/**/runtime/
 *.ini
 *.blend
 *.mp4

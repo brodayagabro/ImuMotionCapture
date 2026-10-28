@@ -1,0 +1,3 @@
+# name URL full_commit
+rtmlib https://github.com/Tau-J/rtmlib.git 03a1693e59e4f7cd84582c0fb30459b3bf18ad42
+freemocap https://github.com/freemocap/freemocap.git 700c8614d11d886dacfea8e52333d3c0b942ef52

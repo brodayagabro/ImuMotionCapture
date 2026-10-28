@@ -4,110 +4,123 @@
 Python, HTML, JavaScript и WebGL находятся в одном файле. Отдельная сборка
 frontend, CDN и настольный GUI FreeMoCap не нужны.
 
-Отправитель для Ubuntu/Debian: [camera_streamer.py](camera_streamer.py).
+Отправитель для Ubuntu/Debian: [camera_streamer.py](../camera/camera_streamer.py).
 Он публикует видео на IP сервера через RTSP; настройка MediaMTX и команды
-для обеих сторон приведены в [CAMERA_STREAMER.md](CAMERA_STREAMER.md).
+для обеих сторон приведены в [инструкции камеры](../camera/README.md).
 
-## Выбранная модель и зависимости
+## Развёртывание после git clone
 
-**RTMPose-m + YOLOX-m**, preset `balanced`, COCO-17, ONNX Runtime.
-Используются готовые веса: обучение не требуется. Можно выбрать
-`--preset lightweight` или `--preset performance`; это меняет готовые
-модели и размеры их входа. Это не оценка точности на нашей установке.
-
-Код загружается из уже склонированных репозиториев:
-
-- `MotionCapture/equipment/VisualMoCap/rtmlib` — детектор, RTMPose,
-  предобработка, постобработка и получение весов;
-- `MotionCapture/equipment/VisualMoCap/freemocap` — DLT-триангуляция;
-- `ImuMotionCapture/host/storage/bvh.py` — преобразование вращений в BVH-каналы.
-
-Программа ищет каталог `equipment/VisualMoCap` относительно своего расположения.
-На другом сервере можно передать `--repos /path/to/VisualMoCap`.
-Основные библиотеки устанавливаются в отдельное окружение через `--setup`.
-RTMlib импортируется из клона: его pip-зависимости не устанавливаются
-автоматически, чтобы не смешивать CPU/GPU ONNX Runtime и несколько OpenCV.
-Исходники внешних репозиториев не изменяются.
-
-## Быстрая проверка
-
-Все команды ниже выполняются из `ImuMotionCapture/scripts/Visual_IMU_compare`.
-Python должен быть версии 3.11 или новее; локально проверен Python 3.12.14.
+Из этого каталога, без путей к внешним клонам:
 
 ```bash
-python visual_mocap_server.py --setup cpu
-.venv-visual-cpu/bin/python visual_mocap_server.py --demo --device cpu
+./setup.sh --system-deps --device cpu
+source .venv-cpu/bin/activate
 ```
 
-Открыть **http://127.0.0.1:8080**. Демонстрационный режим создаёт три
-синтетических видеопотока с известными проекциями движущегося скелета.
-Он проверяет приём кадров, триангуляцию, WebSocket, WebGL и формирование BVH.
-**Нейросеть в `--demo` не запускается**, что явно показано в интерфейсе.
+Для NVIDIA: `--device cuda` и `source .venv-cuda/bin/activate`.
+Набор пакетов требует Python 3.12+. Если системный Python слишком старый,
+setup автоматически скачивает приватный Python 3.12 в `.tools/python`.
+`--system-deps` устанавливает `python3-venv`, `git`, `ca-certificates` через
+apt/sudo. Если они уже есть, этот параметр можно опустить.
+Драйвер NVIDIA устанавливается отдельно. ONNX Runtime GPU 1.31.1 использует
+CUDA 13.x/cuDNN 9; нужна совместимая версия драйвера. Jetson/JetPack требует
+отдельного согласования сборок.
 
-Локальное окружение `.venv-visual-cpu` уже создано при разработке.
-Повторный `--setup` не перезаписывает существующее окружение.
-На Windows исполняемый файл находится в `Scripts/python.exe` вместо `bin/python`.
+Setup устанавливает закреплённые пакеты, получает исходники, MediaMTX
+с проверкой SHA-256, готовые веса и инициализирует модель. Камеры и постоянные
+сервисы не запускаются. `--skip-models` откладывает получение весов до первого
+запуска. Повторный setup допустим; пользовательские изменения в клонах
+не сбрасываются, при несовпадении установщик останавливается с диагностикой.
 
-## GPU и RTSP
+| Локальный каталог | Содержимое |
+|---|---|
+| `.venv-cpu`, `.venv-cuda` | Раздельные окружения CPU/GPU |
+| `repositories/rtmlib` | Инференс RTMPose/YOLOX |
+| `repositories/freemocap` | DLT-триангулятор |
+| `.tools/bin/mediamtx` | RTSP-приёмник для всех камер |
+| `.cache/rtmlib` | Предобученные ONNX-веса |
+| `runtime` | Калибровка, записи, список установленных пакетов |
 
-Для сервера с NVIDIA GPU:
+Всё перечисленное исключено из Git. Версии заданы в
+[requirements.txt](requirements.txt), [CPU](requirements-cpu.txt),
+[CUDA](requirements-cuda.txt), [исходниках](requirements-repositories.txt),
+[бинарниках](requirements-tools.json), [bootstrap](requirements-bootstrap.txt).
+Нужен полный репозиторий ImuMotionCapture: BVH-конвертер находится в
+`host/storage/bvh.py` этого же клона.
+
+## Модель
+
+**RTMPose-m + YOLOX-m**, COCO-17, preset `balanced`, ONNX Runtime.
+Обучение не требуется. `--preset lightweight` и `--preset performance`
+выбирают другие готовые модели. RTMlib импортируется из локального клона;
+конфликтующие pip-зависимости RTMlib поверх окружения не устанавливаются.
+Настольный FreeMoCap и его GUI не запускаются.
+
+Модели по умолчанию хранятся в `server/.cache/rtmlib/hub/checkpoints`.
+Явно заданный `TORCH_HOME` может переопределить путь.
+`--det-model`, `--pose-model`, `--repos` оставлены для особых конфигураций;
+для обычного развёртывания они не нужны.
+
+## Запуск RTSP и захвата
+
+Первый терминал в `server/`:
 
 ```bash
-python visual_mocap_server.py --setup cuda
-.venv-visual-cuda/bin/python visual_mocap_server.py \
-  --device cuda:0 --host 0.0.0.0 --port 8080 \
-  --camera 'cam1=rtsp://192.168.1.101:8554/camera' \
-  --camera 'cam2=rtsp://192.168.1.102:8554/camera' \
-  --camera 'cam3=rtsp://192.168.1.103:8554/camera' \
+source .venv-cpu/bin/activate
+python rtsp_relay.py
+```
+
+На NVIDIA можно использовать `.venv-cuda`. Ретранслятор принимает публикации
+`cam1`, `cam2`, `cam3` на TCP-порту 8554. Одинаковое имя двух издателей
+не допускается. HTTP/HLS/WebRTC-сервисы отключены. Конфигурация и служебные
+файлы находятся во временном каталоге. Для локального теста есть
+`--bind 127.0.0.1`; нестандартный порт задаётся через `--port`.
+
+Второй терминал в `server/`:
+
+```bash
+source .venv-cpu/bin/activate
+python visual_mocap_server.py \
+  --device cpu --host 0.0.0.0 --port 8080 \
+  --camera 'cam1=rtsp://127.0.0.1:8554/cam1' \
+  --camera 'cam2=rtsp://127.0.0.1:8554/cam2' \
   --calibration runtime/calibration.json \
-  --bvh-target 192.168.1.10:7001 --bvh-transport udp \
+  --bvh-target 192.168.1.20:7001 --bvh-transport udp \
   --bvh-file runtime/session_001.bvh
 ```
 
-Открыть **http://IP_СЕРВЕРА:8080**. Программа по умолчанию слушает только
-localhost; `--host 0.0.0.0` открывает доступ с других компьютеров.
-Это сервис для доверенной локальной сети, без встроенной аутентификации.
+На GPU: `.venv-cuda` и `--device cuda:0`. Указывать только существующие потоки.
+Открыть **http://IP_СЕРВЕРА:8080**. По умолчанию приложение слушает localhost;
+`--host 0.0.0.0` открывает доступ другим компьютерам. Сервисы предназначены
+для доверенной LAN, без встроенной аутентификации.
 
-`--setup cuda` устанавливает ONNX Runtime GPU и его CUDA/cuDNN-зависимости;
-драйвер NVIDIA должен присутствовать на сервере. После создания обеих
-нейросетевых сессий проверяется наличие `CUDAExecutionProvider`.
-При неудачной инициализации GPU показывается ошибка; скрытого перехода
-на CPU нет. `--device cpu` разрешает CPU явно. Требования драйвера и
-библиотек зависят от установленного ONNX Runtime:
-[официальная документация CUDA EP](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html).
+Без физических камер:
 
-При первом реальном запуске RTMlib скачивает готовые веса в свой кеш
-`~/.cache/rtmlib/hub/checkpoints`. Можно задать локальные ONNX-файлы
-через `--det-model` и `--pose-model`; они должны соответствовать выбранному
-preset и 17-точечной модели. Для сервера без интернета веса нужно перенести заранее.
-
-RTSP использует OpenCV/FFmpeg, по умолчанию TCP. Для UDP:
-`--rtsp-transport udp`. Переменная `OPENCV_FFMPEG_CAPTURE_OPTIONS`, если
-задана оператором, имеет приоритет. Декодирование видео выполняется на CPU;
-на GPU выполняются детектор и RTMPose. Аппаратное декодирование не реализовано.
-
-Каждая камера имеет отдельный поток чтения, ограниченный буфер последних
-8 кадров, таймауты открытия/чтения и переподключение. Старые задания инференса
-не накапливаются. Один экземпляр модели последовательно обрабатывает виды;
-`--fps 20` ограничивает число полных циклов, а не обещает фактические 20 FPS.
-Ускорение пакетным инференсом можно добавить после измерений на целевом GPU.
-
-Вместо длинной командной строки можно использовать `--config runtime/cameras.json`:
-
-```json
-{
-  "cameras": [
-    {"id": "cam1", "source": "rtsp://192.168.1.101:8554/camera", "offset_ms": 0},
-    {"id": "cam2", "source": "rtsp://192.168.1.102:8554/camera", "offset_ms": -12}
-  ]
-}
+```bash
+python visual_mocap_server.py --demo --device cpu
 ```
 
-`offset_ms` прибавляется к серверному времени получения кадра; это ручная
-компенсация измеренной постоянной задержки. USB-индекс и путь к видео также
-допустимы как `source`. Файлы проигрываются с исходным FPS и повторяются.
-Адреса камер не передаются браузеру; системные сообщения FFmpeg могут
-содержать URL, поэтому логи с учётными данными следует хранить локально.
+В `--demo` камеры и точки синтетические, нейросетевой инференс не выполняется.
+При реальном запуске CUDA проверяется у обеих ONNX-сессий. Скрытого перехода
+на CPU нет. [Требования ONNX CUDA EP](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html).
+
+RTSP читается через OpenCV/FFmpeg, по умолчанию TCP (`--rtsp-transport udp`
+меняет транспорт). Декодирование идёт на CPU, инференс — на выбранном устройстве.
+Каждая камера имеет отдельный поток, буфер последних 8 кадров, таймауты
+и переподключение. `--fps 20` — предел циклов, не обещание производительности.
+Источники можно задать через `--config runtime/cameras.json`:
+
+```json
+{"cameras": [
+  {"id": "cam1", "source": "rtsp://127.0.0.1:8554/cam1", "offset_ms": 0},
+  {"id": "cam2", "source": "rtsp://127.0.0.1:8554/cam2", "offset_ms": -12}
+]}
+```
+
+`offset_ms` прибавляется к времени получения кадра на сервере. Это ручная
+компенсация постоянного сдвига, не синхронизация экспозиций.
+USB-индексы и файлы тоже поддерживаются. Адреса не передаются браузеру;
+системные сообщения FFmpeg могут содержать URL.
 
 ## Калибровка и синхронизация
 
@@ -262,8 +275,8 @@ while True:
 Автоматические тесты:
 
 ```bash
-.venv-visual-cpu/bin/python -m pip install pytest httpx
-.venv-visual-cpu/bin/python -m pytest test_visual_mocap_server.py -q
+./setup.sh --device cpu --with-tests
+.venv-cpu/bin/python -m pytest test_visual_mocap_server.py test_rtsp_relay.py -q
 ```
 
 Проверяются геометрия с дисторсией и выбросами, отсутствие ложного 3D,
@@ -283,7 +296,7 @@ while True:
 OpenCV contrib headless 4.14.0.94, ONNX Runtime 1.31.1,
 FastAPI 0.162.0, Uvicorn 0.54.0, websockets 16.1.1.
 Версии клонов зафиксированы в
-[`REPOSITORIES.json`](../../../equipment/VisualMoCap/REPOSITORIES.json).
+[requirements-repositories.txt](requirements-repositories.txt).
 
 Программа является прототипом сервера. Подключение ваших одноплатников,
 измерения на целевом GPU, точность движений и синхронизацию с IMU нужно

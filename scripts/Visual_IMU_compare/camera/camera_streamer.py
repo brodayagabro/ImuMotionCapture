@@ -2,15 +2,13 @@
 """Send a Linux V4L2 camera to a server over RTSP/TCP.
 
 Camera computer:
-  python3 camera_streamer.py --server 192.168.1.10 --name cam1 \
+  python3 camera_streamer.py --server 192.168.1.90 --name cam1 \
       --device /dev/video0 --resolution 1280x720 --fps 30
 
-GPU server (RTSP relay, separate terminal/service):
-  python3 camera_streamer.py --relay --mediamtx /path/to/mediamtx
-
-The existing visual_mocap_server.py then reads rtsp://127.0.0.1:8554/cam1.
+Start ../server/rtsp_relay.py on the GPU server first.
+visual_mocap_server.py then reads rtsp://127.0.0.1:8554/cam1.
 Python >= 3.9; camera side needs ffmpeg and v4l2-ctl, no Python packages.
-See CAMERA_STREAMER.md for installation, supported modes and deployment.
+See README.md and ./setup.sh for installation and deployment.
 """
 from __future__ import annotations
 
@@ -18,7 +16,6 @@ import argparse
 from dataclasses import dataclass
 from fractions import Fraction
 import ipaddress
-import json
 import logging
 import math
 import os
@@ -28,7 +25,6 @@ import selectors
 import shutil
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 
@@ -94,9 +90,6 @@ def arguments(argv=None):
     parser.add_argument("--stall-timeout", type=float, default=15, help="Restart if no new encoded frames for this many seconds")
     parser.add_argument("--no-reconnect", action="store_true", help="Exit on a camera/network error")
     parser.add_argument("--duration", type=float, help="Stop after N wall-clock seconds; useful for testing")
-    parser.add_argument("--relay", action="store_true", help="Run only the MediaMTX relay on the GPU server")
-    parser.add_argument("--bind", type=host, default="0.0.0.0", help="Relay listening address")
-    parser.add_argument("--mediamtx", default="mediamtx", help="MediaMTX executable for --relay")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be in 1..65535")
@@ -108,9 +101,7 @@ def arguments(argv=None):
         number = getattr(args, field)
         if number is not None and (not math.isfinite(number) or number <= 0):
             parser.error(f"--{field.replace('_', '-')} must be finite and positive")
-    if args.relay and (args.server or args.device or args.resolution or args.fps or args.list_devices or args.list_formats):
-        parser.error("--relay runs on the server and cannot be combined with camera capture options")
-    if not (args.relay or args.list_devices or args.list_formats):
+    if not (args.list_devices or args.list_formats):
         if not args.server or args.resolution is None or args.fps is None:
             parser.error("Camera streaming requires --server, --resolution and --fps")
     if args.encoder == "copy" and args.input_format not in ("auto", "h264"):
@@ -325,32 +316,6 @@ def publish(args, stop):
     return 0 if total or stop.is_set() else 1
 
 
-def relay_config(bind, port):
-    address = f"[{bind}]:{port}" if ":" in bind else f"{bind}:{port}"
-    return ("logLevel: info\nrtsp: yes\nrtspTransports: [tcp]\nrtspAddress: " + json.dumps(address) + "\n"
-            "rtmp: no\nhls: no\nwebrtc: no\nsrt: no\napi: no\nmetrics: no\npprof: no\nplayback: no\n"
-            "pathDefaults:\n  source: publisher\n  overridePublisher: false\npaths:\n  all_others:\n")
-
-
-def relay(args, stop):
-    binary = executable(args.mediamtx)
-    with tempfile.TemporaryDirectory(prefix="visual-mocap-relay-") as directory:
-        config = Path(directory) / "mediamtx.yml"
-        config.write_text(relay_config(args.bind, args.port))
-        # MediaMTX may create certificates in cwd. Keep them out of the repo.
-        process = subprocess.Popen([binary, str(config)], cwd=directory, start_new_session=True)
-        try:
-            deadline = time.monotonic()+args.duration if args.duration else math.inf
-            LOG.info("RTSP relay on %s:%s; streams: rtsp://SERVER:%s/CAMERA_NAME", args.bind, args.port, args.port)
-            while process.poll() is None and not stop.is_set() and time.monotonic() < deadline:
-                stop.wait(.2)
-            if process.poll() is not None:
-                return process.returncode
-        finally:
-            stop_child(process)
-    return 0
-
-
 def main(argv=None):
     args = arguments(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -358,7 +323,7 @@ def main(argv=None):
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda *_: stop.set())
     try:
-        return relay(args, stop) if args.relay else publish(args, stop)
+        return publish(args, stop)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         LOG.error("%s", exc)
         return 1

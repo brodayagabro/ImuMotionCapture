@@ -1,0 +1,2 @@
+# Bundled FFmpeg for 64-bit Linux. On other architectures install system ffmpeg.
+imageio-ffmpeg==0.7.0; platform_machine == "x86_64" or platform_machine == "aarch64"

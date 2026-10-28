@@ -1,0 +1,2 @@
+# Used only when system Python is too old for the pinned runtime.
+uv==0.11.31
