@@ -5,6 +5,8 @@
 Этот каталог содержит исследование решений и план интеграции с ImuMotionCapture.
 Реализованный RTSP-сервер с RTMPose, WebGL и сетевым BVH описан в
 [SERVER.md](SERVER.md); приложение — [visual_mocap_server.py](visual_mocap_server.py).
+Отправка видео с Ubuntu/Debian на этот сервер —
+[camera_streamer.py](camera_streamer.py), инструкция [CAMERA_STREAMER.md](CAMERA_STREAMER.md).
 Ниже сохранено сравнение готовых пакетов, на котором основан выбор компонентов.
 Выводы основаны на локальном коде, документации разработчиков и публикациях;
 производительность на целевом GPU-сервере ещё не измерялась.

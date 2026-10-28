@@ -4,6 +4,10 @@
 Python, HTML, JavaScript и WebGL находятся в одном файле. Отдельная сборка
 frontend, CDN и настольный GUI FreeMoCap не нужны.
 
+Отправитель для Ubuntu/Debian: [camera_streamer.py](camera_streamer.py).
+Он публикует видео на IP сервера через RTSP; настройка MediaMTX и команды
+для обеих сторон приведены в [CAMERA_STREAMER.md](CAMERA_STREAMER.md).
+
 ## Выбранная модель и зависимости
 
 **RTMPose-m + YOLOX-m**, preset `balanced`, COCO-17, ONNX Runtime.
