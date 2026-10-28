@@ -34,6 +34,10 @@ ImuMotionCapture/
 Материалы в `sensors/arduino/` и `sensors/WT901WIFI/` относятся к прежним
 прототипам. Текущая рабочая прошивка находится в `sensors/esp32/`.
 
+Сравнение визуального и IMU-захвата, публикации JCR Q1–Q2 и план подключения
+сетевых камер находятся в
+[`scripts/Visual_IMU_compare`](scripts/Visual_IMU_compare/README.md).
+
 ## Установка Python-приложений
 
 Требуется Python 3.11 или новее. Из корня репозитория:
