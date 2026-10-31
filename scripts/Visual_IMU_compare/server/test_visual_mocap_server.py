@@ -247,3 +247,101 @@ def test_charuco_board_is_detectable(args):
     image = session.board.generateImage((cols*160+80, rows*160+80), marginSize=40)
     _, ids, _, _ = session.detector.detectBoard(image)
     assert len(ids) == (cols-1)*(rows-1)
+
+
+def test_idle_armature_exists_without_cameras_or_bvh(args):
+    view = s.ArmatureView(.5)
+    state = view.snapshot(100)
+    assert state["status"] == "rest" and state["frame_id"] is None
+    assert len(state["points"]) == 16 and len(state["bones"]) == 19
+    assert min(p[1] for p in state["points"]) == pytest.approx(0)
+    assert all(np.linalg.norm(np.subtract(b["end"], b["start"])) > 0 for b in state["bones"])
+    engine = s.Engine(args)
+    assert engine.snapshot()["armature"] == state
+    # Idle geometry is embedded, so the browser can draw before its first WS message.
+    assert '__REST_ARMATURE__' not in s.HTML
+
+
+def test_armature_forward_kinematics_uses_parent_offsets_and_zxy_order():
+    rig = [dict(name="root", parent=None, offset=(0,0,0), end=None),
+           dict(name="child", parent=0, offset=(1,0,0), end=(0,1,0))]
+    channels = [2,3,4, 30,40,50, -20,10,60]
+    geometry = s.armature_geometry(rig, channels, [True, False])
+    root = np.array(channels[:3])
+    r0 = rotation_from_channels(channels[3:6])
+    r1 = rotation_from_channels(channels[6:9])
+    child = root+r0 @ [1,0,0]
+    np.testing.assert_allclose(geometry["points"][1], child)
+    np.testing.assert_allclose(geometry["bones"][1]["end"], child+r0 @ r1 @ [0,1,0])
+    np.testing.assert_allclose(geometry["bones"][1]["axes"], (r0 @ r1).T)
+    assert geometry["bones"][0]["tracked"] and not geometry["bones"][1]["tracked"]
+
+
+@pytest.mark.parametrize("units", ["m", "cm"])
+def test_armature_follows_exported_bvh_with_fixed_lengths(args, units):
+    args.bvh_units = units
+    adapter, view = s.BvhAdapter(args), s.ArmatureView(.5)
+    for i in range(3):
+        frame = adapter.update({"points":s.demo_points(i*.1).tolist()}, 1+i*.05, i)
+        original_channels = frame["channels"][:]
+        view.update(adapter, frame, 1.01+i*.05)
+        assert frame["channels"] == original_channels
+        assert view.snapshot(1.01+i*.05)["status"] == ("live" if i == 2 else "waiting")
+    before = view.snapshot(1.11)
+    scale = 100 if units == "cm" else 1
+    np.testing.assert_allclose(before["points"][0], np.array(frame["channels"][:3])/scale)
+    # Different pose / root translation / noisy estimated proportions must not stretch bones.
+    points = s.demo_points(1.4)+[1,0,.3]
+    points[9] += [.05,0,0]
+    frame = adapter.update({"points":points.tolist()}, 1.2, 3)
+    view.update(adapter, frame, 1.21)
+    after = view.snapshot(1.21)
+    assert not np.allclose(before["points"], after["points"])
+    for a, b in zip(before["bones"], after["bones"], strict=True):
+        assert a["name"] == b["name"]
+        assert np.linalg.norm(np.subtract(a["end"],a["start"])) == pytest.approx(
+            np.linalg.norm(np.subtract(b["end"],b["start"])))
+    # Displayed forearm direction agrees with the measured, exported swing.
+    actual = np.subtract(after["points"][6], after["points"][5])
+    expected = adapter.axis @ (points[9]-points[7])
+    np.testing.assert_allclose(actual/np.linalg.norm(actual), expected/np.linalg.norm(expected), atol=1e-6)
+
+
+def test_armature_holds_loss_and_requires_fresh_sequence_to_resume(args):
+    adapter, view = s.BvhAdapter(args), s.ArmatureView(.5)
+    for i in range(3):
+        frame = adapter.update({"points":s.demo_points(i).tolist()}, 1+i*.05, i)
+        view.update(adapter, frame, 1.01+i*.05)
+    good = view.snapshot(1.11)
+    assert good["status"] == "live"
+    # Expiration works even if inference stops producing updates completely.
+    assert view.snapshot(2)["status"] == "held"
+    view.update(adapter, None, 2)
+    assert view.snapshot(2)["points"] == good["points"]
+    for i in range(3):
+        frame = adapter.update({"points":s.demo_points(i+.5).tolist()}, 2.1+i*.05, i+3)
+        view.update(adapter, frame, 2.11+i*.05)
+        state = view.snapshot(2.11+i*.05)
+        assert state["status"] == ("live" if i == 2 else "held")
+        if i < 2:
+            assert state["points"] == good["points"]
+    view.update(adapter, frame, 2.22)  # duplicate is not a new stable frame
+    assert view.snapshot(2.22)["status"] == "held"
+    assert view.consecutive == 0
+
+
+def test_armature_rejects_stale_nonfinite_and_resets_for_new_bvh(args):
+    adapter, view = s.BvhAdapter(args), s.ArmatureView(.5)
+    frame = adapter.update({"points":s.demo_points(0).tolist()}, 1, 1)
+    view.update(adapter, frame, 2)
+    assert view.consecutive == 0
+    broken = dict(frame, channels=[float("nan")]+frame["channels"][1:])
+    view.update(adapter, broken, 1.1)
+    assert view.consecutive == 0
+    view.update(adapter, frame, 1.1)
+    identity = view.identity
+    replacement = s.BvhAdapter(args)
+    new_frame = replacement.update({"points":s.demo_points(0).tolist()}, 2, 1)
+    view.update(replacement, new_frame, 2.01)
+    assert view.identity != identity
+    assert view.consecutive == 1 and view.snapshot(2.01)["status"] == "waiting"

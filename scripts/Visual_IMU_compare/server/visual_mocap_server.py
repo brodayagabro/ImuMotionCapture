@@ -550,6 +550,127 @@ class BvhFile:
         self.temporary.replace(self.path)
 
 
+def bvh_rig(measurements):
+    """Fixed rest offsets, in BVH metres; shared by export and the idle armature."""
+    torso, shoulders, hips, head, la, lf, ra, rf, lt, ls, rt, rs = measurements
+    specs = [
+        ("Hips", None, (0,0,0)), ("Spine", 0, (0,0,0)), ("Chest", 1, (0,torso,0)),
+        ("Head", 2, (0,head,0)), ("LeftArm", 2, (-shoulders/2,0,0)),
+        ("LeftForeArm", 4, (-la,0,0)), ("LeftHand", 5, (-lf,0,0)),
+        ("RightArm", 2, (shoulders/2,0,0)), ("RightForeArm", 7, (ra,0,0)),
+        ("RightHand", 8, (rf,0,0)), ("LeftUpLeg", 0, (-hips/2,0,0)),
+        ("LeftLeg", 10, (0,-lt,0)), ("LeftFoot", 11, (0,-ls,0)),
+        ("RightUpLeg", 0, (hips/2,0,0)), ("RightLeg", 13, (0,-rt,0)),
+        ("RightFoot", 14, (0,-rs,0)),
+    ]
+    return [dict(name=name, parent=parent, offset=offset,
+                 end=(0,.1,0) if name == "Head" else (-.1,0,0) if name == "LeftHand"
+                 else (.1,0,0) if name == "RightHand" else (0,0,.12) if name.endswith("Foot") else None)
+            for name, parent, offset in specs]
+
+
+def armature_geometry(rig, channels, tracked):
+    """Forward kinematics of the exported ZXY channels, including End Sites.
+
+    Channels and offsets are in metres here. Bone frames keep octahedron
+    cross-sections attached to the parent rotation, as in human_canvas_gl.py.
+    """
+    positions, rotations, bones = [], [], []
+    for i, joint in enumerate(rig):
+        z, x, y = np.radians(channels[3+3*i:6+3*i])
+        cz, sz, cx, sx, cy, sy = np.cos(z), np.sin(z), np.cos(x), np.sin(x), np.cos(y), np.sin(y)
+        local = (np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]]) @
+                 np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]]) @
+                 np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]]))
+        parent = joint["parent"]
+        if parent is None:
+            position, rotation = np.asarray(channels[:3]) + joint["offset"], local
+        else:
+            position = positions[parent] + rotations[parent] @ joint["offset"]
+            rotation = rotations[parent] @ local
+            if np.linalg.norm(joint["offset"]) > 1e-8:
+                bones.append(dict(name=rig[parent]["name"]+":"+joint["name"],
+                                  start=positions[parent].tolist(), end=position.tolist(),
+                                  axes=rotations[parent].T.tolist(), tracked=bool(tracked[parent])))
+        positions.append(position)
+        rotations.append(rotation)
+        if joint["end"] is not None:
+            bones.append(dict(name=joint["name"]+":End", start=position.tolist(),
+                              end=(position + rotation @ joint["end"]).tolist(),
+                              axes=rotation.T.tolist(), tracked=bool(tracked[i])))
+    return dict(joint_names=[j["name"] for j in rig], points=[p.tolist() for p in positions], bones=bones)
+
+
+class ArmatureView:
+    """Display-only state: T-pose, three fresh BVH frames, then last-pose hold.
+
+    Never generates or changes outbound BVH. All methods use Engine.bvh_lock.
+    """
+    def __init__(self, max_age_s):
+        self.max_age_s = max_age_s
+        self.identity = None
+        self.rig = bvh_rig((.5,.4,.28,.22,.28,.25,.28,.25,.42,.42,.42,.42))
+        self.geometry = self.rest_geometry()
+        self.last_timestamp = None
+        self.last_frame = -1
+        self.display_timestamp = None
+        self.display_frame = None
+        self.consecutive = 0
+        self.live = False
+
+    def rest_geometry(self):
+        channels = np.zeros(3+3*len(self.rig))
+        geometry = armature_geometry(self.rig, channels, [False]*len(self.rig))
+        channels[1] = -min(p[1] for p in geometry["points"])
+        return armature_geometry(self.rig, channels, [False]*len(self.rig))
+
+    def update(self, adapter, frame, now):
+        self.live = False
+        if frame is None:
+            self.consecutive = 0
+            return
+        identity = (adapter.metadata["stream_id"], adapter.metadata["skeleton_id"])
+        if identity != self.identity:
+            self.__init__(self.max_age_s)
+            self.identity = identity
+            order = adapter.order
+            index = {original: i for i, original in enumerate(order)}
+            self.rig = [dict(name=j.name, parent=index.get(j.parent),
+                             offset=adapter.module.TO_BVH @ np.array(j.offset),
+                             end=adapter.module.TO_BVH @ np.array(j.end) if np.linalg.norm(j.end) else None)
+                        for j in (adapter.recording.joints[i] for i in order)]
+            self.geometry = self.rest_geometry()
+        timestamp, frame_id = frame["timestamp_monotonic_s"], frame["frame_id"]
+        channels = np.asarray(frame["channels"], dtype=float)
+        if (not np.isfinite(timestamp) or not 0 <= now-timestamp <= self.max_age_s
+                or channels.shape != (3+3*len(self.rig),) or not np.isfinite(channels).all()
+                or len(frame["tracked"]) != len(self.rig)
+                or frame_id <= self.last_frame
+                or (self.last_timestamp is not None and timestamp <= self.last_timestamp)):
+            self.consecutive = 0
+            return
+        if self.last_timestamp is not None and timestamp-self.last_timestamp > self.max_age_s:
+            self.consecutive = 0
+        self.last_timestamp, self.last_frame = timestamp, frame_id
+        self.consecutive += 1
+        if self.consecutive < 3:
+            return
+        if adapter.metadata["units"] == "cm":
+            channels[:3] /= 100
+        self.geometry = armature_geometry(self.rig, channels, frame["tracked"])
+        self.display_timestamp, self.display_frame = timestamp, frame_id
+        self.live = True
+
+    def snapshot(self, now):
+        age = now-self.display_timestamp if self.display_timestamp is not None else None
+        live = self.live and age is not None and age <= self.max_age_s
+        status = "live" if live else "held" if age is not None else "waiting" if self.identity else "rest"
+        return dict(**self.geometry, status=status, units="m", rotation_order="ZXY",
+                    rig_id=":".join(self.identity) if self.identity else "preview",
+                    frame_id=self.display_frame, age_ms=age*1000 if age is not None else None,
+                    consecutive_frames=self.consecutive, required_frames=3, max_age_ms=self.max_age_s*1000)
+
+
 class BvhAdapter:
     """COCO-17 positions → fixed skeleton → host BVH channel convention.
 
@@ -570,22 +691,12 @@ class BvhAdapter:
         self.axis = np.diag([1., -1., -1.])  # camera-world → BVH (Y up)
 
     def initialize(self, measurements):
-        torso, shoulders, hips, head, la, lf, ra, rf, lt, ls, rt, rs = measurements
-        specs = [
-            ("Hips", None, (0,0,0)), ("Spine", 0, (0,0,0)), ("Chest", 1, (0,torso,0)),
-            ("Head", 2, (0,head,0)), ("LeftArm", 2, (-shoulders/2,0,0)),
-            ("LeftForeArm", 4, (-la,0,0)), ("LeftHand", 5, (-lf,0,0)),
-            ("RightArm", 2, (shoulders/2,0,0)), ("RightForeArm", 7, (ra,0,0)),
-            ("RightHand", 8, (rf,0,0)), ("LeftUpLeg", 0, (-hips/2,0,0)),
-            ("LeftLeg", 10, (0,-lt,0)), ("LeftFoot", 11, (0,-ls,0)),
-            ("RightUpLeg", 0, (hips/2,0,0)), ("RightLeg", 13, (0,-rt,0)),
-            ("RightFoot", 14, (0,-rs,0)),
-        ]
         t = self.module.TO_BVH
         joints = []
-        for name, parent, offset in specs:
-            end = (0,.1,0) if name == "Head" else (-.1,0,0) if name == "LeftHand" else (.1,0,0) if name == "RightHand" else (0,0,.12) if name.endswith("Foot") else (0,0,0)
-            joints.append(self.module.Joint(name, parent, tuple(t.T @ offset), name, tuple(t.T @ end)))
+        for joint in bvh_rig(measurements):
+            name = joint["name"]
+            end = joint["end"] or (0,0,0)
+            joints.append(self.module.Joint(name, joint["parent"], tuple(t.T @ joint["offset"]), name, tuple(t.T @ end)))
         self.recording = self.module.BvhRecording(joints, [0,0,0], fps=self.args.fps,
                                                   units_per_meter=100 if self.args.bvh_units == "cm" else 1)
         hierarchy, self.order = bvh_hierarchy(self.recording, self.module)
@@ -855,6 +966,7 @@ class Engine:
         self.calibration_action_lock = threading.Lock()
         self.bvh_lock = threading.Lock()
         self.bvh = BvhAdapter(args)
+        self.armature = ArmatureView(args.max_age_ms/1000)
         self.sender = BvhSender(args.bvh_target, args.bvh_transport, self.stop)
         self.calibration_data = demo_calibration(self.ids) if args.demo else None
         if not args.demo and args.calibration.exists():
@@ -890,6 +1002,8 @@ class Engine:
 
     def snapshot(self):
         now = time.monotonic()
+        with self.bvh_lock:
+            armature = self.armature.snapshot(now)
         with self.lock:
             result = self.result
             age = (now - result["completed_monotonic_s"])*1000 if result else None
@@ -906,7 +1020,7 @@ class Engine:
                         max_skew_ms=self.args.max_skew_ms, pose_age_ms=age,
                         board=dict(squares=self.args.board, square_m=self.args.square_m, marker_m=self.args.marker_m),
                         bvh=dict(**self.sender.stats(), pose_status=self.bvh.status, file_error=self.bvh.file_error),
-                        cameras=[c.stats(now) for c in self.cameras.values()], pose=pose,
+                        cameras=[c.stats(now) for c in self.cameras.values()], pose=pose, armature=armature,
                         joint_names=JOINTS, edges=EDGES)
 
     def preview(self, name, annotated):
@@ -979,6 +1093,7 @@ class Engine:
                             continue
                     timestamp = max(f.received for f in group.values()) if group else completed
                     bvh_frame = self.bvh.update(reconstruction, timestamp, counter)
+                    self.armature.update(self.bvh, bvh_frame, time.monotonic())
                     if bvh_frame:
                         bvh_frame["source_frame_ids"] = {name: frames[name].sequence for name in eligible}
                         bvh_frame["time_basis"] = "server_receive_monotonic"
@@ -1094,6 +1209,7 @@ def create_app(engine):
                 with engine.bvh_lock:
                     engine.bvh.close()
                     engine.bvh = BvhAdapter(engine.args)
+                    engine.armature = ArmatureView(engine.args.max_age_ms/1000)
                     with engine.lock:
                         engine.calibration_data, engine.calibration = data, calibration
                         engine.result = None
@@ -1110,19 +1226,20 @@ HTML = r'''<!doctype html>
 <html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Visual MoCap · Live</title>
 <style>
-:root{color-scheme:dark;font:15px system-ui;background:#0c111b;color:#e4ecf7}*{box-sizing:border-box}body{margin:0}header{padding:22px 28px;border-bottom:1px solid #263247;display:flex;gap:20px;align-items:center;justify-content:space-between}h1{font-size:22px;margin:0}small,.muted{color:#91a3bb}main{padding:22px;max-width:1800px;margin:auto}.badge{border-radius:20px;padding:6px 12px;background:#233249;font-size:13px}.good{color:#74e7b1}.warn{color:#ffce80}.layout{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.4fr);gap:18px}.card{background:#141d2b;border:1px solid #29364c;border-radius:12px;overflow:hidden;margin-bottom:16px}.bar{padding:12px 16px;display:flex;gap:12px;justify-content:space-between;align-items:center}img{width:100%;display:block;min-height:100px;background:#0c111b}.camera-stat{font-size:12px;color:#a2b5ce}.viewer{height:620px;position:relative}canvas{display:block;width:100%;height:100%;touch-action:none}.hint{position:absolute;bottom:16px;left:18px;color:#9cadc5;font-size:12px;pointer-events:none}.empty{position:absolute;top:20px;left:18px;right:18px;color:#ffce80;pointer-events:none}.stats{display:flex;flex-wrap:wrap;gap:24px;padding:16px;border-top:1px solid #29364c}.stat b{display:block;font-size:24px;font-weight:500}.stat span{font-size:12px;color:#91a3bb}button,a.button{background:#253a53;color:#e4ecf7;border:1px solid #3c5674;border-radius:7px;padding:9px 12px;cursor:pointer;text-decoration:none;font:inherit}button:hover{background:#35516e}button:disabled{opacity:.5;cursor:wait}details{padding:16px;border-top:1px solid #29364c}summary{cursor:pointer}p{line-height:1.55}.controls{display:flex;gap:8px;flex-wrap:wrap}#message{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.error{color:#ff9c9c}#notice{margin:0 0 16px;padding:12px 16px;background:#1b273a;border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere}label{font-size:13px} @media(max-width:900px){.layout{grid-template-columns:1fr}.viewer{height:430px}header{padding:18px}main{padding:12px}}
+:root{color-scheme:light;font:15px system-ui;background:#f1f5f9;color:#1e293b}*{box-sizing:border-box}body{margin:0}header{padding:22px 28px;border-bottom:1px solid #dbe3ed;background:#fff;display:flex;gap:20px;align-items:center;justify-content:space-between}h1{font-size:22px;margin:0}small,.muted{color:#64748b}main{padding:22px;max-width:1800px;margin:auto}.badge{border-radius:20px;padding:6px 12px;background:#e8eef5;font-size:13px}.good{color:#166534}.warn{color:#92400e}.layout{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.4fr);gap:18px}.card{background:#fff;border:1px solid #dbe3ed;border-radius:12px;overflow:hidden;margin-bottom:16px}.bar{padding:12px 16px;display:flex;gap:12px;justify-content:space-between;align-items:center}img{width:100%;display:block;min-height:100px;background:#e2e8f0}.camera-stat{font-size:12px;color:#475569}.viewer{height:620px;position:relative;background:#f8fafc}canvas{display:block;width:100%;height:100%;touch-action:none}.hint{position:absolute;bottom:16px;left:18px;right:18px;color:#64748b;font-size:12px;pointer-events:none}.empty{position:absolute;top:16px;left:18px;right:18px;color:#475569;pointer-events:none;font-size:13px}.empty.live{color:#166534}.empty.held{color:#92400e}.stats{display:flex;flex-wrap:wrap;gap:24px;padding:16px;border-top:1px solid #dbe3ed}.stat b{display:block;font-size:24px;font-weight:500}.stat span{font-size:12px;color:#64748b}button,a.button{background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;border-radius:7px;padding:9px 12px;cursor:pointer;text-decoration:none;font:inherit}button:hover{background:#dbeafe}button:disabled{opacity:.5;cursor:wait}details{padding:16px;border-top:1px solid #dbe3ed}summary{cursor:pointer}p{line-height:1.55}.controls{display:flex;gap:8px;flex-wrap:wrap}#message{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.error{color:#b91c1c}#notice{margin:0 0 16px;padding:12px 16px;background:#e8eef5;border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere}label{font-size:13px}@media(max-width:900px){.layout{grid-template-columns:1fr}.viewer{height:430px}header{padding:18px}main{padding:12px}}
 </style>
 <header><div><h1>Visual MoCap <span class="muted">/ Live</span></h1><small>Камеры → RTMPose → 3D</small></div><span id="connection" class="badge">Подключение…</span></header>
 <main><div id="notice">Ожидание состояния сервера…</div><div class="layout"><section><div class="bar"><b>Видеопотоки</b><label><input id="overlay" type="checkbox" checked> Ключевые точки</label></div><div id="cameras"></div></section>
-<section><div class="card"><div class="bar"><b>3D-скелет · WebGL</b><button id="resetView">Центрировать</button></div><div class="viewer"><canvas id="gl"></canvas><div id="empty" class="empty">Ожидание 3D-точек</div><div class="hint">Мышь / касание — вращать · колесо / щипок — масштаб · координаты в метрах</div></div><div class="stats"><div class="stat"><b id="fps">—</b><span>результатов / с</span></div><div class="stat"><b id="latency">—</b><span>приём → результат, мс</span></div><div class="stat"><b id="skew">—</b><span>разница времени приёма, мс</span></div><div class="stat"><b id="joints">0 / 17</b><span>3D-точек</span></div></div>
+<section><div class="card"><div class="bar"><b>BVH-арматура · WebGL</b><button id="resetView">Центрировать</button></div><div class="viewer"><canvas id="gl"></canvas><div id="empty" class="empty">T-поза · ожидание BVH</div><div class="hint">Мышь / касание — вращать · колесо / щипок — масштаб · координаты в метрах</div></div><div class="stats"><div class="stat"><b id="fps">—</b><span>результатов / с</span></div><div class="stat"><b id="latency">—</b><span>приём → результат, мс</span></div><div class="stat"><b id="skew">—</b><span>разница времени приёма, мс</span></div><div class="stat"><b id="joints">0 / 17</b><span>3D-точек</span></div></div>
 <details><summary>Калибровка камер</summary><p>Распечатайте ChArUco-доску. <span id="boardSize"></span> Соберите минимум 12 разных положений и наклонов. Доска должна быть неподвижна во время снимка и видна всем камерам.</p><div class="controls"><a class="button" href="/api/calibration/board.png" target="_blank" rel="noopener">Скачать доску</a><button data-action="capture">Добавить снимок</button><button data-action="solve">Вычислить и сохранить</button><button data-action="reset">Сбросить снимки</button></div><p>Снимков: <b id="samples">0</b></p><p id="message" role="status"></p></details><details open><summary>BVH</summary><p id="bvhStatus">Ожидание скелета…</p><p class="muted">Первые 20 пригодных поз задают длины костей (настраивается при запуске). Вращения конечностей вокруг их осей не измерены; кисти и стопы наследуют ориентацию родителя.</p></details></div><p class="muted">Режим одного человека. 3D использует калибровку и минимум два согласованных вида. Время приёма RTSP не равно времени экспозиции камеры.</p><p id="world" class="muted"></p></section></div></main>
 <script>
 'use strict';
 const $=id=>document.getElementById(id), cards=new Map();let current=null, ws=null, seenFrame=-1, arrivals=[];
+let armature=__REST_ARMATURE__, connected=false, lastStateMs=0;
 const statuses={calibration_required:'Для 3D нужна калибровка камер',waiting_for_synchronized_views:'Ожидание двух согласованных видеопотоков',no_valid_single_person_pose:'Нет уверенной позы одного человека в двух камерах',calibration_resolution_mismatch:'Разрешение видео отличается от калибровки',tracking:''};
 function setFeed(card,id){card.querySelector('img').src='/video/'+encodeURIComponent(id)+'.mjpg?overlay='+$('overlay').checked}
 $('overlay').onchange=()=>cards.forEach((card,id)=>setFeed(card,id));
-function update(s){current=s; const pose=s.pose; let warnings=[];
+function update(s){current=s;lastStateMs=performance.now();if(s.armature)armature=s.armature; const pose=s.pose; let warnings=[];
  if(s.demo)warnings.push('ДЕМО: синтетические камеры и точки. Нейросетевой инференс не выполняется.');
  if(s.model_status==='loading')warnings.push('Загрузка модели и весов. Видео доступно независимо от инференса.');
  if(s.error)warnings.push('Ошибка инференса: '+s.error);
@@ -1136,13 +1253,12 @@ function update(s){current=s; const pose=s.pose; let warnings=[];
  const now=performance.now();if(pose&&pose.frame_id!==seenFrame){seenFrame=pose.frame_id;arrivals.push(now)}arrivals=arrivals.filter(t=>now-t<2000);$('fps').textContent=arrivals.length>1?((arrivals.length-1)*1000/(now-arrivals[0])).toFixed(1):'—';
  $('latency').textContent=pose?pose.receive_to_result_ms.toFixed(0):'—';$('skew').textContent=pose?.reception_skew_ms!=null?pose.reception_skew_ms.toFixed(1):'—';
  const count=pose?pose.skeleton.points.filter(Boolean).length:0;$('joints').textContent=count+' / 17';
- $('empty').textContent=count?'':(s.error?'Инференс остановлен':pose?(statuses[pose.status]||pose.status):'Нет свежих 3D-данных');
  for(const b of document.querySelectorAll('[data-action]'))b.disabled=s.demo;
 }
-function connect(){ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.onopen=()=>{$('connection').textContent='● Подключено';$('connection').className='badge good'};ws.onmessage=e=>update(JSON.parse(e.data));ws.onclose=()=>{$('connection').textContent='Переподключение…';$('connection').className='badge warn';current=null;$('empty').textContent='Связь с сервером потеряна';setTimeout(connect,1500)};ws.onerror=()=>ws.close()}
+function connect(){ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.onopen=()=>{connected=true;$('connection').textContent='● Подключено';$('connection').className='badge good'};ws.onmessage=e=>update(JSON.parse(e.data));ws.onclose=()=>{connected=false;$('connection').textContent='Переподключение…';$('connection').className='badge warn';current=null;setTimeout(connect,1500)};ws.onerror=()=>ws.close()}
 for(const button of document.querySelectorAll('[data-action]'))button.onclick=async()=>{button.disabled=true;$('message').textContent='Обработка…';try{const r=await fetch('/api/calibration/'+button.dataset.action,{method:'POST'}),v=await r.json();if(!r.ok)throw Error(v.detail||r.statusText);$('message').textContent=v.saved?'Калибровка сохранена. RMS: '+JSON.stringify(v.rms_px):'Снимков: '+v.samples}catch(e){$('message').textContent=e.message}finally{button.disabled=false}};
 // Native WebGL, no CDN, Node build, Three.js or browser plugins required.
-const canvas=$('gl'), gl=canvas.getContext('webgl',{antialias:true});let yaw=.35,pitch=.12,distance=4.5,target=[0,.9,0],autoCenter=true;
+const canvas=$('gl'), gl=canvas.getContext('webgl',{antialias:true});let yaw=.35,pitch=.12,distance=3.5,target=[0,.9,0],autoCenter=true;
 if(!gl){$('empty').textContent='WebGL недоступен. Включите аппаратное ускорение браузера.'}else{
  const vs='attribute vec3 p; attribute vec3 color; uniform mat4 mvp; varying vec3 c; void main(){gl_Position=mvp*vec4(p,1.0);gl_PointSize=7.0;c=color;}',fs='precision mediump float; varying vec3 c; void main(){gl_FragColor=vec4(c,1.0);}';
  function shader(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s}
@@ -1152,14 +1268,45 @@ if(!gl){$('empty').textContent='WebGL недоступен. Включите а�
  function multiply(a,b){const o=new Float32Array(16);for(let c=0;c<4;c++)for(let r=0;r<4;r++)for(let k=0;k<4;k++)o[c*4+r]+=a[k*4+r]*b[c*4+k];return o}
  function mvp(){const eye=[target[0]+distance*Math.cos(pitch)*Math.sin(yaw),target[1]+distance*Math.sin(pitch),target[2]+distance*Math.cos(pitch)*Math.cos(yaw)],z=norm(sub(eye,target)),x=norm(cross([0,1,0],z)),y=cross(z,x);const view=[x[0],y[0],z[0],0,x[1],y[1],z[1],0,x[2],y[2],z[2],0,-dot(x,eye),-dot(y,eye),-dot(z,eye),1];const f=1/Math.tan(Math.PI/8),aspect=canvas.width/canvas.height,n=.02,far=150;return multiply([f/aspect,0,0,0,0,f,0,0,0,0,(far+n)/(n-far),-1,0,0,2*far*n/(n-far),0],view)}
  const pointers=new Map();canvas.onpointerdown=e=>{canvas.setPointerCapture(e.pointerId);pointers.set(e.pointerId,[e.clientX,e.clientY])};canvas.onpointerup=canvas.onpointercancel=e=>pointers.delete(e.pointerId);canvas.onpointermove=e=>{if(!pointers.has(e.pointerId))return;const old=pointers.get(e.pointerId);if(pointers.size===1){yaw-=(e.clientX-old[0])*.006;pitch=Math.max(-1.4,Math.min(1.4,pitch+(e.clientY-old[1])*.006))}else{const other=[...pointers.entries()].find(([id])=>id!==e.pointerId)[1];const before=Math.hypot(old[0]-other[0],old[1]-other[1]),after=Math.hypot(e.clientX-other[0],e.clientY-other[1]);if(after>0)distance=Math.max(.3,Math.min(80,distance*before/after))}pointers.set(e.pointerId,[e.clientX,e.clientY])};canvas.onwheel=e=>{e.preventDefault();distance=Math.max(.3,Math.min(80,distance*Math.exp(e.deltaY*.001))) };
- $('resetView').onclick=()=>{autoCenter=true;yaw=.35;pitch=.12;distance=4.5};
- function draw(){const dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,Math.round(canvas.clientWidth*dpr)),h=Math.max(1,Math.round(canvas.clientHeight*dpr));if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}gl.viewport(0,0,w,h);gl.clearColor(.045,.065,.10,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
- const points=current?.pose?.skeleton.points.map(p=>p?[p[0],-p[1],-p[2]]:null)||[];const valid=points.filter(Boolean);if(autoCenter&&valid.length){target=[0,1,2].map(i=>valid.reduce((s,p)=>s+p[i],0)/valid.length);autoCenter=false}
- let lines=[];const line=(a,b,c)=>{lines.push(...a,...c,...b,...c)};const floor=valid.length?Math.min(...valid.map(p=>p[1])):0;for(let i=-5;i<=5;i++){line([target[0]+i*.5,floor,target[2]-2.5],[target[0]+i*.5,floor,target[2]+2.5],[.12,.19,.27]);line([target[0]-2.5,floor,target[2]+i*.5],[target[0]+2.5,floor,target[2]+i*.5],[.12,.19,.27])}
- for(const [a,b] of current?.edges||[])if(points[a]&&points[b])line(points[a],points[b],[.25,.9,.68]);gl.uniformMatrix4fv(matrix,false,mvp());gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(lines),gl.DYNAMIC_DRAW);gl.drawArrays(gl.LINES,0,lines.length/6);
- const dots=valid.flatMap(p=>[...p,1,.67,.28]);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(dots),gl.DYNAMIC_DRAW);gl.drawArrays(gl.POINTS,0,dots.length/6);requestAnimationFrame(draw)}draw();
+ $('resetView').onclick=()=>{autoCenter=true;yaw=.35;pitch=.12;distance=3.5};
+ // Octahedra match host/viz/pyqt_mocap/human_canvas_gl.py: 20% head,
+ // radius 12% (at most 4.5 cm), eight shaded facets and dark edges.
+ const add=(a,b)=>a.map((v,i)=>v+b[i]),scale=(a,k)=>a.map(v=>v*k);
+ const shades=[1,.90,.78,.70,.88,.80,.96,.85];
+ function boneMesh(bone,color,triangles,edges){
+  const delta=sub(bone.end,bone.start),length=Math.hypot(...delta);if(length<1e-8)return;
+  const direction=scale(delta,1/length),axes=bone.axes;
+  const reference=axes.reduce((a,b)=>Math.abs(dot(direction,a))<=Math.abs(dot(direction,b))?a:b);
+  const u=norm(cross(direction,reference)),v=cross(direction,u),radius=Math.min(length*.12,.045),center=add(bone.start,scale(delta,.2));
+  const vertices=[bone.start,bone.end,add(center,scale(u,radius)),add(center,scale(v,radius)),add(center,scale(u,-radius)),add(center,scale(v,-radius))];
+  for(let i=0;i<4;i++){const a=2+i,b=2+(i+1)%4;for(const [k,face] of [[0,[0,b,a]],[1,[1,a,b]]])for(const index of face)triangles.push(...vertices[index],...scale(color,shades[2*i+k]));
+   for(const [a,b] of [[0,2+i],[1,2+i],[2+i,2+(i+1)%4]])edges.push(...vertices[a],.18,.24,.30,...vertices[b],.18,.24,.30);
+  }
+ }
+ let centeredRig=null,centeredLive=false,floor=0;
+ function draw(){
+  const dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,Math.round(canvas.clientWidth*dpr)),h=Math.max(1,Math.round(canvas.clientHeight*dpr));
+  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}gl.viewport(0,0,w,h);gl.clearColor(248/255,250/255,252/255,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  const age=(armature.age_ms||0)+performance.now()-lastStateMs;
+  const live=connected&&armature.status==='live'&&age<=armature.max_age_ms;
+  const held=armature.frame_id!==null&&!live;
+  $('empty').className='empty'+(live?' live':held?' held':'');
+  $('empty').textContent=live?'● BVH · движение'+(armature.bones.some(b=>!b.tracked&&!b.name.endsWith(':End'))?' · часть костей удерживается':''):held?'Поза удерживается · '+(!connected?'связь потеряна':'нет стабильного свежего BVH'):armature.status==='waiting'?'T-поза · ожидание 3 последовательных BVH-кадров':'T-поза · '+(current?.pose?(statuses[current.pose.status]||'ожидание BVH'):'ожидание BVH');
+  if(centeredRig!==armature.rig_id){centeredRig=armature.rig_id;centeredLive=false;autoCenter=true}
+  if(armature.frame_id!==null&&!centeredLive){centeredLive=true;autoCenter=true}
+  const points=armature.points;
+  if(autoCenter){target=[0,1,2].map(i=>points.reduce((sum,p)=>sum+p[i],0)/points.length);floor=Math.min(...points.map(p=>p[1]));autoCenter=false}
+  const grid=[],triangles=[],edges=[];
+  const line=(a,b,c)=>grid.push(...a,...c,...b,...c);
+  for(let i=-5;i<=5;i++){line([target[0]+i*.5,floor,target[2]-2.5],[target[0]+i*.5,floor,target[2]+2.5],[.82,.86,.90]);line([target[0]-2.5,floor,target[2]+i*.5],[target[0]+2.5,floor,target[2]+i*.5],[.82,.86,.90])}
+  for(const bone of armature.bones){const color=live&&bone.tracked?(bone.name.includes('Leg')||bone.name.includes('Foot')?[.30,.58,.77]:[.88,.55,.41]):held?[.66,.69,.73]:[.54,.62,.70];boneMesh(bone,color,triangles,edges)}
+  gl.uniformMatrix4fv(matrix,false,mvp());
+  function upload(data,mode){gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.DYNAMIC_DRAW);gl.drawArrays(mode,0,data.length/6)}
+  upload(grid,gl.LINES);gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1,1);upload(triangles,gl.TRIANGLES);gl.disable(gl.POLYGON_OFFSET_FILL);upload(edges,gl.LINES);
+  requestAnimationFrame(draw)
+ }draw();
 }connect();
-</script></html>'''
+</script></html>'''.replace('__REST_ARMATURE__', json.dumps(ArmatureView(.5).snapshot(0)))
 
 
 def main(args):
