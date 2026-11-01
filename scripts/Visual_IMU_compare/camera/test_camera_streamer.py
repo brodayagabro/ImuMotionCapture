@@ -1,5 +1,6 @@
 """Headless sender tests; physical-camera validation is performed separately."""
 import importlib.util
+import http.client
 from pathlib import Path
 import sys
 import threading
@@ -67,6 +68,9 @@ def test_real_capture_parameters_and_no_artificial_cfr():
     ["--server", "rtsp://localhost"], ["--server", "host;touch /tmp/x"],
     ["--name", "../camera"], ["--port", "65536"], ["--duration", "nan"],
     ["--encoder", "copy", "--input-format", "mjpeg"],
+    ["--preview-port", "0"], ["--preview-port", "65536"],
+    ["--preview-width", "641"], ["--preview-width", "8192"],
+    ["--preview-fps", "0"], ["--preview-fps", "31"],
 ])
 def test_invalid_options_rejected(extra):
     with pytest.raises(SystemExit):
@@ -99,3 +103,71 @@ def test_wall_clock_duration_stops_child_without_frames():
                                     threading.Event(), started+.2, 5)
     assert count == 0 and result != 0
     assert time.monotonic()-started < 2
+
+
+def test_preview_reassembles_partial_jpegs_and_keeps_latest():
+    preview = s.CameraPreview(options("--preview"))
+    first, second = b"\xff\xd8first\xff\xd9", b"\xff\xd8second\xff\xd9"
+    stream = b"noise" + first + second
+    for byte in stream:
+        preview.feed(bytes([byte]))
+    assert preview.snapshot() == second
+    preview.feed(b"\xff\xd8" + b"x" * (8 * 1024 * 1024))
+    assert len(preview.pending) <= 1
+    preview.feed(first)
+    assert preview.snapshot() == first
+    preview.clear()
+    assert preview.snapshot() is None
+
+
+def test_preview_http_no_stale_image_and_shutdown():
+    args = options("--preview", "--preview-host", "127.0.0.1")
+    args.preview_port = 0  # Ephemeral test listener; CLI requires an explicit usable port.
+
+    def fetch(port, path):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    with s.CameraPreview(args) as preview:
+        port = preview.http.server_port
+        status, headers, page = fetch(port, "/")
+        assert status == 200 and b"/frame.jpg" in page and b"__NAME__" not in page
+        assert "no-store" in headers["Cache-Control"]
+        assert fetch(port, "/frame.jpg")[0] == 503
+        jpeg = b"\xff\xd8frame\xff\xd9"
+        preview.feed(jpeg)
+        for _ in range(2):  # Reading a frame does not consume it for other viewers.
+            status, headers, body = fetch(port, "/frame.jpg?t=123")
+            assert status == 200 and body == jpeg
+            assert headers["Content-Type"] == "image/jpeg"
+        preview.updated = time.monotonic() - preview.max_age - 1
+        assert fetch(port, "/frame.jpg")[0] == 503
+        preview.feed(jpeg)
+        preview.clear()  # A reconnect must not show the previous connection's frame.
+        assert fetch(port, "/frame.jpg")[0] == 503
+        assert fetch(port, "/unknown")[0] == 404
+    assert not preview.thread.is_alive()
+    with pytest.raises(OSError):
+        fetch(port, "/")
+
+
+def test_supervisor_drains_preview_without_http_clients():
+    preview = s.CameraPreview(options("--preview"))
+    # Use the output FD passed to the child, without FFmpeg/camera dependencies.
+    preview.output = lambda fd: [str(fd)]
+    code = """import os,sys,time
+fd=int(sys.argv[1])
+for i in range(1, 11):
+ os.write(fd, b'\\xff\\xd8' + b'x'*100000 + b'\\xff\\xd9')
+ print('frame='+str(i)+'\\nprogress=continue', flush=True)
+ time.sleep(.01)
+"""
+    result, count = s.stream_attempt([sys.executable, "-u", "-c", code], threading.Event(),
+                                     time.monotonic()+5, 2, preview)
+    assert result == 0 and count == 10
+    assert preview.snapshot() is None  # Capture exit invalidates its last image.

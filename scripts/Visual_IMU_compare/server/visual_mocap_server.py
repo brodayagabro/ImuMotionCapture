@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from bisect import bisect_left
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,7 +23,9 @@ import os
 from pathlib import Path
 import re
 import socket
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -62,6 +65,9 @@ def arguments(argv=None):
     p.add_argument("--max-reprojection-px", type=float, default=12)
     p.add_argument("--rtsp-transport", choices=["tcp", "udp"], default="tcp")
     p.add_argument("--calibration", type=Path, default=HERE / "runtime" / "calibration.json")
+    p.add_argument("--calibration-duration", type=float, default=60, help="Maximum calibration recording duration in seconds (1–300); then solve automatically")
+    p.add_argument("--calibration-temp", type=Path, help="Parent for private temporary calibration videos; default: system temporary directory")
+    p.add_argument("--calibration-max-mb", type=int, default=2048, help="Temporary video size limit in MiB; checked once per second")
     p.add_argument("--board", default="7x5", help="ChArUco board square counts, columns x rows")
     p.add_argument("--square-m", type=float, default=0.04)
     p.add_argument("--marker-m", type=float, default=0.03)
@@ -86,6 +92,8 @@ def arguments(argv=None):
         p.error("--demo cannot be mixed with real camera sources")
     if args.bvh_warmup < 1 or not 1 <= args.fps <= 100:
         p.error("--bvh-warmup must be positive; --fps must be between 1 and 100")
+    if not math.isfinite(args.calibration_duration) or not 1 <= args.calibration_duration <= 300 or args.calibration_max_mb < 16:
+        p.error("--calibration-duration must be 1–300 seconds; --calibration-max-mb must be at least 16")
     return args
 
 
@@ -889,7 +897,7 @@ class CalibrationSession:
         self.lock = threading.Lock()
         self.last_sequences = None
 
-    def capture(self, frames, all_ids):
+    def capture(self, frames, all_ids, distinct=False):
         with self.lock:
             if set(frames) != set(all_ids):
                 raise ValueError("All cameras need fresh frames within the time tolerance")
@@ -897,7 +905,7 @@ class CalibrationSession:
             if sequences == self.last_sequences:
                 raise ValueError("These frames were already captured")
             if len(self.samples) >= 60:
-                raise ValueError("Maximum 60 calibration samples; solve or reset")
+                raise ValueError("Maximum 60 calibration samples")
             sample = {}
             for name, frame in frames.items():
                 corners, ids, _, _ = self.detector.detectBoard(frame.image)
@@ -905,6 +913,19 @@ class CalibrationSession:
                     raise ValueError(f"{name}: at least 8 ChArUco corners must be visible")
                 sample[name] = dict(ids=ids.reshape(-1), corners=corners.reshape(-1, 2),
                                     size=(frame.image.shape[1], frame.image.shape[0]))
+            if distinct:
+                for name in all_ids[1:]:
+                    if len(np.intersect1d(sample[all_ids[0]]["ids"], sample[name]["ids"])) < 8:
+                        raise ValueError("At least 8 common corners must be visible in every camera pair with the reference")
+                for previous in self.samples:
+                    differences = []
+                    for name in all_ids:
+                        a, b = previous[name], sample[name]
+                        common, ia, ib = np.intersect1d(a["ids"], b["ids"], return_indices=True)
+                        differences.append(float(np.median(np.linalg.norm(a["corners"][ia]-b["corners"][ib], axis=1))) /
+                                           math.hypot(*b["size"]) if len(common) >= 8 else math.inf)
+                    if max(differences) < .01:
+                        raise ValueError("Repeated board pose; move and tilt the board")
             self.samples.append(sample)
             self.last_sequences = sequences
             return len(self.samples)
@@ -912,7 +933,7 @@ class CalibrationSession:
     def solve(self, all_ids):
         with self.lock:
             if len(self.samples) < 12:
-                raise ValueError("Capture at least 12 distinct board poses visible in all cameras")
+                raise ValueError("Video needs at least 12 distinct board poses visible in all cameras; record again while moving and tilting the board")
             objects = self.board.getChessboardCorners()
             cameras, rms = {}, {}
             for name in all_ids:
@@ -954,6 +975,250 @@ class CalibrationSession:
                         square_m=float(self.board.getSquareLength()), marker_m=float(self.board.getMarkerLength())))
 
 
+def calibration_video_groups(rows, all_ids, max_skew_s):
+    """Match recorded frames by corrected receive time, never by AVI index/FPS."""
+    if any(not rows[name] for name in all_ids):
+        raise ValueError("No recorded frames from one or more cameras")
+    times = {name: [r["aligned"] for r in rows[name]] for name in all_ids}
+    if any(any(b <= a for a, b in zip(t, t[1:])) for t in times.values()):
+        raise ValueError("Nonmonotonic calibration video timestamps")
+    groups, previous, last_time = [], dict.fromkeys(all_ids, -1), -math.inf
+    reference = all_ids[0]
+    for index, timestamp in enumerate(times[reference]):
+        if timestamp-last_time < .5:
+            continue
+        group = {reference: index}
+        for name in all_ids[1:]:
+            right = bisect_left(times[name], timestamp)
+            candidates = [i for i in (right-1, right) if previous[name] < i < len(times[name])]
+            if candidates:
+                group[name] = min(candidates, key=lambda i: abs(times[name][i]-timestamp))
+        if len(group) != len(all_ids):
+            continue
+        stamps = [times[name][i] for name, i in group.items()]
+        if max(stamps)-min(stamps) > max_skew_s:
+            continue
+        groups.append(group)
+        previous, last_time = group, timestamp
+    # Spread detection work over the whole recording; keep CPU/memory bounded.
+    return [groups[i] for i in np.linspace(0, len(groups)-1, min(240, len(groups)), dtype=int)]
+
+
+class CalibrationCancelled(Exception):
+    pass
+
+
+class VideoCalibration:
+    """Owns one temporary recording, offline detection/solve, and cleanup.
+
+    Reads existing camera buffers independently of inference. The worker owns
+    all video files; HTTP actions only set events. No camera module changes.
+    """
+    def __init__(self, args, ids, histories, apply):
+        self.args, self.ids, self.histories, self.apply = args, ids, histories, apply
+        self.lock = threading.Lock()
+        self.finish = threading.Event()
+        self.cancelled = threading.Event()
+        self.thread = None
+        self.active = False
+        self.started = None
+        self.state = dict(status="idle", seconds=0., frames=dict.fromkeys(ids, 0),
+                          dropped_frames=dict.fromkeys(ids, 0), samples=0, candidates=0, processed=0,
+                          error=None, last_rejection=None, rms_px=None, temporary_files_removed=True)
+
+    def snapshot(self):
+        with self.lock:
+            state = dict(self.state, frames=dict(self.state["frames"]),
+                         dropped_frames=dict(self.state["dropped_frames"]), active=self.active,
+                         duration_s=self.args.calibration_duration)
+            if state["status"] == "recording":
+                state["seconds"] = min(time.monotonic()-self.started, self.args.calibration_duration)
+            return state
+
+    def start(self):
+        with self.lock:
+            if self.active:
+                raise ValueError("Calibration is already recording or processing")
+            histories = self.histories()
+            now = time.monotonic()
+            if len(self.ids) < 2 or any(not histories[name] or
+                    not 0 <= now-histories[name][-1].received <= self.args.max_age_ms/1000 for name in self.ids):
+                raise ValueError("At least two cameras are required, and all configured cameras must have fresh video")
+            self.finish.clear()
+            self.cancelled.clear()
+            self.started, self.active = now, True
+            self.state.update(status="recording", seconds=0., frames=dict.fromkeys(self.ids, 0),
+                              dropped_frames=dict.fromkeys(self.ids, 0), samples=0, candidates=0, processed=0,
+                              error=None, last_rejection=None, rms_px=None, temporary_files_removed=False)
+            self.thread = threading.Thread(target=self.run, name="video-calibration", daemon=True)
+            self.thread.start()
+
+    def stop_recording(self):
+        with self.lock:
+            if not self.active or self.state["status"] != "recording":
+                raise ValueError("No calibration recording is active")
+            self.finish.set()
+
+    def cancel(self):
+        with self.lock:
+            if not self.active or self.state["status"] not in ("recording", "processing", "cancelling"):
+                raise ValueError("No cancellable calibration is active")
+            self.cancelled.set()
+            self.finish.set()
+            self.state["status"] = "cancelling"
+
+    def close(self):
+        with self.lock:
+            if self.active:
+                self.cancelled.set()
+                self.finish.set()
+        if self.thread and self.thread.ident:
+            # OpenCV's current solve may need to finish before cancellation;
+            # the worker checks the event before applying its result.
+            self.thread.join()
+
+    def check_cancelled(self):
+        if self.cancelled.is_set():
+            raise CalibrationCancelled()
+
+    def check_disk(self, folder):
+        if shutil.disk_usage(folder).free < 128*1024**2:
+            raise OSError("Less than 128 MiB free for calibration recording")
+        if sum(p.stat().st_size for p in folder.iterdir() if p.is_file()) > self.args.calibration_max_mb*1024**2:
+            raise OSError("Calibration video size limit exceeded; shorten the recording or increase --calibration-max-mb")
+
+    def record(self, folder):
+        writers, sidecars, sizes = {}, {}, {}
+        last, counts, dropped = dict.fromkeys(self.ids, None), dict.fromkeys(self.ids, 0), dict.fromkeys(self.ids, 0)
+        next_disk_check = 0
+        try:
+            while not self.finish.is_set() and time.monotonic()-self.started < self.args.calibration_duration:
+                self.check_cancelled()
+                if time.monotonic() >= next_disk_check:
+                    self.check_disk(folder)
+                    next_disk_check = time.monotonic()+1
+                for name, history in self.histories().items():
+                    for frame in history:
+                        if frame.received < self.started or (last[name] is not None and frame.sequence <= last[name]):
+                            continue
+                        size = (frame.image.shape[1], frame.image.shape[0])
+                        if name not in writers:
+                            if any(v % 2 for v in size):
+                                raise ValueError(f"{name}: calibration video needs an even image width and height")
+                            writer = cv2.VideoWriter(str(folder/f"{name}.avi"), cv2.VideoWriter_fourcc(*"MJPG"), 30., size)
+                            writers[name] = writer
+                            if not writer.isOpened():
+                                raise OSError(f"{name}: could not create temporary MJPEG video")
+                            sidecars[name] = (folder/f"{name}.jsonl").open("w", encoding="utf-8")
+                            sizes[name] = size
+                        if size != sizes[name]:
+                            raise ValueError(f"{name}: resolution changed during calibration recording")
+                        if last[name] is not None:
+                            dropped[name] += max(0, frame.sequence-last[name]-1)
+                        writers[name].write(frame.image)
+                        sidecars[name].write(json.dumps(dict(index=counts[name], sequence=frame.sequence,
+                            received=frame.received, aligned=frame.aligned))+"\n")
+                        counts[name] += 1
+                        last[name] = frame.sequence
+                with self.lock:
+                    self.state.update(frames=dict(counts), dropped_frames=dict(dropped))
+                self.finish.wait(.005)
+        finally:
+            for writer in writers.values():
+                writer.release()
+            for file in sidecars.values():
+                file.close()
+            with self.lock:
+                self.state["seconds"] = min(time.monotonic()-self.started, self.args.calibration_duration)
+        self.check_cancelled()
+        self.check_disk(folder)
+        if any(counts[name] == 0 for name in self.ids):
+            raise ValueError("No video recorded from one or more cameras")
+        return sizes
+
+    def process(self, folder, sizes):
+        rows = {name: [json.loads(line) for line in (folder/f"{name}.jsonl").read_text().splitlines()]
+                for name in self.ids}
+        groups = calibration_video_groups(rows, self.ids, self.args.max_skew_ms/1000)
+        with self.lock:
+            self.state["candidates"] = len(groups)
+        if len(groups) < 12:
+            raise ValueError("Video needs at least 12 time-matched groups; record longer and check camera timing")
+        session, captures = CalibrationSession(self.args), {}
+        try:
+            for name in self.ids:
+                cap = cv2.VideoCapture(str(folder/f"{name}.avi"))
+                captures[name] = cap
+                if not cap.isOpened() or round(cap.get(cv2.CAP_PROP_FRAME_COUNT)) != len(rows[name]):
+                    raise OSError(f"{name}: video frame count does not match recorded timestamps")
+            for i, group in enumerate(groups):
+                self.check_cancelled()
+                frames = {}
+                for name, index in group.items():
+                    cap = captures[name]
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                    ok, image = cap.read()
+                    if not ok or round(cap.get(cv2.CAP_PROP_POS_FRAMES)) != index+1:
+                        raise OSError(f"{name}: could not decode recorded frame {index}")
+                    if (image.shape[1], image.shape[0]) != sizes[name]:
+                        raise ValueError(f"{name}: recorded video resolution changed")
+                    row = rows[name][index]
+                    frames[name] = Frame(row["sequence"], row["received"], row["aligned"], image)
+                try:
+                    session.capture(frames, self.ids, distinct=True)
+                except ValueError as exc:
+                    with self.lock:
+                        self.state["last_rejection"] = str(exc)
+                with self.lock:
+                    self.state.update(processed=i+1, samples=len(session.samples))
+                if len(session.samples) >= 60:
+                    break
+            self.check_cancelled()
+            result = session.solve(self.ids)
+            self.check_cancelled()
+            with self.lock:
+                result["video_calibration"] = dict(samples=len(session.samples), frames=dict(self.state["frames"]),
+                    dropped_frames=dict(self.state["dropped_frames"]), duration_s=self.state["seconds"],
+                    timing_basis="server_monotonic_after_decode_plus_manual_offset")
+            return result
+        finally:
+            for cap in captures.values():
+                cap.release()
+
+    def run(self):
+        final_status, error, folder = "error", None, None
+        try:
+            parent = self.args.calibration_temp
+            if parent:
+                parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="visual-mocap-calibration-", dir=parent) as temporary:
+                folder = Path(temporary)
+                sizes = self.record(folder)
+                with self.lock:
+                    self.check_cancelled()
+                    self.state["status"] = "processing"
+                data = self.process(folder, sizes)
+                with self.lock:
+                    self.check_cancelled()
+                    self.state["status"] = "saving"
+                    self.apply(data)
+                    self.state["rms_px"] = data["rms_px"]
+                final_status = "complete"
+        except CalibrationCancelled:
+            final_status = "cancelled"
+        except Exception as exc:
+            error = str(exc)
+            LOG.exception("Video calibration failed")
+        finally:
+            removed = folder is None or not folder.exists()
+            if not removed:
+                error = (error or "") + f"; temporary files could not be removed: {folder}"
+                final_status = "error"
+            with self.lock:
+                self.state.update(status=final_status, error=error, temporary_files_removed=removed)
+                self.active = False
+
+
 class Engine:
     def __init__(self, args):
         self.args = args
@@ -963,7 +1228,6 @@ class Engine:
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.calibrator = CalibrationSession(args)
-        self.calibration_action_lock = threading.Lock()
         self.bvh_lock = threading.Lock()
         self.bvh = BvhAdapter(args)
         self.armature = ArmatureView(args.max_age_ms/1000)
@@ -973,6 +1237,8 @@ class Engine:
             self.calibration_data = json.loads(args.calibration.read_text())
         self.calibration = checked_calibration(self.calibration_data, self.ids) if self.calibration_data else None
         self.cameras = {s.id: Camera(s, self.stop, args.preview_width, self.calibration[s.id] if args.demo else None) for s in self.sources}
+        self.video_calibration = VideoCalibration(args, self.ids,
+            lambda: {name: camera.history() for name, camera in self.cameras.items()}, self.apply_calibration)
         self.result = None
         self.processed = {}
         self.model_status = "synthetic" if args.demo else "loading"
@@ -988,6 +1254,7 @@ class Engine:
 
     def close(self):
         self.stop.set()
+        self.video_calibration.close()
         deadline = time.monotonic() + 6
         self.sender.wake.set()
         for thread in [*(c.thread for c in self.cameras.values()), self.thread, self.sender.thread]:
@@ -996,12 +1263,37 @@ class Engine:
         with self.bvh_lock:
             self.bvh.close()
 
+    def apply_calibration(self, data):
+        calibration = checked_calibration(data, self.ids)
+        adapter = BvhAdapter(self.args)
+        payload = json.dumps(data, indent=2, allow_nan=False)+"\n"
+        path = self.args.calibration
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=path.name+".",
+                                             suffix=".tmp", dir=path.parent, delete=False) as file:
+                temporary = Path(file.name)
+                file.write(payload)
+            with self.bvh_lock:
+                self.bvh.close()
+                temporary.replace(path)
+                self.bvh = adapter
+                self.armature = ArmatureView(self.args.max_age_ms/1000)
+                with self.lock:
+                    self.calibration_data, self.calibration = data, calibration
+                    self.result = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def group(self):
         return select_frames({name: c.history() for name, c in self.cameras.items()}, time.monotonic(),
                              self.args.max_age_ms/1000, self.args.max_skew_ms/1000)
 
     def snapshot(self):
         now = time.monotonic()
+        video_calibration = self.video_calibration.snapshot()
         with self.bvh_lock:
             armature = self.armature.snapshot(now)
         with self.lock:
@@ -1013,7 +1305,8 @@ class Engine:
             return dict(schema_version=1, demo=self.args.demo, model=f"RTMPose {self.args.preset}",
                         device="synthetic" if self.args.demo else self.args.device,
                         model_status=self.model_status, error=self.model_error, providers=self.providers,
-                        calibrated=self.calibration is not None, calibration_samples=len(self.calibrator.samples),
+                        calibrated=self.calibration is not None, calibration_samples=video_calibration["samples"],
+                        video_calibration=video_calibration,
                         calibration_rms_px=(self.calibration_data or {}).get("rms_px"),
                         world_frame=(self.calibration_data or {}).get("world_frame"),
                         timing_basis="server_monotonic_after_decode_plus_manual_offset",
@@ -1184,41 +1477,23 @@ def create_app(engine):
         _, data = cv2.imencode(".png", image)
         return Response(data.tobytes(), media_type="image/png")
 
-    @app.post("/api/calibration/{action}")
+    @app.post("/api/calibration/{action}", status_code=202)
     def calibrate(action: str):
         if engine.args.demo:
             raise HTTPException(409, "Calibration is disabled for synthetic demo")
-        if not engine.calibration_action_lock.acquire(blocking=False):
-            raise HTTPException(409, "Another calibration operation is running")
         try:
-            if action == "capture":
-                return {"samples": engine.calibrator.capture(engine.group(), engine.ids)}
-            if action == "reset":
-                with engine.calibrator.lock:
-                    engine.calibrator.samples.clear()
-                    engine.calibrator.last_sequences = None
-                return {"samples": 0}
-            if action == "solve":
-                data = engine.calibrator.solve(engine.ids)
-                calibration = checked_calibration(data, engine.ids)
-                path = engine.args.calibration
-                path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = path.with_suffix(".tmp")
-                temporary.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
-                temporary.replace(path)
-                with engine.bvh_lock:
-                    engine.bvh.close()
-                    engine.bvh = BvhAdapter(engine.args)
-                    engine.armature = ArmatureView(engine.args.max_age_ms/1000)
-                    with engine.lock:
-                        engine.calibration_data, engine.calibration = data, calibration
-                        engine.result = None
-                return {"saved": True, "rms_px": data["rms_px"]}
-            raise HTTPException(404, "Unknown calibration action")
-        except (ValueError, cv2.error) as exc:
-            raise HTTPException(400, str(exc)) from exc
-        finally:
-            engine.calibration_action_lock.release()
+            if action == "start":
+                engine.video_calibration.start()
+            elif action == "stop":
+                engine.video_calibration.stop_recording()
+            elif action == "cancel":
+                engine.video_calibration.cancel()
+            else:
+                raise HTTPException(404, "Use /api/calibration/start, /stop or /cancel")
+            return engine.video_calibration.snapshot()
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     return app
 
 
@@ -1231,11 +1506,11 @@ HTML = r'''<!doctype html>
 <header><div><h1>Visual MoCap <span class="muted">/ Live</span></h1><small>Камеры → RTMPose → 3D</small></div><span id="connection" class="badge">Подключение…</span></header>
 <main><div id="notice">Ожидание состояния сервера…</div><div class="layout"><section><div class="bar"><b>Видеопотоки</b><label><input id="overlay" type="checkbox" checked> Ключевые точки</label></div><div id="cameras"></div></section>
 <section><div class="card"><div class="bar"><b>BVH-арматура · WebGL</b><button id="resetView">Центрировать</button></div><div class="viewer"><canvas id="gl"></canvas><div id="empty" class="empty">T-поза · ожидание BVH</div><div class="hint">Мышь / касание — вращать · колесо / щипок — масштаб · координаты в метрах</div></div><div class="stats"><div class="stat"><b id="fps">—</b><span>результатов / с</span></div><div class="stat"><b id="latency">—</b><span>приём → результат, мс</span></div><div class="stat"><b id="skew">—</b><span>разница времени приёма, мс</span></div><div class="stat"><b id="joints">0 / 17</b><span>3D-точек</span></div></div>
-<details><summary>Калибровка камер</summary><p>Распечатайте ChArUco-доску. <span id="boardSize"></span> Соберите минимум 12 разных положений и наклонов. Доска должна быть неподвижна во время снимка и видна всем камерам.</p><div class="controls"><a class="button" href="/api/calibration/board.png" target="_blank" rel="noopener">Скачать доску</a><button data-action="capture">Добавить снимок</button><button data-action="solve">Вычислить и сохранить</button><button data-action="reset">Сбросить снимки</button></div><p>Снимков: <b id="samples">0</b></p><p id="message" role="status"></p></details><details open><summary>BVH</summary><p id="bvhStatus">Ожидание скелета…</p><p class="muted">Первые 20 пригодных поз задают длины костей (настраивается при запуске). Вращения конечностей вокруг их осей не измерены; кисти и стопы наследуют ориентацию родителя.</p></details></div><p class="muted">Режим одного человека. 3D использует калибровку и минимум два согласованных вида. Время приёма RTSP не равно времени экспозиции камеры.</p><p id="world" class="muted"></p></section></div></main>
+<details><summary>Калибровка камер по видео</summary><p>Распечатайте ChArUco-доску. <span id="boardSize"></span> Во время записи медленно перемещайте и наклоняйте её в общей области обзора всех камер. Покажите не менее 12 разных положений, делая короткие паузы.</p><div class="controls"><a class="button" href="/api/calibration/board.png" target="_blank" rel="noopener">Скачать доску</a><button data-action="start">Начать запись</button><button data-action="stop" disabled>Остановить и калибровать</button><button data-action="cancel" disabled>Отмена</button></div><p id="calibrationStatus" role="status">Запись не начата</p><progress id="calibrationProgress" max="1" value="0" style="width:100%"></progress><p id="calibrationFrames" class="muted"></p><p>Выбрано положений доски: <b id="samples">0</b></p><p id="message" role="status"></p><p class="muted">Видео записывается во временную папку и удаляется после расчёта, ошибки или отмены. Сохраняется только успешная калибровка.</p></details><details open><summary>BVH</summary><p id="bvhStatus">Ожидание скелета…</p><p class="muted">Первые 20 пригодных поз задают длины костей (настраивается при запуске). Вращения конечностей вокруг их осей не измерены; кисти и стопы наследуют ориентацию родителя.</p></details></div><p class="muted">Режим одного человека. 3D использует калибровку и минимум два согласованных вида. Время приёма RTSP не равно времени экспозиции камеры.</p><p id="world" class="muted"></p></section></div></main>
 <script>
 'use strict';
 const $=id=>document.getElementById(id), cards=new Map();let current=null, ws=null, seenFrame=-1, arrivals=[];
-let armature=__REST_ARMATURE__, connected=false, lastStateMs=0;
+let armature=__REST_ARMATURE__, connected=false, lastStateMs=0, calibrationRequest=false, calibrationError='', calibrationStage=null;
 const statuses={calibration_required:'Для 3D нужна калибровка камер',waiting_for_synchronized_views:'Ожидание двух согласованных видеопотоков',no_valid_single_person_pose:'Нет уверенной позы одного человека в двух камерах',calibration_resolution_mismatch:'Разрешение видео отличается от калибровки',tracking:''};
 function setFeed(card,id){card.querySelector('img').src='/video/'+encodeURIComponent(id)+'.mjpg?overlay='+$('overlay').checked}
 $('overlay').onchange=()=>cards.forEach((card,id)=>setFeed(card,id));
@@ -1253,10 +1528,28 @@ function update(s){current=s;lastStateMs=performance.now();if(s.armature)armatur
  const now=performance.now();if(pose&&pose.frame_id!==seenFrame){seenFrame=pose.frame_id;arrivals.push(now)}arrivals=arrivals.filter(t=>now-t<2000);$('fps').textContent=arrivals.length>1?((arrivals.length-1)*1000/(now-arrivals[0])).toFixed(1):'—';
  $('latency').textContent=pose?pose.receive_to_result_ms.toFixed(0):'—';$('skew').textContent=pose?.reception_skew_ms!=null?pose.reception_skew_ms.toFixed(1):'—';
  const count=pose?pose.skeleton.points.filter(Boolean).length:0;$('joints').textContent=count+' / 17';
- for(const b of document.querySelectorAll('[data-action]'))b.disabled=s.demo;
+ updateCalibration(s.video_calibration);
 }
 function connect(){ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.onopen=()=>{connected=true;$('connection').textContent='● Подключено';$('connection').className='badge good'};ws.onmessage=e=>update(JSON.parse(e.data));ws.onclose=()=>{connected=false;$('connection').textContent='Переподключение…';$('connection').className='badge warn';current=null;setTimeout(connect,1500)};ws.onerror=()=>ws.close()}
-for(const button of document.querySelectorAll('[data-action]'))button.onclick=async()=>{button.disabled=true;$('message').textContent='Обработка…';try{const r=await fetch('/api/calibration/'+button.dataset.action,{method:'POST'}),v=await r.json();if(!r.ok)throw Error(v.detail||r.statusText);$('message').textContent=v.saved?'Калибровка сохранена. RMS: '+JSON.stringify(v.rms_px):'Снимков: '+v.samples}catch(e){$('message').textContent=e.message}finally{button.disabled=false}};
+function updateCalibration(c){
+ if(!c)return;
+ if(calibrationStage!==c.status){calibrationStage=c.status;calibrationError=''}
+ const labels={idle:'Запись не начата',recording:'Запись видео',processing:'Поиск доски и расчёт калибровки',saving:'Сохранение калибровки',cancelling:'Отмена · ожидание завершения текущей операции',cancelled:'Запись отменена',complete:'Калибровка сохранена',error:'Калибровка не выполнена'};
+ $('calibrationStatus').textContent=(labels[c.status]||c.status)+(c.status==='recording'?' · '+c.seconds.toFixed(1)+' / '+c.duration_s+' с':'')+(!c.active&&c.temporary_files_removed&&c.status!=='idle'?' · временное видео удалено':'');
+ $('calibrationProgress').value=c.status==='recording'?c.seconds/c.duration_s:c.status==='complete'?1:c.candidates?c.processed/c.candidates:0;
+ $('calibrationFrames').textContent=Object.entries(c.frames).map(([name,n])=>name+': '+n+' кадров'+(c.dropped_frames[name]?' · пропущено при записи '+c.dropped_frames[name]:'')).join(' / ');
+ $('samples').textContent=c.samples;
+ $('message').textContent=calibrationError||c.error||(c.rms_px?'RMS, пиксели: '+Object.entries(c.rms_px).map(([name,v])=>name+': '+v.toFixed(2)).join(' · '):c.last_rejection||'Запись автоматически завершится через '+c.duration_s+' с. Можно остановить раньше.');
+ $('message').className=calibrationError||c.error?'error':'';
+ for(const b of document.querySelectorAll('[data-action]'))b.disabled=calibrationRequest||current?.demo||
+  (b.dataset.action==='start'?c.active:b.dataset.action==='stop'?c.status!=='recording':!c.active||!['recording','processing'].includes(c.status));
+}
+for(const button of document.querySelectorAll('[data-action]'))button.onclick=async()=>{
+ calibrationRequest=true;calibrationError='';updateCalibration(current?.video_calibration);
+ try{const r=await fetch('/api/calibration/'+button.dataset.action,{method:'POST'}),v=await r.json();if(!r.ok)throw Error(v.detail||r.statusText);if(current)current.video_calibration=v;updateCalibration(v)}
+ catch(e){calibrationError=e.message;$('message').textContent=e.message;$('message').className='error'}
+ finally{calibrationRequest=false;for(const b of document.querySelectorAll('[data-action]'))b.disabled=true}
+};
 // Native WebGL, no CDN, Node build, Three.js or browser plugins required.
 const canvas=$('gl'), gl=canvas.getContext('webgl',{antialias:true});let yaw=.35,pitch=.12,distance=3.5,target=[0,.9,0],autoCenter=true;
 if(!gl){$('empty').textContent='WebGL недоступен. Включите аппаратное ускорение браузера.'}else{
