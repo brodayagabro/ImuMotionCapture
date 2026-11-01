@@ -1,0 +1,257 @@
+{
+  "skeleton": {
+    "protocol": "visual-mocap-bvh/1",
+    "type": "skeleton",
+    "stream_id": "8c8fcc6f-7757-4b81-81ca-e2ba65c453a0",
+    "skeleton_id": "bf94b0e6d35b2aab",
+    "hierarchy": "HIERARCHY\nROOT Hips\n{\n  OFFSET 0.00000000 0.00000000 0.00000000\n  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\n  JOINT Spine\n  {\n    OFFSET 0.00000000 0.00000000 0.00000000\n    CHANNELS 3 Zrotation Xrotation Yrotation\n    JOINT Chest\n    {\n      OFFSET 0.00000000 60.00000000 0.00000000\n      CHANNELS 3 Zrotation Xrotation Yrotation\n      JOINT Head\n      {\n        OFFSET 0.00000000 25.00000000 0.00000000\n        CHANNELS 3 Zrotation Xrotation Yrotation\n        End Site\n        {\n          OFFSET 0.00000000 10.00000000 0.00000000\n        }\n      }\n      JOINT LeftArm\n      {\n        OFFSET -22.00000000 0.00000000 0.00000000\n        CHANNELS 3 Zrotation Xrotation Yrotation\n        JOINT LeftForeArm\n        {\n          OFFSET -23.11727928 0.00000000 0.00000000\n          CHANNELS 3 Zrotation Xrotation Yrotation\n          JOINT LeftHand\n          {\n            OFFSET -33.26270757 0.00000000 0.00000000\n            CHANNELS 3 Zrotation Xrotation Yrotation\n            End Site\n            {\n              OFFSET -10.00000000 0.00000000 0.00000000\n            }\n          }\n        }\n      }\n      JOINT RightArm\n      {\n        OFFSET 22.00000000 0.00000000 0.00000000\n        CHANNELS 3 Zrotation Xrotation Yrotation\n        JOINT RightForeArm\n        {\n          OFFSET 34.00000000 0.00000000 0.00000000\n          CHANNELS 3 Zrotation Xrotation Yrotation\n          JOINT RightHand\n          {\n            OFFSET 33.80110628 0.00000000 0.00000000\n            CHANNELS 3 Zrotation Xrotation Yrotation\n            End Site\n            {\n              OFFSET 10.00000000 0.00000000 0.00000000\n            }\n          }\n        }\n      }\n    }\n  }\n  JOINT LeftUpLeg\n  {\n    OFFSET -16.00000000 0.00000000 0.00000000\n    CHANNELS 3 Zrotation Xrotation Yrotation\n    JOINT LeftLeg\n    {\n      OFFSET 0.00000000 -40.00000000 0.00000000\n      CHANNELS 3 Zrotation Xrotation Yrotation\n      JOINT LeftFoot\n      {\n        OFFSET 0.00000000 -45.00000000 0.00000000\n        CHANNELS 3 Zrotation Xrotation Yrotation\n        End Site\n        {\n          OFFSET 0.00000000 0.00000000 12.00000000\n        }\n      }\n    }\n  }\n  JOINT RightUpLeg\n  {\n    OFFSET 16.00000000 0.00000000 0.00000000\n    CHANNELS 3 Zrotation Xrotation Yrotation\n    JOINT RightLeg\n    {\n      OFFSET 0.00000000 -40.00000000 0.00000000\n      CHANNELS 3 Zrotation Xrotation Yrotation\n      JOINT RightFoot\n      {\n        OFFSET 0.00000000 -45.00000000 0.00000000\n        CHANNELS 3 Zrotation Xrotation Yrotation\n        End Site\n        {\n          OFFSET 0.00000000 0.00000000 12.00000000\n        }\n      }\n    }\n  }\n}\n",
+    "channel_names": [
+      "Hips.Xposition",
+      "Hips.Yposition",
+      "Hips.Zposition",
+      "Hips.Zrotation",
+      "Hips.Xrotation",
+      "Hips.Yrotation",
+      "Spine.Zrotation",
+      "Spine.Xrotation",
+      "Spine.Yrotation",
+      "Chest.Zrotation",
+      "Chest.Xrotation",
+      "Chest.Yrotation",
+      "Head.Zrotation",
+      "Head.Xrotation",
+      "Head.Yrotation",
+      "LeftArm.Zrotation",
+      "LeftArm.Xrotation",
+      "LeftArm.Yrotation",
+      "LeftForeArm.Zrotation",
+      "LeftForeArm.Xrotation",
+      "LeftForeArm.Yrotation",
+      "LeftHand.Zrotation",
+      "LeftHand.Xrotation",
+      "LeftHand.Yrotation",
+      "RightArm.Zrotation",
+      "RightArm.Xrotation",
+      "RightArm.Yrotation",
+      "RightForeArm.Zrotation",
+      "RightForeArm.Xrotation",
+      "RightForeArm.Yrotation",
+      "RightHand.Zrotation",
+      "RightHand.Xrotation",
+      "RightHand.Yrotation",
+      "LeftUpLeg.Zrotation",
+      "LeftUpLeg.Xrotation",
+      "LeftUpLeg.Yrotation",
+      "LeftLeg.Zrotation",
+      "LeftLeg.Xrotation",
+      "LeftLeg.Yrotation",
+      "LeftFoot.Zrotation",
+      "LeftFoot.Xrotation",
+      "LeftFoot.Yrotation",
+      "RightUpLeg.Zrotation",
+      "RightUpLeg.Xrotation",
+      "RightUpLeg.Yrotation",
+      "RightLeg.Zrotation",
+      "RightLeg.Xrotation",
+      "RightLeg.Yrotation",
+      "RightFoot.Zrotation",
+      "RightFoot.Xrotation",
+      "RightFoot.Yrotation"
+    ],
+    "joint_names": [
+      "Hips",
+      "Spine",
+      "Chest",
+      "Head",
+      "LeftArm",
+      "LeftForeArm",
+      "LeftHand",
+      "RightArm",
+      "RightForeArm",
+      "RightHand",
+      "LeftUpLeg",
+      "LeftLeg",
+      "LeftFoot",
+      "RightUpLeg",
+      "RightLeg",
+      "RightFoot"
+    ],
+    "units": "cm",
+    "nominal_fps": 20,
+    "rotation_order": "ZXY",
+    "axes": "X right, Y up, Z backward relative to calibration world",
+    "orientation_method": "torso basis + limb shortest-arc swing; axial twist unmeasured",
+    "unmeasured_joints": [
+      "LeftHand",
+      "RightHand",
+      "LeftFoot",
+      "RightFoot"
+    ]
+  },
+  "frame": {
+    "protocol": "visual-mocap-bvh/1",
+    "type": "frame",
+    "stream_id": "8c8fcc6f-7757-4b81-81ca-e2ba65c453a0",
+    "skeleton_id": "bf94b0e6d35b2aab",
+    "frame_id": 1,
+    "timestamp_monotonic_s": 10.0,
+    "channels": [
+      8.155209,
+      85.0,
+      0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -46.201604,
+      0.0,
+      -0.0,
+      -22.65125,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -61.927513,
+      0.0,
+      -0.0,
+      -1.994741,
+      -0.62663,
+      34.876283,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0,
+      -0.0,
+      0.0,
+      -0.0
+    ],
+    "tracked": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "points": [
+    [
+      0.08155209061191404,
+      -1.7,
+      0.0
+    ],
+    [
+      0.04655209061191404,
+      -1.74,
+      -0.02
+    ],
+    [
+      0.11655209061191404,
+      -1.74,
+      -0.02
+    ],
+    [
+      0.0015520906119140393,
+      -1.7,
+      0.0
+    ],
+    [
+      0.16155209061191406,
+      -1.7,
+      0.0
+    ],
+    [
+      -0.13844790938808596,
+      -1.45,
+      0.0
+    ],
+    [
+      0.301552090611914,
+      -1.45,
+      0.0
+    ],
+    [
+      -0.29844790938808596,
+      -1.6168558063985041,
+      0.0
+    ],
+    [
+      0.46155209061191405,
+      -1.15,
+      0.0
+    ],
+    [
+      -0.41844790938808596,
+      -1.9270827740767094,
+      0.0
+    ],
+    [
+      0.581552090611914,
+      -0.9,
+      0.1932653061713073
+    ],
+    [
+      -0.07844790938808596,
+      -0.85,
+      0.0
+    ],
+    [
+      0.24155209061191404,
+      -0.85,
+      0.0
+    ],
+    [
+      -0.07844790938808596,
+      -0.45,
+      0.0
+    ],
+    [
+      0.24155209061191404,
+      -0.45,
+      0.0
+    ],
+    [
+      -0.07844790938808596,
+      0.0,
+      0.0
+    ],
+    [
+      0.24155209061191404,
+      0.0,
+      0.0
+    ]
+  ]
+}

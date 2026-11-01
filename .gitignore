@@ -233,6 +233,8 @@ __marimo__/
 /scripts/Visual_IMU_compare/**/.tools/
 /scripts/Visual_IMU_compare/**/repositories/
 /scripts/Visual_IMU_compare/**/runtime/
+/scripts/Visual_IMU_compare/records/
+/scripts/Visual_IMU_compare/output/
 *.ini
 *.blend
 *.mp4

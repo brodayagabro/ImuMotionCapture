@@ -4,6 +4,12 @@
 |---|---|---|
 | Компьютер/одноплатник с камерой | [camera/](camera/README.md) | V4L2 → H.264 → RTSP |
 | Хост-сервер | [server/](server/README.md) | Приём RTSP, RTMPose, 3D, WebGL, BVH |
+| Компьютер оператора эксперимента | [src/](src/README.md) | IMU + визуальный BVH, OpenGL, семафор, парная запись |
+
+Семафорный эксперимент по сценарию ER2026 перенесён в **[src/](src/README.md)**.
+Он получает BVH от видеосервера вместо Noitom и сохраняет `custom.bvh` / `visual.bvh`.
+Запуск: `python scripts/Visual_IMU_compare/src/main.py --source-ip 192.168.1.90`
+из корня клона, в окружении настольного приложения (`src/setup.sh`).
 
 ```text
 Камера 1 → camera_streamer.py ─┐
@@ -133,6 +139,10 @@ Setup можно запускать повторно: проверяются о�
 
 ## Материалы исследования
 
+- [Бенчмарк синхронизации камер по светодиоду](server/SYNC_BENCHMARK.md):
+  приём RTSP без изменения отправителей, выбор LED в браузере, CSV,
+  разметка кадров и отчёт со сдвигом, разбросом и трендом задержки.
+- [Замеры скорости RTMPose на RTX 5090, 30.10.2026](BENCHMARK_2026-10-30.md).
 - [Сравнение решений](COMPARISON.md).
 - [Публикации и JCR](SOURCES.md).
 - [Исторический аудит conda freemocap-env](FREEMOCAP_ENV.md).
