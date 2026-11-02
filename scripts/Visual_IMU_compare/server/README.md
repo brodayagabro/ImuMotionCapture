@@ -1,8 +1,48 @@
 # Сервер визуального захвата
 
-## Режим записи SkellyCam → FreeMoCap
+## Основной режим: RTSP → запись на сервере → FreeMoCap
 
-**Основная новая точка входа — [freemocap_host.py](freemocap_host.py).**
+Камеры запускают лёгкий `camera_streamer.py` и публикуют H.264 в MediaMTX.
+Веб-приложение записывает потоки по кнопке; синхронизация, калибровка,
+постобработка, выбор пути BVH и проигрывание на арматуре остаются прежними.
+
+```bash
+bash setup.sh --workflow recording --system-deps
+.venv-freemocap/bin/python rtsp_relay.py
+```
+
+В другом терминале:
+
+```bash
+.venv-freemocap/bin/python freemocap_host.py \
+  --camera cam1=rtsp://127.0.0.1:8554/cam1 \
+  --camera cam2=rtsp://127.0.0.1:8554/cam2
+```
+
+Веб-интерфейс: `http://IP_СЕРВЕРА:8080/`. Нужны TCP-порты 8554 и 8080
+из локальной сети. На ранее подготовленном сервере установить только relay
+можно через `.venv-freemocap/bin/python install_rtsp_relay.py`.
+MediaMTX закреплён в `requirements-tools.json`, архив проверяется по SHA-256.
+
+Приём реализован в [rtsp_recording.py](rtsp_recording.py): отдельный FFmpeg
+для каждого источника, TCP, H.264 stream copy, фрагментированный MP4,
+готовность по продвижению медиавремени. Первую общую вспышку давать только
+после «Все камеры записывают». Экспозиция камер аппаратно не синхронизируется.
+`--capture-timeout 10` задаёт таймаут отсутствия новых кадров (3–60 секунд).
+Обрыв помечает дубль ошибкой и останавливает все приёмники; переподключения
+не склеиваются. Файлы и журналы сохраняются в `rtsp_capture/`.
+`capture_report.json` явно указывает, что PTS не являются аппаратными метками.
+При завершении хоста FFmpeg закрывает MP4; после перезапуска доступна повторная
+обработка. Аварийное завершение может потерять последний фрагмент.
+
+Нативная обработка получает те же имена `*.id-cam1.idx-0.mp4` и `cam2`,
+поэтому схема идентификаторов калибровки сохраняется. Перед использованием
+старого TOML должны совпадать геометрия камер, фокус и разрешение.
+Полные команды камер и смена systemd-службы — в [общем README](../README.md).
+
+## Альтернативный вход: HTTP-узлы SkellyCam → FreeMoCap
+
+Точка входа та же — [freemocap_host.py](freemocap_host.py).
 Ручное развёртывание на двух камерах и хосте подробно описано в
 [README эксперимента](../README.md). Минимальный запуск из `server/`:
 
@@ -24,7 +64,7 @@ bash setup.sh --workflow recording --system-deps
 на сервере, кнопка скачивания сохраняет файл на компьютер с браузером.
 Проигрыватель использует прежнюю восьмигранную WebGL-отрисовку костей:
 [armature_view.js](armature_view.js), чтение BVH/FK — [bvh_player.js](bvh_player.js).
-Видеопоток RTSP, живой BVH и IMU-эксперимент относятся к прежнему режиму ниже.
+Живой инференс RTMPose/BVH и IMU-эксперимент относятся к отдельному режиму ниже.
 
 [freemocap_recording_worker.py](freemocap_recording_worker.py) вызывает
 штатные `SyncPipeline`, `PosthocPipelineManager`, MediaPipe, Anipose,
@@ -80,7 +120,7 @@ Blender: `--blender /path/to/blender`. Старый `calibration.json` не по
 
 ```bash
 bash setup.sh --workflow recording --with-tests
-.venv-freemocap/bin/python -m pytest test_recording_workflow.py -q
+.venv-freemocap/bin/python -m pytest test_recording_workflow.py test_rtsp_recording.py -q
 node test_bvh_player.cjs
 ```
 

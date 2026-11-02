@@ -21,6 +21,19 @@ node = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(node)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def release_unused_native_websocket_logs():
+    yield
+    # Native imports create a UI log queue. These headless tests have no UI
+    # consumer; waiting for its feeder to flush a full pipe hangs interpreter
+    # shutdown. Only discard this test process's unused websocket messages.
+    from skellylogs.handlers.websocket_log_queue_handler import get_websocket_log_queue
+    try:
+        get_websocket_log_queue().cancel_join_thread()
+    except ValueError:
+        pass  # No native logging queue was created by the selected tests.
+
+
 def make_video(path, flash=30, count=105, fps=30):
     path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (160, 120))

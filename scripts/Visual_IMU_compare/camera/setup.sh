@@ -72,7 +72,11 @@ PY="$ENV_DIR/bin/python"
 "$PY" -c 'import sys; assert sys.version_info >= (3,10), "Existing venv requires recreation with Python >= 3.10"'
 REQ="$SCRIPT_DIR/requirements.txt"
 if ((WITH_TESTS)); then REQ="$SCRIPT_DIR/requirements-dev.txt"; fi
-"$PY" -m pip install --disable-pip-version-check --only-binary=:all: -r "$REQ"
+if ((WITH_TESTS)) || ! command -v ffmpeg >/dev/null; then
+    "$PY" -m pip install --disable-pip-version-check --only-binary=:all: -r "$REQ"
+else
+    echo 'Using system FFmpeg; camera_streamer.py needs no third-party Python packages.'
+fi
 "$PY" - "$ENV_DIR" <<'PY'
 from pathlib import Path
 import shutil, subprocess, sys

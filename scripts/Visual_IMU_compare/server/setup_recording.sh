@@ -120,6 +120,9 @@ else:
 print('Native recording APIs OK')
 PY
 "$UV" pip freeze --python "$ENV_DIR/bin/python" > "$ROOT/runtime/requirements-recording-resolved.txt"
+if [[ "$ROLE" == server ]]; then
+    "$ENV_DIR/bin/python" "$ROOT/install_rtsp_relay.py"
+fi
 echo "Ready: $ENV_DIR/bin/python"
 if [[ "$ROLE" == server ]] && ! command -v blender >/dev/null; then
     echo 'Blender is required for BVH export. Install Blender or pass --blender /path/to/blender to freemocap_host.py.'
