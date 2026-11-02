@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Shared installer called by camera/setup.sh and server/setup.sh --workflow recording.
+# Native FreeMoCap server installer, called by server/setup.sh --workflow recording.
 set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-ROLE=${1:?Expected camera or server}; shift
-[[ "$ROLE" == camera || "$ROLE" == server ]] || exit 2
+ROLE=${1:?Expected server}; shift
+[[ "$ROLE" == server ]] || { echo "Camera SkellyCam setup was removed. Use camera/setup.sh for RTSP." >&2; exit 2; }
 ROOT="$(cd -- "$HERE/../$ROLE" && pwd -P)"
 PYTHON_BIN=/usr/bin/python3
 SYSTEM_DEPS=0
@@ -15,7 +15,7 @@ while (($#)); do
         --with-tests) WITH_TESTS=1; shift ;;
         -h|--help)
             echo "Usage: $ROLE/setup.sh --workflow recording [--python python3] [--system-deps] [--with-tests]"
-            echo "Installs a private Python 3.12 and the pinned native SkellyCam/FreeMoCap environment."
+            echo "Installs a private Python 3.12 and the pinned native FreeMoCap environment."
             echo "No sudo unless --system-deps is explicitly supplied. Does not start services."
             exit 0 ;;
         *) echo "Unknown recording-profile argument: $1" >&2; exit 2 ;;
@@ -27,7 +27,7 @@ flock -n 9 || { echo 'Recording setup already running' >&2; exit 1; }
 if ((SYSTEM_DEPS)); then
     SUDO=(); if ((EUID != 0)); then SUDO=(sudo); fi
     PACKAGES=(python3-venv git ca-certificates ffmpeg libgl1 libglib2.0-0)
-    if [[ "$ROLE" == camera ]]; then PACKAGES+=(libportaudio2 v4l-utils); else PACKAGES+=(blender); fi
+    PACKAGES+=(blender)
     "${SUDO[@]}" apt-get update
     "${SUDO[@]}" apt-get install -y --no-install-recommends "${PACKAGES[@]}"
 fi
@@ -67,15 +67,9 @@ for line in (root / 'requirements-recording-repositories.txt').read_text().split
         subprocess.run(['git', 'clone', '--filter=blob:none', '--no-checkout', url, str(target)], env=env, check=True)
         git(target, 'checkout', '--detach', commit)
 PY
-if [[ "$ROLE" == camera ]]; then
-    PROJECT="$ROOT/repositories/skellycam"
-    ENV_DIR="$ROOT/.venv-skellycam"
-    GROUP=()
-else
-    PROJECT="$ROOT/repositories/freemocap"
-    ENV_DIR="$ROOT/.venv-freemocap"
-    GROUP=(--group cpu)
-fi
+PROJECT="$ROOT/repositories/freemocap"
+ENV_DIR="$ROOT/.venv-freemocap"
+GROUP=(--group cpu)
 [[ ! -L "$ENV_DIR" ]] || { echo "Refusing symlink environment: $ENV_DIR" >&2; exit 1; }
 export UV_PROJECT_ENVIRONMENT="$ENV_DIR"
 # --locked rejects upstream lock drift; it never updates branches or dependencies.
@@ -107,16 +101,8 @@ export SKELLYCAM_BASE_FOLDER="$ROOT/runtime/native-check"
 "$ENV_DIR/bin/python" - "$ROLE" <<'PY'
 import sys
 from skellycam.core.ipc.process_management.worker_registry import WorkerRegistry
-if sys.argv[1] == 'camera':
-    try:
-        from skellycam.core.camera_group.camera_group_manager import CameraGroupManager
-    except OSError as exc:
-        raise SystemExit(f'{exc}. Install libportaudio2 (or setup.sh --workflow recording --system-deps).')
-    import av
-    av.CodecContext.create('libx264', 'w')
-else:
-    from freemocap.core.pipeline.posthoc.posthoc_pipeline_manager import PosthocPipelineManager
-    from skelly_synchronize.core.pipeline.runner import run_pipeline
+from freemocap.core.pipeline.posthoc.posthoc_pipeline_manager import PosthocPipelineManager
+from skelly_synchronize.core.pipeline.runner import run_pipeline
 print('Native recording APIs OK')
 PY
 "$UV" pip freeze --python "$ENV_DIR/bin/python" > "$ROOT/runtime/requirements-recording-resolved.txt"

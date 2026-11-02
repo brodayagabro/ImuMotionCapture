@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-r"""Generate/install the same camera service for RTSP or SkellyCam recording.
+r"""Generate/install the RTSP camera service (also replaces an old SkellyCam unit).
 
-SkellyCam: run setup.sh --workflow recording first, then:
-  .venv-skellycam/bin/python install_service.py --workflow recording --install \
-      --name cam1 --device /dev/video0 --resolution 1280x720 --fps 30 --port 8082
-
-Legacy RTSP (default workflow, compatible with existing commands):
+Run setup.sh first, then:
   .venv/bin/python install_service.py --install \
       --server 192.168.1.90 --name cam1 --device /dev/video0 \
-      --resolution 1280x720 --fps 30 --preview
+      --resolution 1280x720 --fps 30
 
 Without --install, only write runtime/systemd/visual-mocap-camera-NAME.service.
 With the same --name, --install replaces and restarts the existing service.
@@ -27,7 +23,6 @@ import sys
 import tempfile
 
 import camera_streamer
-import skellycam_node
 
 
 CAMERA_DIR = Path(__file__).resolve().parent
@@ -61,28 +56,18 @@ def service_account(username=None):
 
 
 def render_unit(camera_dir, account, stream_args, workflow="live"):
-    if workflow == "recording":
-        args = skellycam_node.arguments(stream_args)
-        environment, script, stop_timeout = ".venv-skellycam", "skellycam_node.py", 60
-        # Let the API process finalize native recordings before terminating
-        # capture workers. systemd still kills the whole cgroup on timeout.
-        kill_mode = "mixed"
-        description = "SkellyCam recording node"
-    elif workflow == "live":
-        args = camera_streamer.arguments(stream_args)
-        if args.list_devices or args.list_formats or args.duration is not None:
-            raise ValueError("A boot service cannot use --list-devices, --list-formats or --duration")
-        environment, script, stop_timeout = ".venv", "camera_streamer.py", 10
-        kill_mode = "control-group"
-        description = "RTSP streamer"
-    else:
-        raise ValueError(f"Unknown workflow: {workflow}")
+    if workflow != "live":
+        raise ValueError("Camera nodes use RTSP only; select --workflow live")
+    args = camera_streamer.arguments(stream_args)
+    if args.list_devices or args.list_formats or args.duration is not None:
+        raise ValueError("A boot service cannot use --list-devices, --list-formats or --duration")
+    environment, script, stop_timeout = ".venv", "camera_streamer.py", 10
+    kill_mode, description = "control-group", "RTSP streamer"
     camera_dir = Path(camera_dir).resolve()
     # Keep the venv symlink: resolving bin/python would bypass the environment.
     python = camera_dir / environment / "bin/python"
     if not python.is_file() or not os.access(python, os.X_OK):
-        setup_options = " --workflow recording" if workflow == "recording" else ""
-        raise ValueError(f"Camera environment is missing: run {camera_dir / 'setup.sh'}{setup_options} first")
+        raise ValueError(f"Camera environment is missing: run {camera_dir / 'setup.sh'} first")
     if not (camera_dir / script).is_file():
         raise ValueError(f"Camera program is missing: {camera_dir / script}")
     if ":" in str(camera_dir):
@@ -165,10 +150,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,
-        epilog="Remaining options go to skellycam_node.py (recording) or camera_streamer.py (live). "
+        epilog="Remaining options go to camera_streamer.py. "
                "The same --name replaces the existing service when used with --install.")
-    parser.add_argument("--workflow", choices=("live", "recording"), default="live",
-                        help="recording: SkellyCam; live: legacy RTSP (default)")
+    parser.add_argument("--workflow", choices=("live",), default="live",
+                        help="RTSP (accepted for compatibility with previous commands)")
     parser.add_argument("--install", action="store_true", help="Install, enable at boot and start/restart now")
     parser.add_argument("--user", help="Local account for capture (default: current user, or SUDO_USER)")
     options, stream_args = parser.parse_known_args(argv)

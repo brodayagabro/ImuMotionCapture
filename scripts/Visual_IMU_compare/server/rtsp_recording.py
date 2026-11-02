@@ -3,10 +3,32 @@ from __future__ import annotations
 
 import asyncio
 from fractions import Fraction
+from functools import lru_cache
 import json
 from pathlib import Path
+import re
 import shutil
+import subprocess
 import time
+
+
+@lru_cache(maxsize=8)
+def socket_timeout_option(binary):
+    """FFmpeg 4 uses stimeout; its timeout option enables RTSP LISTEN mode."""
+    result = subprocess.run([binary, "-hide_banner", "-h", "demuxer=rtsp"],
+                            capture_output=True, text=True, timeout=5, check=True)
+    help_text = result.stdout + result.stderr
+    if re.search(r"^\s+-stimeout\s", help_text, re.MULTILINE):
+        return "-stimeout"
+    if re.search(r"^\s+-timeout\s+.*socket.*I/O", help_text, re.MULTILINE):
+        return "-timeout"
+    raise ValueError(f"Cannot determine RTSP socket timeout option for {binary}")
+
+
+async def input_options(binary, timeout):
+    option = await asyncio.to_thread(socket_timeout_option, binary)
+    return ["-rtsp_transport", "tcp", option, str(int(timeout * 1e6)),
+            "-analyzeduration", "1000000", "-probesize", "1000000"]
 
 
 async def terminate(process):
@@ -22,8 +44,7 @@ async def terminate(process):
 async def probe(source, ffprobe="ffprobe", timeout=10, *, recorded=False):
     command = [ffprobe, "-v", "error"]
     if not recorded:
-        command += ["-rtsp_transport", "tcp", "-timeout", str(int(timeout * 1e6)),
-                    "-analyzeduration", "1000000", "-probesize", "1000000"]
+        command += await input_options(ffprobe, timeout)
     else:
         command += ["-count_packets"]
     command += ["-select_streams", "v:0", "-show_entries",
@@ -79,8 +100,7 @@ class StreamRecording:
         # at different keyframes is expected; native flash alignment follows.
         command = [self.ffmpeg, "-hide_banner", "-loglevel", "warning", "-nostats",
                    "-stats_period", "0.2", "-progress", "pipe:1",
-                   "-rtsp_transport", "tcp", "-timeout", str(int(self.timeout * 1e6)),
-                   "-analyzeduration", "1000000", "-probesize", "1000000",
+                   *await input_options(self.ffmpeg, self.timeout),
                    "-i", self.url, "-map", "0:v:0", "-an", "-c:v", "copy",
                    "-avoid_negative_ts", "make_zero", "-movflags",
                    "+frag_keyframe+empty_moov+default_base_moof", "-n", str(self.path)]

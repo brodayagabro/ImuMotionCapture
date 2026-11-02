@@ -169,7 +169,7 @@ def processing_timeline(folder: Path):
     """Describe the *resampled output timeline*, never invent capture timestamps.
 
     Native filters and Blender read a timestamps CSV rather than MP4 metadata.
-    Original SkellyCam timestamps remain untouched under camera_files/.
+    Original RTSP media PTS remain in rtsp_capture/ MP4 files.
     """
     import cv2
     metadata = []
@@ -192,7 +192,7 @@ def processing_timeline(folder: Path):
         writer.writerows((i, i/fps, 1000/fps, fps) for i in range(count))
     save(target / "provenance.json", dict(source="SkellySync output constant-frame-rate timeline",
          hardware_capture_timestamps=False, fps=fps, frame_count=count,
-         original_timestamps="../../camera_files"))
+         original_media="../../rtsp_capture", capture_report="../../capture_report.json"))
 
 
 def run(spec: dict, report):

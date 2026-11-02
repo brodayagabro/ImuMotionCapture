@@ -1,25 +1,15 @@
 """Transport/state tests plus real SkellySync alignment (no sync mocks)."""
-import asyncio
-import importlib.util
 import json
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 
 import cv2
-import httpx
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 import freemocap_host as host_module
 from freemocap_recording_worker import synchronize, processing_timeline
-
-ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("skellycam_node", ROOT / "camera/skellycam_node.py")
-node = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(node)
-
 
 @pytest.fixture(scope="module", autouse=True)
 def release_unused_native_websocket_logs():
@@ -103,62 +93,9 @@ def test_native_normalizes_measured_camera_rates(tmp_path):
     assert data["aligned_flash_frames"][0] > 0
 
 
-class FakeRecorder:
-    def __init__(self, args):
-        self.args = args
-        self.ready = False
-        self.active = None
-
-    async def prepare(self):
-        self.ready = True
-
-    async def start(self, take_id):
-        self.active = take_id
-
-    async def stop(self):
-        path = self.args.records / self.active / "synchronized_videos" / f"test.id-{self.args.name}.idx-0.mp4"
-        make_video(path, 30 if self.args.name == "cam1" else 45)
-        self.active = None
-
-    async def close(self):
-        pass
-
-
-def node_args(tmp_path, name="cam1"):
-    return SimpleNamespace(name=name, device="/dev/video0", records=tmp_path / name,
-                           resolution="160x120", fps=30)
-
-
-def test_camera_node_finalization_checksum_idempotence_and_safe_paths(tmp_path):
-    args = node_args(tmp_path)
-    with TestClient(node.create_app(args, FakeRecorder)) as client:
-        assert client.post("/prepare").json()["ready"]
-        assert client.post("/recordings/test/start").status_code == 200
-        assert client.post("/recordings/test/start").status_code == 200
-        assert client.get("/recordings/test/manifest").status_code == 409
-        assert client.post("/recordings/other/start").status_code == 409
-        assert client.post("/recordings/test/stop").status_code == 200
-        assert client.post("/recordings/test/stop").status_code == 200
-        item = client.get("/recordings/test/manifest").json()["files"][0]
-        response = client.get("/recordings/test/files/" + item["path"])
-        import hashlib
-        assert hashlib.sha256(response.content).hexdigest() == item["sha256"]
-        assert len(response.content) == item["size"]
-        assert client.get("/recordings/test/files/.node-state.json").status_code == 404
-        assert client.get("/recordings/test/files/%2E%2E/%2E%2E/secret").status_code == 404
-        assert client.post("/recordings/test/start").status_code == 409
-
-
 def host_args(tmp_path):
     return SimpleNamespace(records=tmp_path / "host", output=tmp_path / "output", blender="blender",
-                           camera=["cam1=http://cam1:8082", "cam2=http://cam2:8082"])
-
-
-def test_camera_endpoint_identity_validation():
-    for endpoints in [["cam1=rtsp://foo", "cam2=http://bar"], ["cam1=http://foo", "cam1=http://bar"],
-                      ["cam1=http://foo", "cam2=http://foo"]]:
-        with pytest.raises(ValueError):
-            host_module.camera_endpoints(endpoints)
+                           camera=["cam1=rtsp://127.0.0.1:8554/cam1", "cam2=rtsp://127.0.0.1:8554/cam2"])
 
 
 def test_web_routes_output_picker_and_restart_recovery(tmp_path):
@@ -180,55 +117,17 @@ def test_web_routes_output_picker_and_restart_recovery(tmp_path):
         assert client.get("/api/recordings/test/bvh").status_code == 404
 
 
-def test_two_nodes_transfer_to_real_sync_worker(tmp_path):
-    async def exercise():
-        from contextlib import AsyncExitStack
-        args = host_args(tmp_path)
-        host = host_module.Host(args)
-        async with AsyncExitStack() as stack:
-            clients = {}
-            for name in ("cam1", "cam2"):
-                app = node.create_app(node_args(tmp_path, name), FakeRecorder)
-                await stack.enter_async_context(app.router.lifespan_context(app))
-                clients[name] = await stack.enter_async_context(httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=app), base_url=f"http://{name}:8082"))
-
-            async def request(req):
-                response = await clients[req.url.host].request(req.method, str(req.url))
-                return httpx.Response(response.status_code, content=response.content, headers=response.headers)
-
-            host.client = await stack.enter_async_context(httpx.AsyncClient(transport=httpx.MockTransport(request)))
-            take = await host.start(host_module.StartRequest(kind="sync"))
-            assert take["state"] == "recording"
-            await host.stop(take["id"])
-            await asyncio.wait_for(host.task, 45)
-            assert take["state"] == "complete", take
-            folder = host.root / take["id"]
-            data = json.loads((folder / "sync_result.json").read_text())
-            assert data["aligned_flash_frames"] == [30, 30]
-            assert len(list((folder / "raw_videos").glob("*.mp4"))) == 2
-            for name in clients:
-                assert (tmp_path / name / take["id"]).is_dir()
-            await host.close()
-    asyncio.run(exercise())
-
-
-def test_failed_start_rolls_back_every_node(tmp_path):
-    async def exercise():
-        host = host_module.Host(host_args(tmp_path))
-        stopped = []
-        async def request(req):
-            if req.url.path == "/prepare":
-                return httpx.Response(200, json=dict(camera=req.url.host, ready=True, active=None, fps=30))
-            if req.url.path.endswith("/start") and req.url.host == "cam2":
-                return httpx.Response(503, text="device busy")
-            if req.url.path.endswith("/stop"):
-                stopped.append(req.url.host)
-            return httpx.Response(200, json={})
-        async with httpx.AsyncClient(transport=httpx.MockTransport(request)) as client:
-            host.client = client
-            with pytest.raises(host_module.HTTPException, match="device busy"):
-                await host.start(host_module.StartRequest(kind="sync"))
-        assert sorted(stopped) == ["cam1", "cam2"]
-        assert next(iter(host.takes.values()))["state"] == "failed"
-    asyncio.run(exercise())
+def test_preview_endpoint_handles_warmup_unknown_camera_and_jpeg(tmp_path, monkeypatch):
+    app = host_module.create_app(host_args(tmp_path))
+    preview = app.state.host.previews["cam1"]
+    monkeypatch.setattr(preview, "snapshot", lambda: None)
+    with TestClient(app) as client:
+        assert client.get("/api/cameras/unknown/preview.jpg").status_code == 404
+        response = client.get("/api/cameras/cam1/preview.jpg")
+        assert response.status_code == 503
+        assert response.headers["cache-control"] == "no-store"
+        monkeypatch.setattr(preview, "snapshot", lambda: b"jpeg")
+        response = client.get("/api/cameras/cam1/preview.jpg")
+        assert response.status_code == 200 and response.content == b"jpeg"
+        assert response.headers["content-type"] == "image/jpeg"
+        assert response.headers["cache-control"] == "no-store"

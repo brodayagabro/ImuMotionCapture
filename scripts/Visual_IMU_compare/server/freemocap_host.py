@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""RTSP or SkellyCam recording → native offline FreeMoCap → BVH + web player."""
+"""RTSP recording → native offline FreeMoCap → BVH + web player."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,15 +14,15 @@ import signal
 import sys
 import tempfile
 import time
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 import uuid
 
-import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from rtsp_recording import RTSPRecorder, finalize_recordings, probe
+from rtsp_preview import Preview
 
 HERE = Path(__file__).resolve().parent
 BUSY = {"preparing", "recording", "collecting", "processing"}
@@ -83,23 +82,19 @@ def camera_endpoints(values):
         name, separator, url = value.partition("=")
         parsed = urlsplit(url)
         if not separator or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
-            raise ValueError("Use --camera cam1=rtsp://SERVER:8554/cam1 (or an HTTP SkellyCam node)")
-        if (parsed.scheme not in ("http", "rtsp") or not parsed.hostname or parsed.fragment
+            raise ValueError("Use --camera cam1=rtsp://SERVER:8554/cam1")
+        if (parsed.scheme != "rtsp" or not parsed.hostname or parsed.fragment
                 or parsed.username or any(ord(c) < 32 for c in url)):
-            raise ValueError("Use an RTSP URL or an HTTP origin without credentials")
+            raise ValueError("Use an RTSP URL without credentials")
         if parsed.port is not None and not 1 <= parsed.port <= 65535:
             raise ValueError("Invalid camera port")
-        if parsed.scheme == "http" and (parsed.path not in ("", "/") or parsed.query):
-            raise ValueError("A SkellyCam endpoint must be an HTTP origin")
         if name in endpoints:
             raise ValueError(f"Duplicate camera identity: {name}")
-        endpoints[name] = url.rstrip("/")
+        endpoints[name] = url
     if len(endpoints) < 2:
         raise ValueError("Configure at least two distinct camera nodes")
     if len(set(endpoints.values())) != len(endpoints):
         raise ValueError("Each camera must have a different endpoint")
-    if len({urlsplit(url).scheme for url in endpoints.values()}) != 1:
-        raise ValueError("Use either RTSP streams or HTTP SkellyCam nodes for all cameras")
     return endpoints
 
 
@@ -109,7 +104,7 @@ class Host:
         self.root = args.records.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.cameras = camera_endpoints(args.camera)
-        self.transport = urlsplit(next(iter(self.cameras.values()))).scheme
+        self.transport = "rtsp"
         self.capture = None
         self.capture_watch = None
         self.health_cache = (0, [])
@@ -117,6 +112,7 @@ class Host:
         self.ffmpeg = getattr(args, "ffmpeg", "ffmpeg")
         self.ffprobe = getattr(args, "ffprobe", "ffprobe")
         self.capture_timeout = getattr(args, "capture_timeout", 10)
+        self.previews = {name: Preview(url, self.ffmpeg, self.capture_timeout) for name, url in self.cameras.items()}
         if self.transport == "rtsp":
             for tool in (self.ffmpeg, self.ffprobe):
                 if not shutil.which(tool):
@@ -125,7 +121,6 @@ class Host:
         self.lock = asyncio.Lock()
         self.task = None
         self.process = None
-        self.client = None
         for path in self.root.glob("*/take.json"):
             take = json.loads(path.read_text())
             if take["state"] in BUSY:
@@ -142,47 +137,24 @@ class Host:
             raise HTTPException(404, "Unknown recording")
         return self.takes[take_id]
 
-    async def node(self, name, method, path):
-        response = await self.client.request(method, self.cameras[name] + path)
-        if response.is_error:
-            raise RuntimeError(f"{name}: HTTP {response.status_code}: {response.text[:1000]}")
-        return response.json()
-
-    async def all_nodes(self, method, path):
-        results = await asyncio.gather(*(self.node(name, method, path) for name in self.cameras), return_exceptions=True)
-        errors = [f"{name}: {value}" for name, value in zip(self.cameras, results) if isinstance(value, BaseException)]
-        if errors:
-            raise RuntimeError("; ".join(errors))
-        return dict(zip(self.cameras, results))
-
     async def health(self):
-        if self.transport == "rtsp":
-            async with self.health_lock:
-                active = next((t for t in self.takes.values() if t["state"] == "recording"), None)
-                if active and self.capture:
-                    return [dict(active["camera_settings"][name], active=active["id"],
-                                 received_seconds=stream.media_time, error=stream.failure())
-                            for name, stream in self.capture.streams.items()]
-                if time.monotonic() - self.health_cache[0] < 10:
-                    return self.health_cache[1]
-                async def stream_health(name, url):
-                    try:
-                        info = await probe(url, self.ffprobe, self.capture_timeout)
-                        return dict(camera=name, engine="rtsp", ready=True, active=None, **info)
-                    except Exception as exc:
-                        return dict(camera=name, engine="rtsp", error=str(exc) or type(exc).__name__)
-                status = await asyncio.gather(*(stream_health(n, u) for n, u in self.cameras.items()))
-                self.health_cache = (time.monotonic(), status)
-                return status
-        async def one(name):
-            try:
-                value = await asyncio.wait_for(self.node(name, "GET", "/health"), 3)
-                if value.get("camera") != name or value.get("engine") != "skellycam":
-                    raise ValueError("Camera identity / engine mismatch")
-                return value
-            except Exception as exc:
-                return dict(camera=name, error=str(exc))
-        return await asyncio.gather(*(one(name) for name in self.cameras))
+        async with self.health_lock:
+            active = next((t for t in self.takes.values() if t["state"] == "recording"), None)
+            if active and self.capture:
+                return [dict(active["camera_settings"][name], active=active["id"],
+                             received_seconds=stream.media_time, error=stream.failure())
+                        for name, stream in self.capture.streams.items()]
+            if time.monotonic() - self.health_cache[0] < 10:
+                return self.health_cache[1]
+            async def stream_health(name, url):
+                try:
+                    info = await probe(url, self.ffprobe, self.capture_timeout)
+                    return dict(camera=name, engine="rtsp", ready=True, active=None, **info)
+                except Exception as exc:
+                    return dict(camera=name, engine="rtsp", error=str(exc) or type(exc).__name__)
+            status = await asyncio.gather(*(stream_health(n, u) for n, u in self.cameras.items()))
+            self.health_cache = (time.monotonic(), status)
+            return status
 
     async def start(self, request):
         async with self.lock:
@@ -213,34 +185,19 @@ class Host:
             self.takes[take_id] = take
             self.update(take)
             try:
-                if self.transport == "rtsp":
-                    self.health_cache = (0, [])
-                    status = {info["camera"]: info for info in await self.health()}
-                else:
-                    status = await self.all_nodes("POST", "/prepare")
+                self.health_cache = (0, [])
+                status = {info["camera"]: info for info in await self.health()}
                 for name, info in status.items():
                     if info.get("camera") != name or not info.get("ready") or info.get("active"):
                         raise ValueError(f"{name}: {info.get('error') or 'node not ready, busy, or identity mismatch'}")
-                rates = [info["fps"] for info in status.values()]
-                if self.transport == "http" and max(rates) - min(rates) > 0.01:
-                    raise ValueError("Configure the same FPS on all camera nodes")
                 self.update(take, camera_settings=status)
-                if self.transport == "rtsp":
-                    self.capture = RTSPRecorder(self.cameras, folder, self.ffmpeg, self.ffprobe, self.capture_timeout)
-                    await self.capture.start()
-                    self.capture_watch = asyncio.create_task(self.watch_capture(take))
-                else:
-                    await self.all_nodes("POST", f"/recordings/{take_id}/start")
+                self.capture = RTSPRecorder(self.cameras, folder, self.ffmpeg, self.ffprobe, self.capture_timeout)
+                await self.capture.start()
+                self.capture_watch = asyncio.create_task(self.watch_capture(take))
                 self.update(take, state="recording", message="All nodes recording. Fire the common flash now.")
             except BaseException as exc:
-                # Even a request that timed out may have started a camera.
-                if self.transport == "rtsp":
-                    await self.stop_capture()
-                    stops = []
-                else:
-                    stops = await asyncio.gather(*(self.node(n, "POST", f"/recordings/{take_id}/stop") for n in self.cameras), return_exceptions=True)
-                self.update(take, state="failed", error=str(exc) or type(exc).__name__,
-                            capture_failed=self.transport == "rtsp", stop_results=[str(s) for s in stops])
+                await self.stop_capture()
+                self.update(take, state="failed", error=str(exc) or type(exc).__name__, capture_failed=True)
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 raise HTTPException(503, str(exc)) from exc
@@ -284,55 +241,16 @@ class Host:
             return take
 
     async def collect(self, take):
-        if self.transport == "rtsp":
-            await self.stop_capture()
-            if self.capture and self.capture.folder == self.root / take["id"]:
-                if error := self.capture.failure():
-                    self.update(take, capture_failed=True)
-                    raise RuntimeError(error)
-                await self.capture.finalize(self.cameras, take["id"])
-                self.capture = None
-            else:
-                await finalize_recordings(self.root / take["id"], self.cameras, take["id"], self.ffprobe)
-            self.health_cache = (0, [])
-            return
-        await self.all_nodes("POST", f"/recordings/{take['id']}/stop")
-        folder = self.root / take["id"]
-        raw = folder / "raw_videos"
-        raw.mkdir(exist_ok=True)
-        manifests = await self.all_nodes("GET", f"/recordings/{take['id']}/manifest")
-        for name, manifest in manifests.items():
-            if manifest.get("camera") != name:
-                raise ValueError(f"{name}: transfer identity mismatch")
-            video_count = 0
-            for item in manifest["files"]:
-                relative = Path(item["path"])
-                target = (folder / "camera_files" / name / relative).resolve()
-                base = (folder / "camera_files" / name).resolve()
-                if relative.is_absolute() or not target.is_relative_to(base):
-                    raise ValueError("Unsafe path in camera manifest")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                partial = target.with_name(target.name + ".partial")
-                digest = hashlib.sha256()
-                size = 0
-                url = self.cameras[name] + f"/recordings/{take['id']}/files/" + quote(relative.as_posix())
-                async with self.client.stream("GET", url) as response:
-                    response.raise_for_status()
-                    with partial.open("wb") as stream:
-                        async for chunk in response.aiter_bytes():
-                            stream.write(chunk)
-                            digest.update(chunk)
-                            size += len(chunk)
-                if size != item["size"] or digest.hexdigest() != item["sha256"]:
-                    raise ValueError(f"Transfer checksum failed: {name}/{relative}")
-                partial.replace(target)
-                if relative.parent.name == "synchronized_videos" and relative.suffix == ".mp4":
-                    video_count += 1
-                    # Canonical native filenames preserve identity between calibration and motion.
-                    shutil.copyfile(target, raw / f"{take['id']}.id-{name}.idx-0.mp4")
-            if video_count != 1:
-                raise ValueError(f"{name}: expected one native video, found {video_count}")
-        save(folder / "transfer_manifests.json", manifests)
+        await self.stop_capture()
+        if self.capture and self.capture.folder == self.root / take["id"]:
+            if error := self.capture.failure():
+                self.update(take, capture_failed=True)
+                raise RuntimeError(error)
+            await self.capture.finalize(self.cameras, take["id"])
+            self.capture = None
+        else:
+            await finalize_recordings(self.root / take["id"], self.cameras, take["id"], self.ffprobe)
+        self.health_cache = (0, [])
 
     async def collect_and_process(self, take):
         folder = self.root / take["id"]
@@ -377,6 +295,7 @@ class Host:
             self.update(take, state="failed", error=f"{type(exc).__name__}: {exc}")
 
     async def close(self):
+        await asyncio.gather(*(preview.close() for preview in self.previews.values()))
         if self.task and not self.task.done():
             self.task.cancel()
         if self.process and self.process.returncode is None:
@@ -388,12 +307,9 @@ class Host:
                 await self.process.wait()
         if self.task:
             await asyncio.gather(self.task, return_exceptions=True)
-        if self.transport == "rtsp":
-            await self.stop_capture()
+        await self.stop_capture()
         for take in self.takes.values():
             if take["state"] == "recording":
-                if self.transport == "http":
-                    await asyncio.gather(*(self.node(n, "POST", f"/recordings/{take['id']}/stop") for n in self.cameras), return_exceptions=True)
                 self.update(take, state="interrupted", error="Host stopped; collect the finalized files after restart")
 
 
@@ -402,9 +318,9 @@ def create_app(args):
 
     @asynccontextmanager
     async def lifespan(app):
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=5), trust_env=False) as client:
-            host.client = client
+        try:
             yield
+        finally:
             await host.close()
 
     app = FastAPI(title="FreeMoCap recording host", lifespan=lifespan)
@@ -431,6 +347,18 @@ def create_app(args):
             takes.append(view)
         return dict(cameras=await host.health(), takes=takes, output=str(args.output), records=str(host.root),
                     transport=host.transport)
+
+    @app.get("/api/cameras/{name}/preview.jpg")
+    async def preview(name: str):
+        if name not in host.previews:
+            raise HTTPException(404, "Unknown camera")
+        source = host.previews[name]
+        jpeg = source.snapshot()
+        headers = {"Cache-Control": "no-store"}
+        if jpeg is None:
+            return Response(source.error or "Waiting for a fresh frame", status_code=503,
+                            headers=headers, media_type="text/plain")
+        return Response(jpeg, media_type="image/jpeg", headers=headers)
 
     @app.post("/api/recordings")
     async def start(request: StartRequest):
@@ -494,7 +422,7 @@ def create_app(args):
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--camera", action="append", required=True,
-                        help="cam1=rtsp://127.0.0.1:8554/cam1 or cam1=http://CAMERA_IP:8082 (repeat; same protocol)")
+                        help="cam1=rtsp://127.0.0.1:8554/cam1 (repeat for each camera)")
     result.add_argument("--ffmpeg", default=shutil.which("ffmpeg") or "ffmpeg")
     result.add_argument("--ffprobe", default=shutil.which("ffprobe") or "ffprobe")
     result.add_argument("--capture-timeout", type=int, choices=range(3, 61), default=10,

@@ -2,10 +2,6 @@
 # Local, repeatable setup for the camera computer. Never activate another venv.
 set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-if [[ ${1:-} == --workflow && ${2:-} == recording ]]; then
-    shift 2
-    exec bash "$SCRIPT_DIR/../server/setup_recording.sh" camera "$@"
-fi
 PYTHON_BIN=/usr/bin/python3
 EXPLICIT_PYTHON=0
 INSTALL_SYSTEM=0

@@ -14,6 +14,8 @@ import pytest
 
 import freemocap_host as host_module
 from rtsp_recording import RTSPRecorder
+import rtsp_recording
+from rtsp_preview import Preview
 from rtsp_relay import relay_config
 
 HERE = Path(__file__).resolve().parent
@@ -100,6 +102,69 @@ def test_rtsp_urls_and_mixed_protocol_rejection():
                    ["a=rtsp://user:password@x/a", "b=rtsp://x/b"]]:
         with pytest.raises(ValueError):
             host_module.camera_endpoints(values)
+
+
+@pytest.mark.parametrize("help_text,expected", [
+    ("  -timeout <int> .D....... set maximum timeout (in seconds) to wait for incoming connections\n"
+     "  -stimeout <int64> .D....... set timeout of socket TCP I/O operations", "-stimeout"),
+    ("  -timeout <int64> .D....... set timeout (in microseconds) of socket TCP I/O operations", "-timeout"),
+])
+def test_socket_timeout_uses_io_option_not_listen_option(monkeypatch, help_text, expected):
+    rtsp_recording.socket_timeout_option.cache_clear()
+    monkeypatch.setattr(rtsp_recording.subprocess, "run",
+                        lambda *args, **kwargs: SimpleNamespace(stdout=help_text, stderr=""))
+    try:
+        assert asyncio.run(rtsp_recording.input_options("test-ffmpeg", 3))[2:4] == [expected, "3000000"]
+    finally:
+        rtsp_recording.socket_timeout_option.cache_clear()
+
+
+def test_unknown_timeout_semantics_fail_instead_of_opening_listener(monkeypatch):
+    rtsp_recording.socket_timeout_option.cache_clear()
+    monkeypatch.setattr(rtsp_recording.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        stdout="  -timeout <int> wait for incoming connections", stderr=""))
+    with pytest.raises(ValueError, match="Cannot determine"):
+        rtsp_recording.socket_timeout_option("unknown-ffmpeg")
+
+
+def test_live_preview_is_shared_and_fresh_and_does_not_interrupt_recording(tmp_path, rtsp_sources):
+    import cv2
+    import numpy as np
+
+    async def run():
+        preview = Preview(rtsp_sources.cameras["cam1"], shutil.which("ffmpeg"), timeout=3)
+        recorder = RTSPRecorder(rtsp_sources.cameras, tmp_path, shutil.which("ffmpeg"), shutil.which("ffprobe"), 3)
+        try:
+            await recorder.start()
+            assert preview.snapshot() is None
+            task = preview.task
+            for _ in range(100):
+                jpeg = preview.snapshot()
+                if jpeg:
+                    break
+                await asyncio.sleep(.1)
+            assert jpeg, preview.error
+            frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            assert frame.shape[:2] == (120, 160)
+            assert preview.task is task
+            preview.updated = time.monotonic() - 3
+            assert preview.snapshot() is None  # Never serve a frozen old picture as live.
+            preview.requested = time.monotonic() - 16
+            await asyncio.wait_for(task, 5)  # No viewers: release the decoder.
+            assert preview.process.returncode is not None
+            assert preview.snapshot() is None
+            assert preview.task is not task  # A returning viewer restarts the decoder.
+            await asyncio.sleep(.5)
+            await preview.close()
+            assert preview.process.returncode is not None
+            assert recorder.failure() is None
+            await recorder.stop()
+            report = await recorder.finalize(list(rtsp_sources.cameras), "preview-test")
+            assert all(info["packets"] > 10 for info in report["cameras"].values())
+        finally:
+            await preview.close()
+            await recorder.stop()
+    asyncio.run(run())
 
 
 def test_rtsp_recording_to_native_sync_and_recovery(tmp_path, rtsp_sources):
