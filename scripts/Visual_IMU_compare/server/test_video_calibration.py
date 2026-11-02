@@ -161,15 +161,18 @@ def test_capture_failures_are_reported_and_cleaned(job, monkeypatch, failure):
     assert instance.snapshot()['temporary_files_removed'] and not applied
 
 
-def calibration_images(args, count=28):
+def calibration_images(args, count=28, camera_count=2):
     """Render a physical board in known stereo geometry; no detector mocks."""
-    session = s.CalibrationSession(args)
+    session = s.CharucoObservations(args)
     board = session.board.generateImage((1400,1000), marginSize=0)
     size = (1280,960)
     k = np.array([[1000.,0,640],[0,1000.,480],[0,0,1]])
     r,_ = s.cv2.Rodrigues(np.array([.01,.13,-.01]))
     cameras = {'a':dict(K=k,D=np.zeros(5),R=np.eye(3),t=np.zeros(3)),
                'b':dict(K=k,D=np.zeros(5),R=r,t=np.array([-.30,.01,.02]))}
+    if camera_count == 3:
+        r3,_ = s.cv2.Rodrigues(np.array([-.02,-.15,.02]))
+        cameras['c'] = dict(K=k,D=np.zeros(5),R=r3,t=np.array([.25,.03,.06]))
     outline = np.array([[0,0,0],[.28,0,0],[.28,.20,0],[0,.20,0]])
     pixels = np.float32([[0,0],[1399,0],[1399,999],[0,999]])
     frames = []
@@ -185,8 +188,9 @@ def calibration_images(args, count=28):
     return frames,cameras,size
 
 
-def test_real_video_detection_and_calibration_recover_camera_geometry(args,tmp_path):
-    frames, expected, size = calibration_images(args)
+@pytest.mark.parametrize('camera_count', [2,3])
+def test_real_video_detection_and_calibration_recover_camera_geometry(args,tmp_path,camera_count):
+    frames, expected, size = calibration_images(args,camera_count=camera_count)
     folder = tmp_path/'input'
     folder.mkdir()
     for name in expected:
@@ -199,20 +203,24 @@ def test_real_video_detection_and_calibration_recover_camera_geometry(args,tmp_p
                     file.write(json.dumps(dict(index=i,sequence=i+1,received=10+i*.6,aligned=10+i*.6))+ '\n')
         finally:
             writer.release()
-    instance = s.VideoCalibration(args,['a','b'],lambda:{},lambda _:None)
+    instance = s.VideoCalibration(args,list(expected),lambda:{},lambda _:None)
     result = instance.process(folder,dict.fromkeys(expected,size))
-    s.checked_calibration(result,['a','b'])
+    s.checked_calibration(result,list(expected))
+    assert result['solver']['name'] == 'freemocap_anipose'
+    assert result['solver']['version'] == 'v2.0.0-alpha.25'
+    assert result['solver']['commit'] == '700c8614d11d886dacfea8e52333d3c0b942ef52'
+    assert result['solver']['median_reprojection_px'] < 1
     assert result['video_calibration']['samples'] >= 12
     assert max(result['rms_px'].values()) < 1
-    np.testing.assert_allclose(result['cameras']['b']['t'],expected['b']['t'],atol=.008)
-    np.testing.assert_allclose(result['cameras']['b']['R'],expected['b']['R'],atol=.015)
     for name in expected:
+        np.testing.assert_allclose(result['cameras'][name]['t'],expected[name]['t'],atol=.008)
+        np.testing.assert_allclose(result['cameras'][name]['R'],expected[name]['R'],atol=.015)
         np.testing.assert_allclose(np.diag(result['cameras'][name]['K'])[:2],[1000,1000],rtol=.03)
 
 
 def test_static_board_does_not_count_as_twelve_poses(args):
     pair, _, _ = calibration_images(args,1)
-    session = s.CalibrationSession(args)
+    session = s.CharucoObservations(args)
     frames = {name:s.Frame(1,1,1,image) for name,image in pair[0].items()}
     assert session.capture(frames,['a','b'],distinct=True) == 1
     frames = {name:s.Frame(2,2,2,image) for name,image in pair[0].items()}

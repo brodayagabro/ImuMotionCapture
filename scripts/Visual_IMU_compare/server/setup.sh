@@ -2,6 +2,10 @@
 # Server profiles deliberately keep CPU/GPU ONNX Runtime in separate venvs.
 set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ ${1:-} == --workflow && ${2:-} == recording ]]; then
+    shift 2
+    exec bash "$SCRIPT_DIR/setup_recording.sh" server "$@"
+fi
 PYTHON_BIN=/usr/bin/python3
 EXPLICIT_PYTHON=0
 DEVICE=cpu
@@ -14,9 +18,9 @@ usage() {
 Usage: ./setup.sh [--device cpu|cuda] [--python /path/to/python3]
                   [--system-deps] [--with-tests] [--skip-models]
 
-Creates server/.venv-cpu or server/.venv-cuda (Python >= 3.12), installs
-pinned packages, local RTMlib/FreeMoCap checkouts and verified MediaMTX.
-If system Python is too old, a private Python 3.12 is downloaded automatically.
+Creates server/.venv-cpu or server/.venv-cuda and server/.venv-calibration,
+installs pinned packages, local RTMlib/FreeMoCap checkouts and verified MediaMTX.
+Calibration uses Python 3.12; other system versions trigger a private download.
 Safe to repeat; does not start a service or open a camera.
 --system-deps     Install python3-venv, git, ca-certificates through apt/sudo.
 --with-tests      Install the test dependencies.
@@ -50,8 +54,8 @@ if ((INSTALL_SYSTEM)); then
     "${SUDO[@]}" apt-get install -y --no-install-recommends python3-venv git ca-certificates
 fi
 command -v "$PYTHON_BIN" >/dev/null || fail "Python not found: $PYTHON_BIN"
-if ! "$PYTHON_BIN" -c 'import sys; sys.exit(sys.version_info < (3,12))'; then
-    ((EXPLICIT_PYTHON == 0)) || fail "The supplied Python must be >= 3.12 for the pinned NumPy"
+if ! "$PYTHON_BIN" -c 'import sys; sys.exit(sys.version_info[:2] != (3,12))'; then
+    ((EXPLICIT_PYTHON == 0)) || fail "Use Python 3.12 for compatibility with the pinned FreeMoCap calibration dependencies"
     BOOTSTRAP="$SCRIPT_DIR/.tools/bootstrap"
     mkdir -p -- "$SCRIPT_DIR/.tools"
     "$PYTHON_BIN" -m venv "$BOOTSTRAP" || fail "Install python3-venv or repeat with --system-deps"
@@ -98,11 +102,11 @@ for line in (root/'requirements-repositories.txt').read_text().splitlines():
     if not line.strip() or line.lstrip().startswith('#'):
         continue
     name, url, commit = line.split()
-    if name not in ('rtmlib','freemocap') or len(commit)!=40 or any(c not in '0123456789abcdef' for c in commit):
+    if name not in ('rtmlib','freemocap','skellycam','skellytracker','skellylogs') or len(commit)!=40 or any(c not in '0123456789abcdef' for c in commit):
         raise SystemExit('Invalid pinned repository definition')
     path = repositories/name
     if path.exists():
-        if git(path,'remote','get-url','origin')!=url or git(path,'rev-parse','HEAD')!=commit or git(path,'status','--porcelain'):
+        if git(path,'remote','get-url','origin').removesuffix('.git')!=url.removesuffix('.git') or git(path,'rev-parse','HEAD')!=commit or git(path,'status','--porcelain'):
             raise SystemExit(f'Existing checkout differs from pinned clean revision: {path}. Left unchanged.')
     else:
         with tempfile.TemporaryDirectory(prefix=f'.{name}-',dir=repositories) as staging:
@@ -173,6 +177,27 @@ sys.path.insert(0,str(repositories/'rtmlib'))
 import rtmlib
 print('Server imports OK; ONNX providers:',ort.get_available_providers())
 PY
+
+# Upstream beartype/skellytracker requires NumPy 2.4.x, while inference has its
+# own pinned runtime. Run the unchanged native solver in an isolated process.
+CALIBRATION_ENV="$SCRIPT_DIR/.venv-calibration"
+[[ ! -L "$CALIBRATION_ENV" ]] || fail "Refusing a symlink calibration environment"
+if [[ -e "$CALIBRATION_ENV" ]]; then
+    [[ -f "$CALIBRATION_ENV/.setup-profile" && $(cat "$CALIBRATION_ENV/.setup-profile") == server-calibration-v1 ]] || fail "Existing calibration environment is not managed by this setup"
+else
+    mkdir -p -- "$CALIBRATION_ENV"
+    echo server-calibration-v1 > "$CALIBRATION_ENV/.setup-profile"
+fi
+if [[ ! -x "$CALIBRATION_ENV/bin/python" ]]; then
+    "$PYTHON_BIN" -m venv "$CALIBRATION_ENV"
+fi
+CALIBRATION_PY="$CALIBRATION_ENV/bin/python"
+"$CALIBRATION_PY" -c 'import sys; assert sys.version_info[:2] == (3,12), "Calibration requires Python 3.12"'
+"$CALIBRATION_PY" -m pip install --disable-pip-version-check --only-binary=:all: -r "$SCRIPT_DIR/requirements-calibration.txt"
+"$CALIBRATION_PY" "$SCRIPT_DIR/freemocap_calibration.py" --repos "$SCRIPT_DIR/repositories" --check
+"$CALIBRATION_PY" -m pip check
+mkdir -p -- "$SCRIPT_DIR/runtime"
+"$CALIBRATION_PY" -m pip freeze > "$SCRIPT_DIR/runtime/requirements-resolved-calibration.txt"
 if ((DOWNLOAD_MODELS)); then
     "$PY" - "$SCRIPT_DIR" "$DEVICE" <<'PY'
 from pathlib import Path

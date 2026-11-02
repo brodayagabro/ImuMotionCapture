@@ -1,0 +1,2 @@
+# Native camera recorder; transitive packages are pinned by this commit's uv.lock.
+skellycam https://github.com/freemocap/skellycam.git 06771043becd50db1570ed2a67dd0536edbf47f1

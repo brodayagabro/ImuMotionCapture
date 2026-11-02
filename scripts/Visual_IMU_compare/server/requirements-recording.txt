@@ -1,0 +1,5 @@
+# SkellyTracker pins NumPy 2.4.6. OpenCV 4.14 supports that NumPy ABI.
+# setup_recording.sh adjusts only SkellyCam's OpenCV dependency declaration
+# in a temporary source copy; its Python capture code remains unchanged.
+numpy==2.4.6
+opencv-contrib-python==4.14.0.94

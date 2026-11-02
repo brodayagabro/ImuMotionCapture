@@ -24,6 +24,7 @@ from pathlib import Path
 import re
 import socket
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -68,6 +69,8 @@ def arguments(argv=None):
     p.add_argument("--calibration-duration", type=float, default=60, help="Maximum calibration recording duration in seconds (1–300); then solve automatically")
     p.add_argument("--calibration-temp", type=Path, help="Parent for private temporary calibration videos; default: system temporary directory")
     p.add_argument("--calibration-max-mb", type=int, default=2048, help="Temporary video size limit in MiB; checked once per second")
+    p.add_argument("--calibration-python", type=Path, default=HERE / ".venv-calibration/bin/python", help="Python for the isolated native FreeMoCap calibration worker")
+    p.add_argument("--calibration-timeout", type=float, default=600, help="Maximum native calibration solver time in seconds")
     p.add_argument("--board", default="7x5", help="ChArUco board square counts, columns x rows")
     p.add_argument("--square-m", type=float, default=0.04)
     p.add_argument("--marker-m", type=float, default=0.03)
@@ -79,7 +82,7 @@ def arguments(argv=None):
     args = p.parse_args(argv)
     if not re.fullmatch(r"cpu|cuda(?::\d+)?", args.device):
         p.error("--device must be cpu or cuda[:GPU_INDEX]")
-    for key in ("fps", "max_skew_ms", "max_age_ms", "max_reprojection_px", "square_m", "marker_m"):
+    for key in ("fps", "max_skew_ms", "max_age_ms", "max_reprojection_px", "square_m", "marker_m", "calibration_timeout"):
         if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
             p.error(f"--{key.replace('_', '-')} must be finite and positive")
     if args.preview_width < 160 or not 0 < args.confidence <= 1 or not 1 <= args.port <= 65535:
@@ -885,7 +888,8 @@ class BvhSender:
             connection.close()
 
 
-class CalibrationSession:
+class CharucoObservations:
+    """Collect board detections only; all calibration math belongs to FreeMoCap."""
     def __init__(self, args):
         cols, rows = map(int, args.board.split("x"))
         if (cols * rows) // 2 > 50:
@@ -930,49 +934,62 @@ class CalibrationSession:
             self.last_sequences = sequences
             return len(self.samples)
 
-    def solve(self, all_ids):
+    def payload(self, all_ids):
         with self.lock:
             if len(self.samples) < 12:
                 raise ValueError("Video needs at least 12 distinct board poses visible in all cameras; record again while moving and tilting the board")
-            objects = self.board.getChessboardCorners()
-            cameras, rms = {}, {}
+            sizes = {}
             for name in all_ids:
                 views = [sample[name] for sample in self.samples]
                 size = views[0]["size"]
                 if any(v["size"] != size for v in views):
                     raise ValueError(f"{name}: resolution changed during calibration")
-                object_points = [objects[v["ids"]].astype(np.float32) for v in views]
-                image_points = [v["corners"].astype(np.float32) for v in views]
-                error, k, d, _, _ = cv2.calibrateCamera(object_points, image_points, size, None, None)
-                if not math.isfinite(error) or error > 3:
-                    raise ValueError(f"{name}: calibration RMS {error:.2f}px > 3px. Capture more varied, sharp board poses.")
-                cameras[name] = dict(K=k.tolist(), D=d.reshape(-1).tolist(), R=np.eye(3).tolist(), t=[0., 0., 0.], image_size=list(size))
-                rms[name] = float(error)
-            reference = all_ids[0]
-            for name in all_ids[1:]:
-                objects_shared, left, right = [], [], []
-                for sample in self.samples:
-                    a, b = sample[reference], sample[name]
-                    common, ia, ib = np.intersect1d(a["ids"], b["ids"], return_indices=True)
-                    if len(common) >= 8:
-                        objects_shared.append(objects[common].astype(np.float32))
-                        left.append(a["corners"][ia].astype(np.float32))
-                        right.append(b["corners"][ib].astype(np.float32))
-                if len(objects_shared) < 12:
-                    raise ValueError(f"{reference}/{name}: need 12 poses with 8 common corners")
-                a, b = cameras[reference], cameras[name]
-                error, _, _, _, _, r, t, _, _ = cv2.stereoCalibrate(
-                    objects_shared, left, right, np.array(a["K"]), np.array(a["D"]),
-                    np.array(b["K"]), np.array(b["D"]), tuple(a["image_size"]), flags=cv2.CALIB_FIX_INTRINSIC,
-                    criteria=(cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 100, 1e-7))
-                if not math.isfinite(error) or error > 3:
-                    raise ValueError(f"{reference}/{name}: stereo RMS {error:.2f}px > 3px; check timing and board poses")
-                b.update(R=r.tolist(), t=t.reshape(-1).tolist())
-                rms[f"{reference}/{name}"] = float(error)
-            return dict(schema_version=1, units="m", extrinsics_convention="world_to_camera",
-                        world_frame=f"{reference}: X right, Y down, Z forward", cameras=cameras,
-                        rms_px=rms, board=dict(squares=list(self.board.getChessboardSize()),
-                        square_m=float(self.board.getSquareLength()), marker_m=float(self.board.getMarkerLength())))
+                sizes[name] = list(size)
+            return dict(camera_ids=list(all_ids), image_sizes=sizes,
+                samples=[{name:dict(ids=sample[name]["ids"].tolist(), corners=sample[name]["corners"].tolist())
+                          for name in all_ids} for sample in self.samples],
+                board=dict(squares=list(self.board.getChessboardSize()),
+                           square_m=float(self.board.getSquareLength()), marker_m=float(self.board.getMarkerLength())))
+
+
+def run_freemocap_calibration(args, payload, folder, cancelled):
+    """Run the upstream solver in its own environment; never fall back to OpenCV."""
+    python = args.calibration_python.absolute()  # preserve the venv symlink
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise ValueError("FreeMoCap calibration environment is missing; rerun server/setup.sh --device cpu or cuda")
+    input_file, output_file, log_file = (folder / name for name in ("observations.json", "calibration-result.json", "solver.log"))
+    input_file.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+    command = [str(python), str(HERE / "freemocap_calibration.py"), "--repos", str(args.repos.resolve()),
+               "--input", str(input_file), "--output", str(output_file)]
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + args.calibration_timeout
+            while process.poll() is None:
+                if cancelled.wait(.1):
+                    raise CalibrationCancelled()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("FreeMoCap calibration timed out; adjust --calibration-timeout if needed")
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+    if cancelled.is_set():
+        raise CalibrationCancelled()
+    if process.returncode:
+        with log_file.open("rb") as log:
+            log.seek(max(0, log_file.stat().st_size - 4000))
+            detail = log.read().decode("utf-8", errors="replace").strip()
+        raise ValueError(f"FreeMoCap calibration failed (exit {process.returncode}): {detail}")
+    result = json.loads(output_file.read_text())
+    checked_calibration(result, payload["camera_ids"])
+    if result.get("solver", {}).get("name") != "freemocap_anipose":
+        raise ValueError("Calibration worker did not return a native FreeMoCap result")
+    return result
 
 
 def calibration_video_groups(rows, all_ids, max_skew_s):
@@ -1024,7 +1041,8 @@ class VideoCalibration:
         self.started = None
         self.state = dict(status="idle", seconds=0., frames=dict.fromkeys(ids, 0),
                           dropped_frames=dict.fromkeys(ids, 0), samples=0, candidates=0, processed=0,
-                          error=None, last_rejection=None, rms_px=None, temporary_files_removed=True)
+                          error=None, last_rejection=None, rms_px=None, temporary_files_removed=True,
+                          phase=None, solver=None)
 
     def snapshot(self):
         with self.lock:
@@ -1044,12 +1062,15 @@ class VideoCalibration:
             if len(self.ids) < 2 or any(not histories[name] or
                     not 0 <= now-histories[name][-1].received <= self.args.max_age_ms/1000 for name in self.ids):
                 raise ValueError("At least two cameras are required, and all configured cameras must have fresh video")
+            if not os.access(self.args.calibration_python, os.X_OK):
+                raise ValueError("FreeMoCap calibration environment is missing; rerun server/setup.sh --device cpu or cuda")
             self.finish.clear()
             self.cancelled.clear()
             self.started, self.active = now, True
             self.state.update(status="recording", seconds=0., frames=dict.fromkeys(self.ids, 0),
                               dropped_frames=dict.fromkeys(self.ids, 0), samples=0, candidates=0, processed=0,
-                              error=None, last_rejection=None, rms_px=None, temporary_files_removed=False)
+                              error=None, last_rejection=None, rms_px=None, temporary_files_removed=False,
+                              phase=None, solver=None)
             self.thread = threading.Thread(target=self.run, name="video-calibration", daemon=True)
             self.thread.start()
 
@@ -1073,8 +1094,7 @@ class VideoCalibration:
                 self.cancelled.set()
                 self.finish.set()
         if self.thread and self.thread.ident:
-            # OpenCV's current solve may need to finish before cancellation;
-            # the worker checks the event before applying its result.
+            # The worker terminates the native solver process on cancellation.
             self.thread.join()
 
     def check_cancelled(self):
@@ -1144,7 +1164,7 @@ class VideoCalibration:
             self.state["candidates"] = len(groups)
         if len(groups) < 12:
             raise ValueError("Video needs at least 12 time-matched groups; record longer and check camera timing")
-        session, captures = CalibrationSession(self.args), {}
+        session, captures = CharucoObservations(self.args), {}
         try:
             for name in self.ids:
                 cap = cv2.VideoCapture(str(folder/f"{name}.avi"))
@@ -1174,7 +1194,9 @@ class VideoCalibration:
                 if len(session.samples) >= 60:
                     break
             self.check_cancelled()
-            result = session.solve(self.ids)
+            with self.lock:
+                self.state["phase"] = "freemocap_anipose"
+            result = run_freemocap_calibration(self.args, session.payload(self.ids), folder, self.cancelled)
             self.check_cancelled()
             with self.lock:
                 result["video_calibration"] = dict(samples=len(session.samples), frames=dict(self.state["frames"]),
@@ -1197,12 +1219,14 @@ class VideoCalibration:
                 with self.lock:
                     self.check_cancelled()
                     self.state["status"] = "processing"
+                    self.state["phase"] = "detecting"
                 data = self.process(folder, sizes)
                 with self.lock:
                     self.check_cancelled()
                     self.state["status"] = "saving"
                     self.apply(data)
                     self.state["rms_px"] = data["rms_px"]
+                    self.state["solver"] = data.get("solver")
                 final_status = "complete"
         except CalibrationCancelled:
             final_status = "cancelled"
@@ -1227,7 +1251,7 @@ class Engine:
         self.triangulate = load_triangulator(args.repos)
         self.stop = threading.Event()
         self.lock = threading.Lock()
-        self.calibrator = CalibrationSession(args)
+        self.calibrator = CharucoObservations(args)
         self.bvh_lock = threading.Lock()
         self.bvh = BvhAdapter(args)
         self.armature = ArmatureView(args.max_age_ms/1000)
@@ -1308,6 +1332,7 @@ class Engine:
                         calibrated=self.calibration is not None, calibration_samples=video_calibration["samples"],
                         video_calibration=video_calibration,
                         calibration_rms_px=(self.calibration_data or {}).get("rms_px"),
+                        calibration_solver=(self.calibration_data or {}).get("solver"),
                         world_frame=(self.calibration_data or {}).get("world_frame"),
                         timing_basis="server_monotonic_after_decode_plus_manual_offset",
                         max_skew_ms=self.args.max_skew_ms, pose_age_ms=age,
@@ -1522,7 +1547,7 @@ function update(s){current=s;lastStateMs=performance.now();if(s.armature)armatur
  $('notice').textContent=warnings.join('\n');$('samples').textContent=s.calibration_samples;
  $('boardSize').textContent=s.board.squares+' клеток; сторона клетки '+(s.board.square_m*1000).toFixed(1)+' мм, маркера '+(s.board.marker_m*1000).toFixed(1)+' мм.';
  $('bvhStatus').textContent=s.bvh.pose_status+(s.bvh.enabled?' · '+s.bvh.transport.toUpperCase()+' → '+s.bvh.target+' · отправлено '+s.bvh.sent:' · сетевой адрес не задан')+(s.bvh.error?' · '+s.bvh.error:'')+(s.bvh.file_error?' · запись: '+s.bvh.file_error:'');
- $('world').textContent=s.world_frame?'Система координат: '+s.world_frame+'. В WebGL оси Y и Z развёрнуты для отображения.':'';
+ $('world').textContent=(s.world_frame?'Система координат: '+s.world_frame+'. В WebGL оси Y и Z развёрнуты для отображения. ':'')+(s.demo?'Калибровка: синтетическая.':s.calibrated?(s.calibration_solver?.name==='freemocap_anipose'?'Калибровка: FreeMoCap Anipose.':'Загружена прежняя калибровка без отметки FreeMoCap. Новая запись пересчитает её через FreeMoCap Anipose.'):'Для новой калибровки используется FreeMoCap Anipose.');
  for(const c of s.cameras){let card=cards.get(c.id);if(!card){card=document.createElement('div');card.className='card';const bar=document.createElement('div');bar.className='bar';const name=document.createElement('b');name.textContent=c.id;const stat=document.createElement('span');stat.className='camera-stat';bar.append(name,stat);const img=document.createElement('img');img.alt=c.id;card.append(bar,img);$('cameras').append(card);cards.set(c.id,card);setFeed(card,c.id)}
  const people=pose?.views[c.id]?.people;card.querySelector('.camera-stat').textContent=c.status+' · '+c.fps+' fps'+(c.age_ms!==null?' · '+Math.round(c.age_ms)+' мс':'')+(people>1?' · несколько людей':'');}
  const now=performance.now();if(pose&&pose.frame_id!==seenFrame){seenFrame=pose.frame_id;arrivals.push(now)}arrivals=arrivals.filter(t=>now-t<2000);$('fps').textContent=arrivals.length>1?((arrivals.length-1)*1000/(now-arrivals[0])).toFixed(1):'—';
@@ -1535,11 +1560,11 @@ function updateCalibration(c){
  if(!c)return;
  if(calibrationStage!==c.status){calibrationStage=c.status;calibrationError=''}
  const labels={idle:'Запись не начата',recording:'Запись видео',processing:'Поиск доски и расчёт калибровки',saving:'Сохранение калибровки',cancelling:'Отмена · ожидание завершения текущей операции',cancelled:'Запись отменена',complete:'Калибровка сохранена',error:'Калибровка не выполнена'};
- $('calibrationStatus').textContent=(labels[c.status]||c.status)+(c.status==='recording'?' · '+c.seconds.toFixed(1)+' / '+c.duration_s+' с':'')+(!c.active&&c.temporary_files_removed&&c.status!=='idle'?' · временное видео удалено':'');
+ $('calibrationStatus').textContent=(c.status==='processing'&&c.phase==='freemocap_anipose'?'FreeMoCap Anipose · совместное уточнение камер':labels[c.status]||c.status)+(c.status==='recording'?' · '+c.seconds.toFixed(1)+' / '+c.duration_s+' с':'')+(!c.active&&c.temporary_files_removed&&c.status!=='idle'?' · временное видео удалено':'');
  $('calibrationProgress').value=c.status==='recording'?c.seconds/c.duration_s:c.status==='complete'?1:c.candidates?c.processed/c.candidates:0;
  $('calibrationFrames').textContent=Object.entries(c.frames).map(([name,n])=>name+': '+n+' кадров'+(c.dropped_frames[name]?' · пропущено при записи '+c.dropped_frames[name]:'')).join(' / ');
  $('samples').textContent=c.samples;
- $('message').textContent=calibrationError||c.error||(c.rms_px?'RMS, пиксели: '+Object.entries(c.rms_px).map(([name,v])=>name+': '+v.toFixed(2)).join(' · '):c.last_rejection||'Запись автоматически завершится через '+c.duration_s+' с. Можно остановить раньше.');
+ $('message').textContent=calibrationError||c.error||(c.rms_px?'RMS по камерам, пиксели: '+Object.entries(c.rms_px).map(([name,v])=>name+': '+v.toFixed(2)).join(' · ')+(c.solver?' · медиана FreeMoCap: '+c.solver.median_reprojection_px.toFixed(2)+' px':''):c.status==='processing'?'Калибровка FreeMoCap выполняется в фоне. Можно отменить.':c.last_rejection||'Запись автоматически завершится через '+c.duration_s+' с. Можно остановить раньше.');
  $('message').className=calibrationError||c.error?'error':'';
  for(const b of document.querySelectorAll('[data-action]'))b.disabled=calibrationRequest||current?.demo||
   (b.dataset.action==='start'?c.active:b.dataset.action==='stop'?c.status!=='recording':!c.active||!['recording','processing'].includes(c.status));
