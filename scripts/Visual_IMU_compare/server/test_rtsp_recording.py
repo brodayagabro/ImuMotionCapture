@@ -172,7 +172,7 @@ def test_rtsp_recording_to_native_sync_and_recovery(tmp_path, rtsp_sources):
         args = arguments(tmp_path, rtsp_sources)
         host = host_module.Host(args)
         try:
-            take = await host.start(host_module.StartRequest(kind="sync"))
+            take = await host.start(host_module.StartRequest(kind="sync", sync_method="flash"))
             assert take["state"] == "recording"
             assert all(info["received_seconds"] > 0 for info in await host.health())
             await show_flash(rtsp_sources)
@@ -188,7 +188,7 @@ def test_rtsp_recording_to_native_sync_and_recovery(tmp_path, rtsp_sources):
             assert len(list((folder / "raw_videos").glob("*.mp4"))) == 2
 
             # Graceful shutdown finalizes files. A restarted host can finish processing.
-            take = await host.start(host_module.StartRequest(kind="sync"))
+            take = await host.start(host_module.StartRequest(kind="sync", sync_method="flash"))
             await show_flash(rtsp_sources)
             await host.close()
             host = host_module.Host(args)
@@ -206,7 +206,7 @@ def test_stream_loss_stops_all_receivers_and_rejects_processing(tmp_path, rtsp_s
     async def run():
         host = host_module.Host(arguments(tmp_path, rtsp_sources))
         try:
-            take = await host.start(host_module.StartRequest(kind="sync"))
+            take = await host.start(host_module.StartRequest(kind="sync", sync_method="flash"))
             rtsp_sources.publisher.terminate()
             for _ in range(100):
                 if take["state"] == "failed":
@@ -223,6 +223,35 @@ def test_stream_loss_stops_all_receivers_and_rejects_processing(tmp_path, rtsp_s
     asyncio.run(run())
 
 
+def test_default_recording_synchronizes_without_any_flash(tmp_path, rtsp_sources):
+    async def run():
+        args = arguments(tmp_path, rtsp_sources)
+        host = host_module.Host(args)
+        try:
+            take = await host.start(host_module.StartRequest(kind="sync"))
+            assert take["options"]["sync_method"] == "receive"
+            assert "No flash required" in take["message"]
+            await asyncio.sleep(3)
+            # Restart recovery also needs the persisted clock and frame sidecars.
+            await host.close()
+            host = host_module.Host(args)
+            take = host.get(take["id"])
+            await host.stop(take["id"])
+            await asyncio.wait_for(host.task, 60)
+            folder = host.root / take["id"]
+            assert take["state"] == "complete", (take, (folder / "worker.log").read_text()[-3000:])
+            report = json.loads((folder / "sync_result.json").read_text())
+            assert report["method"] == "server_receive"
+            assert report["measured_max_skew_ms"] <= 50
+            assert report["synchronized_frame_count"] >= 20
+            assert (folder / report["frame_map"]).is_file()
+            assert len(list((folder / "synchronized_videos").glob("*.mp4"))) == 2
+            assert not (folder / "flash_evidence.json").exists()
+        finally:
+            await host.close()
+    asyncio.run(run())
+
+
 def test_partial_rtsp_start_failure_cleans_up_every_process(tmp_path, rtsp_sources):
     async def run():
         urls = dict(rtsp_sources.cameras)
@@ -231,6 +260,27 @@ def test_partial_rtsp_start_failure_cleans_up_every_process(tmp_path, rtsp_sourc
         try:
             with pytest.raises(RuntimeError):
                 await recorder.start()
+            assert all(s.process.returncode is not None for s in recorder.streams.values())
+        finally:
+            await recorder.stop()
+    asyncio.run(run())
+
+
+def test_timestamp_write_failure_stops_receivers_without_hanging(tmp_path, rtsp_sources, monkeypatch):
+    original_open = Path.open
+
+    def fail_timing_file(path, *args, **kwargs):
+        if path.name.endswith(".timestamps.csv"):
+            raise OSError("test: no disk space for frame timestamps")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_timing_file)
+
+    async def run():
+        recorder = RTSPRecorder(rtsp_sources.cameras, tmp_path, shutil.which("ffmpeg"), shutil.which("ffprobe"), 3)
+        try:
+            with pytest.raises(RuntimeError, match="cannot capture frame timestamps"):
+                await asyncio.wait_for(recorder.start(), 15)
             assert all(s.process.returncode is not None for s in recorder.streams.values())
         finally:
             await recorder.stop()

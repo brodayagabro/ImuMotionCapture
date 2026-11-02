@@ -131,3 +131,16 @@ def test_preview_endpoint_handles_warmup_unknown_camera_and_jpeg(tmp_path, monke
         assert response.status_code == 200 and response.content == b"jpeg"
         assert response.headers["content-type"] == "image/jpeg"
         assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize("settings", [
+    {"camera_offsets_ms": {"unknown": 1}},
+    {"camera_offsets_ms": {"cam1": float("nan")}},
+    {"max_skew_ms": 100, "max_age_ms": 50},
+])
+def test_invalid_reception_settings_fail_before_starting_capture(tmp_path, settings):
+    import asyncio
+    host = host_module.Host(host_args(tmp_path))
+    with pytest.raises(host_module.HTTPException, match="Invalid camera timing"):
+        asyncio.run(host.start(host_module.StartRequest(kind="sync", **settings)))
+    assert not host.takes and host.capture is None

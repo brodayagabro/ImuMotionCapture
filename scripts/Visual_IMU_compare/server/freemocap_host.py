@@ -6,6 +6,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
+from typing import Literal
 import uuid
 
 from fastapi import FastAPI, HTTPException
@@ -39,6 +41,10 @@ class StartRequest(BaseModel):
     output_directory: str = ""
     filename: str = "motion.bvh"
     calibration: str = ""
+    sync_method: Literal["receive", "flash"] = "receive"
+    camera_offsets_ms: dict[str, float] = Field(default_factory=dict)
+    max_skew_ms: float = Field(default=50, gt=0, le=5000, allow_inf_nan=False)
+    max_age_ms: float = Field(default=500, gt=0, le=5000, allow_inf_nan=False)
     brightness_threshold: float = Field(default=1000, gt=0, allow_inf_nan=False)
     squares_x: int = Field(default=5, ge=2, le=30)
     squares_y: int = Field(default=3, ge=2, le=30)
@@ -162,6 +168,9 @@ class Host:
                 raise HTTPException(409, "A recording or processing task is already active")
             if request.kind not in ("sync", "calibration", "motion"):
                 raise HTTPException(400, "Unknown recording kind")
+            if (request.max_skew_ms > request.max_age_ms or set(request.camera_offsets_ms) - set(self.cameras)
+                    or any(not math.isfinite(v) or abs(v) > 5000 for v in request.camera_offsets_ms.values())):
+                raise HTTPException(400, "Invalid camera timing offsets or max_skew_ms exceeds max_age_ms")
             if not re.fullmatch(r"[^/\\\x00]{1,120}\.bvh", request.filename, flags=re.IGNORECASE):
                 raise HTTPException(400, "Use a plain filename ending in .bvh")
             if request.kind == "motion":
@@ -194,7 +203,9 @@ class Host:
                 self.capture = RTSPRecorder(self.cameras, folder, self.ffmpeg, self.ffprobe, self.capture_timeout)
                 await self.capture.start()
                 self.capture_watch = asyncio.create_task(self.watch_capture(take))
-                self.update(take, state="recording", message="All nodes recording. Fire the common flash now.")
+                message = ("All cameras recording. No flash required; begin movement or calibration."
+                           if request.sync_method == "receive" else "All cameras recording. Fire the common flash now.")
+                self.update(take, state="recording", message=message)
             except BaseException as exc:
                 await self.stop_capture()
                 self.update(take, state="failed", error=str(exc) or type(exc).__name__, capture_failed=True)
@@ -261,6 +272,9 @@ class Host:
             if options["dictionary"] not in ("DICT_4X4_50", "DICT_4X4_250", "DICT_5X5_100", "DICT_6X6_250"):
                 raise ValueError("Unsupported ChArUco dictionary")
             spec = dict(folder=str(folder), kind=take["kind"], calibration=options["calibration"],
+                        sync_method=options.get("sync_method", "flash"),
+                        camera_offsets_ms=options.get("camera_offsets_ms", {}),
+                        max_skew_ms=options.get("max_skew_ms", 50), max_age_ms=options.get("max_age_ms", 500),
                         brightness_threshold=options["brightness_threshold"], blender=self.args.blender,
                         board=dict(squares_x=options["squares_x"], squares_y=options["squares_y"],
                                    square_length_mm=options["square_mm"], marker_length_ratio=options["marker_ratio"],
