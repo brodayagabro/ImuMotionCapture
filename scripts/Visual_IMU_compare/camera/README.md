@@ -26,13 +26,70 @@ H.264 через штатный PyAV recorder. Хост управляет за�
 `GET /recordings/{id}/manifest`, `GET /recordings/{id}/files/{path}`.
 
 Не запускайте этот процесс одновременно с `camera_streamer.py` на одной
-камере. Старый systemd-сервис `visual-mocap-camera-cam1.service` нужно
-остановить перед новым режимом. `install_service.py` пока устанавливает
-именно RTSP-streamer, а не SkellyCam. Перезапуск узла после отключения USB
+камере. Для ручного запуска сначала остановите старую службу. Установщик
+ниже сам заменяет и перезапускает её. Перезапуск узла после отключения USB
 снова разрешает постоянный путь в актуальный номер устройства.
 
-Окружение `.venv-skellycam` отдельно от прежнего `.venv`; установщик не
-запускает камеру и не меняет существующие службы.
+Окружение `.venv-skellycam` отдельно от прежнего `.venv`. Сам `setup.sh`
+готовит окружение; служба устанавливается отдельной командой ниже.
+
+### Автозапуск SkellyCam и замена прежней службы
+
+После `bash setup.sh --workflow recording` остановить вручную запущенный
+`skellycam_node.py` через Ctrl+C и из `camera/` выполнить:
+
+```bash
+.venv-skellycam/bin/python install_service.py --workflow recording --install \
+  --name cam1 --device /dev/video0 --resolution 1280x720 --fps 30 \
+  --host 0.0.0.0 --port 8082
+```
+
+На второй камере заменить `cam1` на `cam2`. Чтобы **перезаписать ту же службу**,
+`--name` должен совпадать с прежним: `cam1` заменяет
+`/etc/systemd/system/visual-mocap-camera-cam1.service`. Команда переписывает
+unit, выполняет `daemon-reload`, включает автозапуск и перезапускает службу:
+старый RTSP-процесс завершается, запускается `skellycam_node.py` из
+`.venv-skellycam`. Отдельную службу для нового режима создавать не нужно.
+
+При включении компьютера поднимается HTTP-узел на порту 8082, который
+**ожидает команд записи от хоста**. Сама запись сразу после загрузки не
+начинается. `--server` и `--preview` относятся к RTSP и здесь не принимаются.
+Допустимы все ключи `skellycam_node.py`, включая постоянный `--device`,
+`--records`, `--capture-fourcc`, `--exposure-mode`, `--exposure`.
+
+Установщик запускать обычным пользователем. Sudo используется только для
+установки системной службы; сам узел работает от этого пользователя с
+дополнительной группой `video`. После загрузки пароль не нужен.
+Проверка на компьютере камеры:
+
+```bash
+systemctl status visual-mocap-camera-cam1.service --no-pager
+systemctl is-enabled visual-mocap-camera-cam1.service
+curl --fail http://127.0.0.1:8082/health
+sudo journalctl -u visual-mocap-camera-cam1.service -b -n 100 --no-pager
+```
+
+`ready: false` в `/health` до подготовки камеры хостом — нормальное состояние.
+Для изменения параметров повторить установку с **тем же именем, полным набором
+ключей и `--workflow recording`**. Без `--install` создаётся только файл
+`runtime/systemd/visual-mocap-camera-cam1.service` для проверки; работающая
+служба при этом не меняется.
+
+Проверка файла без установки:
+
+```bash
+.venv-skellycam/bin/python install_service.py --workflow recording \
+  --name cam1 --device /dev/video0 --resolution 1280x720 --fps 30 --port 8082
+systemd-analyze verify runtime/systemd/visual-mocap-camera-cam1.service
+```
+
+Служба перезапускается при завершении процесса. При штатной остановке
+SIGTERM сначала получает основной Python-узел (`KillMode=mixed`): SkellyCam
+даётся до 60 секунд на закрытие записей и дочерних процессов. После этого
+systemd принудительно завершает оставшиеся процессы этой службы.
+Для возврата к RTSP использовать тот же установщик с `--workflow live`,
+тем же `--name` и параметрами `camera_streamer.py`; требуется прежняя `.venv`.
+**Без `--workflow` по умолчанию сохраняется прежний RTSP-режим.**
 
 ## Прежний режим: передача RTSP в реальном времени
 

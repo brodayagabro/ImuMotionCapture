@@ -69,11 +69,11 @@ bash setup.sh --workflow recording
 
 ## 3. Запуск узлов камеры
 
-Сначала остановить прежний `camera_streamer.py`, если он использует эту же
-камеру. Для ранее установленного сервиса: `sudo systemctl stop
-visual-mocap-camera-cam1.service` (на второй камере — `cam2`). Для постоянного
-перехода можно также отключить его автозапуск через `systemctl disable`.
-`install_service.py` пока относится к прежнему RTSP-режиму.
+Для ручного запуска сначала остановить прежний `camera_streamer.py`, если
+он использует эту же камеру. Для ранее установленного сервиса:
+`sudo systemctl stop visual-mocap-camera-cam1.service` (на второй камере —
+`cam2`). Для автозапуска используйте установщик ниже: он сам заменит и
+перезапустит существующую службу с тем же именем.
 
 На **192.168.1.98**, из `camera/`:
 
@@ -102,6 +102,43 @@ visual-mocap-camera-cam1.service` (на второй камере — `cam2`). �
 двум HTTP-узлам. Камера открывается после команды записи с веб-страницы.
 Локальные видео остаются в `camera/runtime/records/`; каталог можно изменить
 через `--records /путь/к/записям`. Для завершения узла — Ctrl+C.
+
+### Автозапуск после включения компьютера
+
+Выполнять из `camera/` **вместо ручного запуска**, после настройки окружения.
+Если узел сейчас запущен в терминале, сначала завершить его через Ctrl+C.
+
+На **192.168.1.98**:
+
+```bash
+.venv-skellycam/bin/python install_service.py --workflow recording --install \
+  --name cam1 --device /dev/video0 --resolution 1280x720 --fps 30 --port 8082
+```
+
+На **192.168.1.112**:
+
+```bash
+.venv-skellycam/bin/python install_service.py --workflow recording --install \
+  --name cam2 --device /dev/video0 --resolution 1280x720 --fps 30 --port 8082
+```
+
+**То же `--name` перезаписывает ту же службу**:
+`visual-mocap-camera-cam1.service` / `visual-mocap-camera-cam2.service`.
+Установщик заменяет RTSP-команду на `skellycam_node.py`, включает автозапуск
+и перезапускает службу. При загрузке поднимается HTTP-узел, ожидающий команд
+записи от хоста. Саму запись по-прежнему запускают из веб-интерфейса.
+Без `--workflow recording` установщик сохраняет прежний RTSP-режим.
+
+```bash
+systemctl status visual-mocap-camera-cam1.service --no-pager
+curl --fail http://127.0.0.1:8082/health
+sudo journalctl -u visual-mocap-camera-cam1.service -f
+```
+
+Для второй камеры в командах управления службой использовать `cam2`.
+Установщик запускать обычным пользователем: sudo будет использован только
+для изменения системной службы. Дополнительные параметры и проверка unit
+без установки — в [инструкции камеры](camera/README.md#автозапуск-skellycam-и-замена-прежней-службы).
 
 Если UFW включён, **на обеих камерах**:
 

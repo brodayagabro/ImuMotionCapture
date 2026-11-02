@@ -200,7 +200,7 @@ def create_app(args, recorder_factory=NativeRecorder):
 
 
 def parser():
-    result = argparse.ArgumentParser(description=__doc__)
+    result = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     result.add_argument("--name", type=identifier, required=True, help="Unique camera identity, e.g. cam1")
     result.add_argument("--device", default="/dev/video0", help="V4L2 index or persistent /dev/v4l/by-id path")
     result.add_argument("--resolution", default="1280x720")
@@ -214,11 +214,24 @@ def parser():
     return result
 
 
+def arguments(argv=None):
+    """Shared validation for manual launch and the systemd service installer."""
+    cli = parser()
+    args = cli.parse_args(argv)
+    if not re.fullmatch(r"[1-9]\d{1,4}x[1-9]\d{1,4}", args.resolution):
+        cli.error("Use --resolution WIDTHxHEIGHT, e.g. 1280x720")
+    if any(int(value) % 2 for value in args.resolution.split("x")):
+        cli.error("H.264 recording requires an even width and height")
+    if not 0 < args.fps <= 240:
+        cli.error("--fps must be greater than 0 and at most 240")
+    if not 1 <= args.port <= 65535:
+        cli.error("--port must be between 1 and 65535")
+    return args
+
+
 if __name__ == "__main__":
+    args = arguments()
     import uvicorn
-    args = parser().parse_args()
-    if not re.fullmatch(r"[1-9]\d{1,4}x[1-9]\d{1,4}", args.resolution) or not 0 < args.fps <= 240:
-        raise SystemExit("Invalid resolution or FPS")
     os.environ.setdefault("SKELLYCAM_BASE_FOLDER", str(HERE / "runtime" / "skellycam"))
     mp.set_start_method("spawn", force=True)
     uvicorn.run(create_app(args), host=args.host, port=args.port)
