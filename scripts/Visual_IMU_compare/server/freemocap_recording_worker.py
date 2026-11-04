@@ -190,10 +190,7 @@ def processing_timeline(folder: Path):
         writer = csv.writer(stream)
         writer.writerow(["frame_index", "normalized_time_seconds", "from_previous.frame_duration.ms", "from_previous.framerate.hz"])
         writer.writerows((i, i/fps, 1000/fps, fps) for i in range(count))
-    sync_path = folder / "sync_result.json"
-    method = json.loads(sync_path.read_text()).get("method") if sync_path.exists() else None
-    source = "Server reception frame selection" if method == "server_receive" else "SkellySync output"
-    save(target / "provenance.json", dict(source=source + " constant-frame-rate timeline",
+    save(target / "provenance.json", dict(source="SkellySync output constant-frame-rate timeline",
          hardware_capture_timestamps=False, fps=fps, frame_count=count,
          original_media="../../rtsp_capture", capture_report="../../capture_report.json"))
 
@@ -201,11 +198,7 @@ def processing_timeline(folder: Path):
 def run(spec: dict, report):
     folder = Path(spec["folder"]).resolve()
     if not (folder / "sync_result.json").is_file():
-        if spec.get("sync_method", "flash") == "receive":
-            from receive_sync import synchronize_received
-            synchronize_received(folder, spec, report)
-        else:
-            synchronize(folder, spec.get("brightness_threshold", 1000.0), report)
+        synchronize(folder, spec.get("brightness_threshold", 1000.0), report)
     if spec["kind"] == "sync":
         return dict(sync=str(folder / "sync_result.json"))
     processing_timeline(folder)

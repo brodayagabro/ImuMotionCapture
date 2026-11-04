@@ -267,31 +267,21 @@ def reconstruct(observations, calibration, triangulate, confidence=0.4, max_erro
     return dict(points=xyz, confidence=scores, reprojection_px=errors)
 
 
-def select_frames(histories, now, max_age, max_skew, require_all=False):
+def select_frames(histories, now, max_age, max_skew):
     """Newest group with at least two views within a bounded time window.
 
     A stalled camera never blocks the others. No unbounded work queue exists.
     """
-    required = len(histories)
     fresh = {name: [f for f in frames if 0 <= now - f.received <= max_age]
              for name, frames in histories.items()}
     fresh = {name: frames for name, frames in fresh.items() if frames}
     best, best_key = {}, (0, -math.inf, 0)
-    # Offline output needs a complete group on each clock tick. One camera's
-    # new frame may arrive just before that tick, the other just after it;
-    # retain the newest complete group from the history in that case.
-    anchors = ({f.aligned for frames in fresh.values() for f in frames} if require_all
-               else {frames[-1].aligned for frames in fresh.values()})
-    for anchor in sorted(anchors, reverse=True):
+    for anchor in sorted({frames[-1].aligned for frames in fresh.values()}, reverse=True):
         group = {}
         for name, frames in fresh.items():
             candidates = [f for f in frames if anchor - max_skew <= f.aligned <= anchor + 1e-9]
             if candidates:
                 group[name] = max(candidates, key=lambda f: f.aligned)
-        if require_all and len(group) != required:
-            continue
-        if require_all:
-            return group  # Anchors are descending: this is the newest complete group.
         # Prefer a current stereo pair over an older three-camera group.
         key = min(len(group), 2), anchor, len(group)
         if key > best_key:

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 from fractions import Fraction
 from functools import lru_cache
 import json
@@ -72,11 +71,6 @@ async def probe(source, ffprobe="ffprobe", timeout=10, *, recorded=False):
         if not fps > 0 or not video.get("width") or not video.get("height"):
             raise ValueError("No usable video size / FPS in RTSP stream")
         result = dict(resolution=f"{video['width']}x{video['height']}", fps=fps, codec="h264")
-        try:
-            nominal = float(Fraction(video.get("r_frame_rate", "0/1")))
-        except (ValueError, ZeroDivisionError):
-            nominal = 0
-        result["nominal_fps"] = nominal if 0 < nominal <= 240 else fps
         if recorded:
             result.update(packets=int(video.get("nb_read_packets", 0)),
                           duration=float(data.get("format", {}).get("duration", 0)))
@@ -95,8 +89,6 @@ class StreamRecording:
         self.ffmpeg, self.timeout = ffmpeg, timeout
         self.process = None
         self.reader = None
-        self.timing_reader = None
-        self.timing_ready = asyncio.Event()
         self.ready = asyncio.Event()
         self.media_time = 0.0
         self.last_frame = time.monotonic()
@@ -104,51 +96,21 @@ class StreamRecording:
         self.error = None
 
     async def start(self):
-        # Keep the original H.264. A second output decodes the SAME input and
-        # logs each frame, so the host can timestamp it without a second RTSP connection.
-        input_args = await input_options(self.ffmpeg, self.timeout)
-        passthrough = ["-vsync", "0"] if "-stimeout" in input_args else ["-fps_mode", "passthrough"]
-        command = [self.ffmpeg, "-hide_banner", "-loglevel", "info", "-nostats",
+        # No -r, wall-clock timestamp replacement, or video encoding. Starting
+        # at different keyframes is expected; native flash alignment follows.
+        command = [self.ffmpeg, "-hide_banner", "-loglevel", "warning", "-nostats",
                    "-stats_period", "0.2", "-progress", "pipe:1",
-                   "-threads", "1", *input_args,
+                   *await input_options(self.ffmpeg, self.timeout),
                    "-i", self.url, "-map", "0:v:0", "-an", "-c:v", "copy",
                    "-avoid_negative_ts", "make_zero", "-movflags",
-                   "+frag_keyframe+empty_moov+default_base_moof", "-n", str(self.path),
-                   "-map", "0:v:0", "-an", "-vf", "showinfo=checksum=0", "-threads:v", "1", *passthrough,
-                   "-f", "null", "/dev/null"]
-        self.process = await asyncio.create_subprocess_exec(
-            *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
+                   "+frag_keyframe+empty_moov+default_base_moof", "-n", str(self.path)]
+        with self.path.with_suffix(".log").open("wb") as log:
+            self.process = await asyncio.create_subprocess_exec(
+                *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log)
         self.reader = asyncio.create_task(self.read_progress())
-        self.timing_reader = asyncio.create_task(self.read_timing())
-        await asyncio.wait_for(asyncio.gather(self.ready.wait(), self.timing_ready.wait()), self.timeout + 5)
+        await asyncio.wait_for(self.ready.wait(), self.timeout + 5)
         if self.error or self.media_time <= 0:
             raise RuntimeError(self.error or f"{self.name}: no video received")
-
-    async def read_timing(self):
-        pattern = re.compile(rb"\[Parsed_showinfo_[^\]]+\].*\bn:\s*(\d+).*\bpts_time:([^\s]+)")
-        try:
-            with self.path.with_suffix(".log").open("wb") as log, self.path.with_suffix(".timestamps.csv").open("w") as stream:
-                writer = csv.writer(stream)
-                writer.writerow(["frame_index", "receive_monotonic_s", "source_pts_s"])
-                while line := await self.process.stderr.readline():
-                    received = time.monotonic()
-                    match = pattern.search(line)
-                    if match:
-                        writer.writerow([int(match[1]), f"{received:.9f}", match[2].decode()])
-                        stream.flush()  # Preserve timing alongside fragmented MP4 on interruption.
-                        self.timing_ready.set()
-                    elif b"Parsed_showinfo_" not in line:
-                        log.write(line)
-        except Exception as exc:
-            self.error = f"{self.name}: cannot capture frame timestamps: {exc}"
-            self.timing_ready.set()
-            # Drain the pipe while the supervisor stops FFmpeg; otherwise a
-            # full stderr pipe can prevent MP4 finalization after a disk error.
-            while await self.process.stderr.read(65536):
-                pass
-        finally:
-            self.timing_ready.set()
 
     async def read_progress(self):
         while line := await self.process.stdout.readline():
@@ -193,8 +155,6 @@ class StreamRecording:
                 await terminate(self.process)
         if self.reader:
             await self.reader
-        if self.timing_reader:
-            await self.timing_reader
         if self.process.returncode != 0 and not self.error:
             self.error = f"{self.name}: FFmpeg exited {self.process.returncode}; recording incomplete"
 
@@ -214,10 +174,6 @@ class RTSPRecorder:
         if errors:
             await self.stop()
             raise RuntimeError("; ".join(errors))
-        (self.folder / "capture_timing.json").write_text(json.dumps(dict(
-            time_basis="server_monotonic_after_decode_log_received",
-            recording_start_monotonic_s=time.monotonic(),
-            hardware_capture_timestamps=False)))
 
     def failure(self):
         return next((error for s in self.streams.values() if (error := s.failure())), None)
@@ -244,12 +200,8 @@ async def finalize_recordings(folder: Path, camera_names, take_id, ffprobe="ffpr
             partial = target.with_suffix(".partial")
             await asyncio.to_thread(shutil.copyfile, source, partial)
             partial.replace(target)
-    camera_info = dict(zip(camera_names, results))
-    for name, info in camera_info.items():
-        info.update(video_name=f"{take_id}.id-{name}.idx-0",
-                    timing_file=f"rtsp_capture/{name}.timestamps.csv")
     report = dict(transport="rtsp", encoding="copy", hardware_capture_timestamps=False,
                   timestamps="RTSP media PTS; not camera exposure or synchronized host clocks",
-                  cameras=camera_info)
+                  cameras=dict(zip(camera_names, results)))
     (folder / "capture_report.json").write_text(json.dumps(report, indent=2))
     return report
