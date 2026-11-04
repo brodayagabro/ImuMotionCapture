@@ -1,3 +1,0 @@
-# Native offline workflow; all Skelly packages are pinned by this commit's uv.lock.
-freemocap https://github.com/freemocap/freemocap.git 700c8614d11d886dacfea8e52333d3c0b942ef52
-skellycam https://github.com/freemocap/skellycam.git 06771043becd50db1570ed2a67dd0536edbf47f1

@@ -181,8 +181,8 @@ def test_bvh_transport_roundtrip(args, transport):
     assert not sender.thread.is_alive()
 
 
-def test_calibration_solver_recovers_known_stereo_geometry(args,tmp_path):
-    session = s.CharucoObservations(args)
+def test_calibration_solver_recovers_known_stereo_geometry(args):
+    session = s.CalibrationSession(args)
     objects = session.board.getChessboardCorners().astype(float)
     k = np.array([[900.,0,640],[0,900,360],[0,0,1]])
     r, _ = s.cv2.Rodrigues(np.array([.02,.17,-.01]))
@@ -192,7 +192,7 @@ def test_calibration_solver_recovers_known_stereo_geometry(args,tmp_path):
         rotation, _ = s.cv2.Rodrigues(np.array([.3*np.sin(i),.35*np.cos(i*.8),.1*np.sin(i*.5)]))
         positions = (rotation @ objects.T).T + [-.2+.1*np.sin(i*.6),-.1+.08*np.cos(i),1.5+.2*np.sin(i*.3)]
         session.samples.append({name:dict(ids=np.arange(len(objects)), corners=s.project(positions,c).astype(np.float32),size=(1280,720)) for name,c in cameras.items()})
-    result = s.run_freemocap_calibration(args,session.payload(["a","b"]),tmp_path,threading.Event())
+    result = session.solve(["a","b"])
     np.testing.assert_allclose(result["cameras"]["b"]["t"], cameras["b"]["t"], atol=.002)
     np.testing.assert_allclose(result["cameras"]["b"]["R"], r, atol=.002)
     assert max(result["rms_px"].values()) < .01
@@ -242,7 +242,7 @@ def test_rejects_nonmonotonic_bvh_timestamps(args):
 
 
 def test_charuco_board_is_detectable(args):
-    session = s.CharucoObservations(args)
+    session = s.CalibrationSession(args)
     cols, rows = session.board.getChessboardSize()
     image = session.board.generateImage((cols*160+80, rows*160+80), marginSize=40)
     _, ids, _, _ = session.detector.detectBoard(image)

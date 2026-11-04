@@ -1,63 +1,5 @@
 # Компьютер с камерой
 
-## Основной режим для одноплатников: RTSP на сервер FreeMoCap
-
-Используйте прежний `camera_streamer.py`: он передаёт H.264 на сервер,
-где `freemocap_host.py` записывает видео и выполняет прежнюю постобработку.
-Полная инструкция — в [README эксперимента](../README.md).
-
-```bash
-bash setup.sh --system-deps
-.venv/bin/python camera_streamer.py \
-  --server 192.168.1.90 --port 8554 --name cam2 \
-  --device /dev/video1 --resolution 640x480 --fps 30
-```
-
-Выберите реальное устройство через `v4l2-ctl --list-devices` и поддерживаемый
-режим через `--list-formats`. На первой камере имя `cam1`, на второй `cam2`.
-Окружение — `.venv`. При установленном системном FFmpeg загрузка Python-пакетов
-не требуется. Камерный режим `--workflow recording` удалён; ниже есть
-инструкция по очистке прежнего `.venv-skellycam`.
-
-Чтобы заменить существующий сервис SkellyCam тем же RTSP-сервисом:
-
-```bash
-.venv/bin/python install_service.py --workflow live --install \
-  --server 192.168.1.90 --port 8554 --name cam2 \
-  --device /dev/video1 --resolution 640x480 --fps 30
-```
-
-Имя должно совпадать с прежней службой. Перед ручным запуском остановите
-службу `sudo systemctl stop visual-mocap-camera-cam2.service`. Перед установкой
-службы завершите ручной процесс через Ctrl+C. Сервер должен запустить relay
-на 8554 и веб-хост записи на 8080. Камерный порт 8082 в RTSP-режиме не нужен.
-
-На странице сервера 8080 превью работает без дополнительных ключей камеры.
-`--preview` включает отдельную страницу камеры на 8081; для уменьшения нагрузки
-используйте её только при настройке. Возможности камер, preview и обслуживание
-RTSP-сервиса подробно описаны ниже в разделе передачи RTSP.
-
-## Удаление прежнего SkellyCam
-
-На камере используется только `camera_streamer.py` и окружение `.venv`.
-Сначала выполните обычный `setup.sh` и замените прежнюю службу командой выше
-с тем же `--name`. Затем из `camera/`:
-
-```bash
-python3 cleanup_skellycam.py          # показать список без удаления
-python3 cleanup_skellycam.py --apply  # удалить старые зависимости
-```
-
-Удаляются только `.venv-skellycam`, `.tools/recording-bootstrap` и чистый
-checkout `repositories/skellycam` в каталоге камеры. Скрипт откажется удалять
-их при обнаружении старой службы/процесса, незавершённой установки, симлинка
-или локальных правок checkout. Сначала проверяется работоспособность `.venv`.
-Записи, рабочее `.venv`, общий Python в `.tools/python`, кэши и зависимости
-сервера сохраняются. Скрипт не использует sudo и не удаляет системные пакеты.
-На сервере SkellyCam остаётся зависимостью штатного FreeMoCap.
-
-## Подробно: передача RTSP в реальном времени
-
 [camera_streamer.py](camera_streamer.py) читает V4L2-камеру через FFmpeg
 и публикует H.264 по RTSP/TCP на сервер. Необязательный `--preview`
 включает страницу с живым изображением для настройки ракурса камеры.
@@ -88,7 +30,7 @@ FFmpeg. Проверяются поддержка V4L2 и кодировщик l
 
 ```bash
 ./setup.sh --with-tests
-.venv/bin/python -m pytest test_camera_streamer.py test_install_service.py -q
+.venv/bin/python -m pytest test_camera_streamer.py -q
 ```
 
 ## Запуск
@@ -139,121 +81,6 @@ python camera_streamer.py \
 Остановка — Ctrl+C/SIGTERM; камера освобождается. Недоступный получатель
 и зависание процесса вызывают повторное подключение. Чужие процессы,
 которые используют камеру, программа не останавливает.
-
-## Автозапуск при включении компьютера
-
-[install_service.py](install_service.py) создаёт системный сервис systemd
-для Ubuntu/Debian. После установки трансляция запускается при загрузке ОС,
-без входа пользователя и без открытого терминала. Используется существующий
-`camera_streamer.py` и окружение `camera/.venv` из этого клона репозитория.
-
-Сначала выполнить `./setup.sh` (или `./setup.sh --system-deps` на новом
-компьютере) и проверить обычную команду трансляции. Затем остановить её
-через Ctrl+C, чтобы камера была свободна, и из `camera/` выполнить:
-
-```bash
-.venv/bin/python install_service.py --install \
-  --server 192.168.1.90 --port 8554 --name cam1 \
-  --device /dev/video0 --resolution 1280x720 --fps 30 \
-  --preview
-```
-
-Команда устанавливает `visual-mocap-camera-cam1.service`, включает автозапуск
-и сразу запускает сервис. `--preview` необязателен; с ним доступна страница
-`http://IP_КАМЕРЫ:8081/`. Параметры видео и адрес сервера задаются теми же
-ключами, что при ручном запуске. На остальных камерах поменять `--name`
-на `cam2`, `cam3`; на одном компьютере также выбрать разные устройства
-и, при включённом превью, разные `--preview-port`.
-
-**Запускать установщик от обычного пользователя, без `sudo` перед Python.**
-Он сам использует sudo для копирования unit-файла в `/etc/systemd/system/`
-и команд systemctl. Пароль администратора может потребоваться при установке
-или изменении сервиса; при загрузке компьютера он не запрашивается.
-Захват работает от пользователя, который запустил установщик, с дополнительной
-группой `video` для доступа к V4L2. При необходимости указать `--user ИМЯ`;
-этому пользователю должны быть доступны репозиторий и его `.venv`.
-
-Для USB-камеры лучше заменить `/dev/video0` постоянным именем: номера
-`/dev/videoN` могут меняться после перезагрузки. Посмотреть ссылки:
-
-```bash
-ls -l /dev/v4l/by-id/
-# Если by-id отсутствует или камеры имеют одинаковые идентификаторы:
-ls -l /dev/v4l/by-path/
-```
-
-Выбрать узел видеозахвата и проверить его через
-`camera_streamer.py --device /dev/v4l/by-id/ИМЯ --list-formats`, затем передать
-тот же путь установщику. `by-path` привязан к USB-порту подключения.
-
-Без `--install` скрипт **только создаёт**
-`runtime/systemd/visual-mocap-camera-cam1.service`, не меняя systemd.
-Так можно предварительно посмотреть конфигурацию и проверить её:
-
-```bash
-.venv/bin/python install_service.py \
-  --server 192.168.1.90 --name cam1 --device /dev/video0 \
-  --resolution 1280x720 --fps 30 --preview
-cat runtime/systemd/visual-mocap-camera-cam1.service
-systemd-analyze verify runtime/systemd/visual-mocap-camera-cam1.service
-```
-
-`runtime/` исключён из Git: настройки конкретного компьютера не попадают
-в репозиторий. Установленный unit использует абсолютный путь **текущего клона**,
-поэтому после переноса репозитория нужно повторить установку из нового места.
-Репозиторий должен быть доступен при загрузке; домашний каталог, который
-расшифровывается только при входе пользователя, для такого запуска не подходит.
-
-### Управление сервисом
-
-Для `cam1`:
-
-```bash
-systemctl status visual-mocap-camera-cam1.service --no-pager
-systemctl is-enabled visual-mocap-camera-cam1.service
-sudo journalctl -u visual-mocap-camera-cam1.service -b -n 100 --no-pager
-sudo journalctl -u visual-mocap-camera-cam1.service -f
-
-# Перезапустить, например после git pull:
-sudo systemctl restart visual-mocap-camera-cam1.service
-# Остановить сейчас (автозапуск при следующей загрузке остаётся):
-sudo systemctl stop visual-mocap-camera-cam1.service
-# Остановить и отключить автозапуск:
-sudo systemctl disable --now visual-mocap-camera-cam1.service
-# Снова включить автозапуск и запустить:
-sudo systemctl enable --now visual-mocap-camera-cam1.service
-```
-
-Чтобы изменить адрес, FPS, разрешение или превью, повторить команду установщика
-с `--install`, **тем же `--name` и полным набором нужных параметров**. Сервис
-будет обновлён и перезапущен. Другое имя создаёт отдельный сервис; старый
-в таком случае отключить, иначе оба могут пытаться открыть одну камеру.
-
-Удаление сервиса:
-
-```bash
-sudo systemctl disable --now visual-mocap-camera-cam1.service
-sudo rm /etc/systemd/system/visual-mocap-camera-cam1.service
-sudo systemctl daemon-reload
-```
-
-Сервис упорядочен после `network-online.target`, но это не гарантирует
-доступность GPU-сервера. Если сеть или RTSP-ретранслятор появились позже,
-отправитель повторяет подключения. Если USB-камера ещё не обнаружена или
-Python завершился, systemd повторяет запуск через 5 секунд, без ограничения
-числа попыток. Остановка через `systemctl stop` прерывает и Python, и FFmpeg.
-Ключи одноразовых проверок `--list-devices`, `--list-formats`, `--duration`
-в установщике отклоняются.
-
-Если статус показывает `active`, а видео нет, смотреть журнал: запущенный
-процесс может ожидать камеру или повторять подключение. На GPU-сервере
-должен отдельно работать `rtsp_relay.py`, а TCP-порт 8554 быть доступен из LAN.
-При `Permission denied` проверить владельца/группу устройства; сервис
-получает группу `video`, но не меняет права устройств. Для ручной диагностики
-сначала остановить сервис, чтобы освободить камеру.
-
-Описание параметров: [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html),
-[systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
 
 ## Доступные разрешения и FPS
 
