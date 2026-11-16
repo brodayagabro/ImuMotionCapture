@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PYTHON=/usr/bin/python3
-SYSTEM=0 TESTS=0 CLEAN=0
+SYSTEM=0 TESTS=0 CLEAN=0 SERVICE=0 SERVICE_DRY_RUN=0
+CAMERA_ARGS=()
+SUDO=(); if ((EUID)); then SUDO=(sudo); fi
 fail() { echo "ERROR: $*" >&2; exit 1; }
 while (($#)); do
     case "$1" in
@@ -10,15 +12,117 @@ while (($#)); do
         --system-deps) SYSTEM=1; shift ;;
         --with-tests) TESTS=1; shift ;;
         --clean-legacy) CLEAN=1; shift ;;
-        -h|--help) echo "Usage: ./setup.sh [--python /path/to/python3] [--system-deps] [--with-tests] [--clean-legacy]"; exit 0 ;;
+        --install-service) SERVICE=1; shift ;;
+        --service-dry-run) SERVICE=1; SERVICE_DRY_RUN=1; shift ;;
+        --) shift; CAMERA_ARGS=("$@"); break ;;
+        -h|--help) cat <<'HELP'
+Usage: ./setup.sh [--python /path/to/python3] [--system-deps] [--with-tests]
+                  [--clean-legacy] [--install-service | --service-dry-run]
+                  -- --name cam2 --device /dev/video0 --audio default [camera options]
+
+--install-service  Stop/update the same camera service, enable boot startup and
+                   start it. Run as your camera user; sudo is used for systemd.
+--service-dry-run  Validate parameters and write runtime/systemd/NAME.service only.
+Arguments after -- are camera_streamer.py options; --name and --device are required
+for service setup. Repeat the same command to change parameters or update code.
+Without --install-service, existing services are not changed.
+HELP
+            exit 0 ;;
         *) fail "Unknown argument: $1 (see README for migration from RTSP/SkellyCam)" ;;
     esac
 done
+((SERVICE || ${#CAMERA_ARGS[@]} == 0)) || fail "Camera arguments require --install-service (or --service-dry-run)"
 mkdir -p "$DIR/.tools"
 exec 9>"$DIR/.tools/setup.lock"
 flock -n 9 || fail "Another setup is running"
+# Render/validate before any privileged operation, including stopping the old unit.
+if ((SERVICE)); then
+    ((EUID)) || fail "Run ./setup.sh as the camera user, without sudo; it elevates only system operations"
+    command -v "$PYTHON" >/dev/null || fail "Python not found: $PYTHON"
+    UNIT=$("$PYTHON" - "$DIR" "${CAMERA_ARGS[@]}" <<'PY_SERVICE'
+from pathlib import Path
+import grp, os, pwd, shutil, sys
+root=Path(sys.argv[1])
+sys.path.insert(0,str(root))
+import camera_streamer
+values=sys.argv[2:]
+if any(v in ('-h','--help') for v in values):
+    raise SystemExit('Service setup needs camera options; use camera_streamer.py --help separately')
+args=camera_streamer.arguments(values)
+if not any(v=='--name' or v.startswith('--name=') for v in values) or not args.device:
+    raise SystemExit('Use --install-service -- --name cam2 --device /dev/video0 --audio default')
+if args.list_devices or args.list_formats or args.list_audio or args.test_video:
+    raise SystemExit('Listing devices and test-video cannot be used in a camera boot service')
+account=pwd.getpwuid(os.getuid())
+for group in ('video','audio'):
+    try:grp.getgrnam(group)
+    except KeyError:raise SystemExit(f'System group {group!r} is missing')
+def quote(value):
+    value=str(value)
+    if any(ord(c)<32 or ord(c)==127 for c in value):
+        raise SystemExit('Service parameters cannot contain control characters')
+    return '"'+value.replace('\\','\\\\').replace('"','\\"').replace('%','%%')+'"'
+def absolute(path):return str(Path(path).expanduser().absolute())
+def explicit(option):return any(v==option or v.startswith(option+'=') for v in values)
+# Use the new venv tools, rather than binaries inside a legacy environment.
+command=['/usr/bin/env',str(root/'.venv/bin/python'),'-u',str(root/'camera_streamer.py'),
+         '--name',args.name,'--device','/dev/video'+args.device if args.device.isdecimal() else absolute(args.device),
+         '--audio',args.audio,'--host',args.host,'--port',str(args.port),
+         '--resolution','max' if args.resolution=='max' else 'x'.join(map(str,args.resolution)),
+         '--input-format',args.input_format,'--records',absolute(args.records),
+         '--preview-width',str(args.preview_width),'--preview-fps',str(args.preview_fps),
+         '--min-free-mb',str(args.min_free_mb)]
+for option in ('ffmpeg','ffprobe','v4l2-ctl'):
+    value=getattr(args,option.replace('-','_'))
+    if option in ('ffmpeg','ffprobe') and not explicit('--'+option):value=str(root/'.venv/bin'/option)
+    else:value=shutil.which(value) or (absolute(value) if '/' in value else value)
+    command+=['--'+option,value]
+if args.fps is not None:command+=['--fps',str(args.fps)]
+if args.token_file:command+=['--token-file',absolute(args.token_file)]
+# ':' disables dollar expansion; quote() escapes systemd percent specifiers.
+exec_start=':'+' '.join(quote(arg) for arg in command)
+# WorkingDirectory is a raw string, not an argv item; guard control characters.
+quote(root)
+working_directory=str(root).replace('%','%%')+'/'
+name=f'visual-mocap-camera-{args.name}.service'
+unit=f"""# Generated by camera/setup.sh --install-service. Repeat setup to update.
+[Unit]
+Description=Local MoCap recorder {args.name}
+Wants=network-online.target
+After=network-online.target sound.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User={account.pw_uid}
+Group={account.pw_gid}
+SupplementaryGroups=video audio
+WorkingDirectory={working_directory}
+ExecStart={exec_start}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillSignal=SIGTERM
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"""
+folder=root/'runtime'/'systemd';folder.mkdir(parents=True,exist_ok=True)
+temporary=folder/(name+'.tmp');temporary.write_text(unit);temporary.replace(folder/name)
+print(name)
+PY_SERVICE
+    )
+    UNIT_FILE="$DIR/runtime/systemd/$UNIT"
+    if ((SERVICE_DRY_RUN)); then
+        cat -- "$UNIT_FILE"
+        printf '\nGenerated: %s (nothing installed or stopped)\n' "$UNIT_FILE"
+        exit 0
+    fi
+fi
 if ((SYSTEM)); then
-    SUDO=(); if ((EUID)); then SUDO=(sudo); fi
     "${SUDO[@]}" apt-get update
     "${SUDO[@]}" apt-get install -y --no-install-recommends python3-venv ffmpeg v4l-utils alsa-utils
 fi
@@ -31,6 +135,23 @@ features=$(ffmpeg -hide_banner -h full 2>/dev/null)
 [[ $features == *-isync* ]] || fail "Camera needs FFmpeg with -isync (5.1+). Install a newer FFmpeg; system Ubuntu 22.04 FFmpeg 4.4 is too old."
 devices=$(ffmpeg -hide_banner -devices 2>&1)
 [[ $devices == *video4linux2* && $devices == *alsa* ]] || fail "FFmpeg needs V4L2 and ALSA inputs"
+if ((SERVICE)); then
+    command -v systemctl >/dev/null || fail "systemctl is required for --install-service"
+    systemctl --system show --property=Version --value >/dev/null || fail "System systemd is not available"
+    load_state=$(systemctl --system show "$UNIT" --property=LoadState --value)
+    [[ $load_state != masked ]] || fail "$UNIT is masked; unmask it before installing"
+    drop_ins=$(systemctl --system show "$UNIT" --property=DropInPaths --value)
+    [[ -z $drop_ins ]] || fail "$UNIT has overrides: $drop_ins. Review systemctl cat $UNIT and remove obsolete overrides before setup."
+    # Keep the existing unit available if a later setup step fails.
+    if [[ -f "/etc/systemd/system/$UNIT" ]]; then
+        (umask 077; "${SUDO[@]}" cat -- "/etc/systemd/system/$UNIT" > "$UNIT_FILE.previous")
+    fi
+    if [[ $load_state != not-found ]]; then
+        echo "Stopping $UNIT (an active recording will be finalized)..."
+        "${SUDO[@]}" systemctl stop "$UNIT"
+    fi
+    trap 'code=$?; if ((code)); then echo "Setup failed. Inspect systemctl status $UNIT and repeat setup after fixing the error; the service is not automatically restored." >&2; fi' EXIT
+fi
 ENV="$DIR/.venv"
 [[ ! -L "$ENV" ]] || fail "Refusing a symlink environment"
 # Never remove an active interpreter, recordings, or external environments.
@@ -110,3 +231,41 @@ PY_CLEAN
 fi
 printf 'Ready: source "%s/bin/activate"
 ' "$ENV"
+
+if ((SERVICE)); then
+    # systemd-analyze parses without starting a service; available with normal systemd.
+    if command -v systemd-analyze >/dev/null; then
+        systemd-analyze verify "$UNIT_FILE"
+    fi
+    "${SUDO[@]}" install -m 0644 -- "$UNIT_FILE" "/etc/systemd/system/$UNIT"
+    "${SUDO[@]}" systemctl daemon-reload
+    "${SUDO[@]}" systemctl enable "$UNIT"
+    "${SUDO[@]}" systemctl restart "$UNIT"
+    # Type=exec confirms exec(), not application startup. Check the camera API too.
+    if ! "$ENV/bin/python" - "$DIR" "${CAMERA_ARGS[@]}" <<'PY_READY'
+import json,sys,time
+from urllib.request import Request,build_opener,ProxyHandler
+sys.path.insert(0,sys.argv[1])
+import camera_streamer
+args=camera_streamer.arguments(sys.argv[2:])
+host={'0.0.0.0':'127.0.0.1','::':'::1'}.get(args.host,args.host)
+if ':' in host:host='['+host+']'
+url=f'http://{host}:{args.port}/api/status'
+headers={'Authorization':'Bearer '+args.token} if args.token else {}
+opener=build_opener(ProxyHandler({}));deadline=time.monotonic()+25;error='No response'
+while time.monotonic()<deadline:
+    try:
+        with opener.open(Request(url,headers=headers),timeout=2) as response:status=json.load(response)
+        if status.get('camera')!=args.name:raise ValueError('Another camera name responded on this port')
+        print('Camera API ready:',url);break
+    except Exception as exc:error=str(exc);time.sleep(.5)
+else:raise SystemExit('Camera API did not become ready: '+error)
+PY_READY
+    then
+        systemctl --no-pager --full status "$UNIT" || true
+        fail "Camera startup failed. Inspect: journalctl -u $UNIT -n 60 --no-pager"
+    fi
+    systemctl is-active --quiet "$UNIT" || fail "Service exited; inspect journalctl -u $UNIT"
+    echo "Service installed/updated and enabled at boot: $UNIT"
+    echo "Logs: journalctl -u $UNIT -f"
+fi

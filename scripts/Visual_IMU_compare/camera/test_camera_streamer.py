@@ -231,3 +231,217 @@ def test_recovery_finalizes_interrupted_file(tmp_path):
         wait_for(lambda: node.takes[identifier]["state"] != "stopping")
         assert node.takes[identifier]["state"] == "ready"
         assert (folder / "video.mkv").exists()
+
+
+def setup_copy(tmp_path, name="camera"):
+    directory = tmp_path / name
+    directory.mkdir()
+    for filename in (
+        "setup.sh",
+        "camera_streamer.py",
+        "requirements.txt",
+        "requirements-dev.txt",
+    ):
+        shutil.copy2(HERE / filename, directory / filename)
+    return directory
+
+
+def test_service_dry_run_quotes_paths_and_passes_systemd_parser(tmp_path):
+    directory = setup_copy(tmp_path, 'camera $cash %quoted "path"')
+    result = subprocess.run(
+        [
+            str(directory / "setup.sh"),
+            "--service-dry-run",
+            "--",
+            "--name",
+            "cam2",
+            "--device",
+            "/dev/v4l/by-id/USB camera-video-index0",
+            "--audio",
+            "plughw:CARD=USB,DEV=0",
+            "--records",
+            str(tmp_path / "records $cash %n"),
+            "--fps",
+            "30000/1001",
+            "--resolution",
+            "1280x720",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    unit = directory / "runtime/systemd/visual-mocap-camera-cam2.service"
+    content = unit.read_text()
+    assert "ExecStart=:" in content
+    assert "%quoted" in str(directory) and "%%quoted" in content
+    assert "$cash" in content and '\\"path\\"' in content
+    assert "SupplementaryGroups=video audio" in content
+    assert "KillMode=mixed" in content and "TimeoutStopSec=90" in content
+    assert '"--fps" "30000/1001"' in content
+    assert not (directory / ".venv").exists()
+    assert "nothing installed or stopped" in result.stdout
+    if shutil.which("systemd-analyze"):
+        subprocess.run(
+            ["systemd-analyze", "verify", str(unit)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--device", "/dev/video0"],
+        ["--name", "cam2"],
+        ["--name", "cam2", "--device", "/dev/video0", "--fps", "0"],
+        ["--name", "cam2", "--device", "/dev/video0", "--test-video", "fixture.mkv"],
+        ["--name", "cam2", "--device", "/dev/video0", "--list-devices"],
+        ["--name", "cam2", "--device", "/dev/video0", "--audio", "bad\n[Service]"],
+    ],
+)
+def test_service_rejects_bad_options_before_installing(tmp_path, options):
+    directory = setup_copy(tmp_path)
+    result = subprocess.run(
+        [str(directory / "setup.sh"), "--install-service", "--", *options],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert not (directory / ".venv").exists()
+    assert not list(directory.glob("runtime/systemd/*.service"))
+
+
+def test_service_install_updates_same_unit_with_mocked_admin_commands(
+    tmp_path, monkeypatch
+):
+    """Execute the actual setup shell script, but never modify this host's systemd."""
+    import os
+    from http.server import BaseHTTPRequestHandler
+
+    directory = setup_copy(tmp_path)
+    legacy = directory / ".venv-skellycam"
+    legacy.mkdir()
+    (legacy / "old").write_text("old runtime")
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    admin_log = tmp_path / "admin.jsonl"
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    tool = binaries / "fake-tool"
+    tool.write_text("""#!/usr/bin/python3
+import json,os,sys,shutil
+from pathlib import Path
+name=Path(sys.argv[0]).name;args=sys.argv[1:]
+with open(os.environ['TEST_ADMIN_LOG'],'a') as log:log.write(json.dumps([name,*args])+'\\n')
+if name=='sudo':
+    assert args[0] in ('systemctl','install','cat')
+    os.execvp(args[0],args)
+if name=='ffmpeg':print('-isync\\nvideo4linux2\\nalsa')
+if name=='systemctl':
+    if '--property=Version' in args:print('255')
+    if '--property=LoadState' in args:print('loaded')
+    if '--property=DropInPaths' in args:print(os.environ.get('TEST_DROP_INS',''))
+if name=='install':
+    assert args[-1].startswith('/etc/systemd/system/visual-mocap-camera-')
+    shutil.copyfile(args[-2],Path(os.environ['TEST_INSTALLED'])/Path(args[-1]).name)
+""")
+    tool.chmod(0o755)
+    for name in (
+        "sudo",
+        "systemctl",
+        "systemd-analyze",
+        "install",
+        "ffmpeg",
+        "ffprobe",
+        "v4l2-ctl",
+        "arecord",
+    ):
+        (binaries / name).symlink_to(tool)
+    monkeypatch.setenv("PATH", str(binaries) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("TEST_ADMIN_LOG", str(admin_log))
+    monkeypatch.setenv("TEST_INSTALLED", str(installed))
+    token = tmp_path / "token"
+    token.write_text("local-test-secret")
+
+    class Status(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            assert self.path == "/api/status"
+            assert self.headers.get("Authorization") == "Bearer local-test-secret"
+            payload = b'{"camera":"cam2"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    http = ThreadingHTTPServer(("127.0.0.1", 0), Status)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        command = [
+            str(directory / "setup.sh"),
+            "--clean-legacy",
+            "--install-service",
+            "--",
+            "--name",
+            "cam2",
+            "--device",
+            "/dev/video0",
+            "--audio",
+            "default",
+            "--port",
+            str(http.server_port),
+            "--token-file",
+            str(token),
+        ]
+        first = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        assert first.returncode == 0, first.stdout + first.stderr
+        assert not legacy.exists()
+        target = installed / "visual-mocap-camera-cam2.service"
+        assert '"--resolution" "max"' in target.read_text()
+        second = subprocess.run(
+            [*command, "--resolution", "640x480", "--fps", "30"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert second.returncode == 0, second.stdout + second.stderr
+        assert '"--resolution" "640x480"' in target.read_text()
+        assert '"--fps" "30"' in target.read_text()
+        assert len(list(installed.iterdir())) == 1
+        operations = [json.loads(line) for line in admin_log.read_text().splitlines()]
+        stops = [
+            i for i, op in enumerate(operations) if op[:2] == ["systemctl", "stop"]
+        ]
+        copies = [i for i, op in enumerate(operations) if op[0] == "install"]
+        restarts = [
+            i for i, op in enumerate(operations) if op[:2] == ["systemctl", "restart"]
+        ]
+        assert len(stops) == len(copies) == len(restarts) == 2
+        assert all(stops[i] < copies[i] < restarts[i] for i in range(2))
+        assert ["systemctl", "enable", "visual-mocap-camera-cam2.service"] in operations
+        assert "Camera API ready:" in second.stdout
+        # Overrides are detected before stopping or replacing an existing service.
+        old_log = len(operations)
+        old_unit = target.read_text()
+        monkeypatch.setenv(
+            "TEST_DROP_INS",
+            "/etc/systemd/system/visual-mocap-camera-cam2.service.d/custom.conf",
+        )
+        refused = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        assert refused.returncode != 0 and "has overrides" in refused.stderr
+        new_operations = [
+            json.loads(line) for line in admin_log.read_text().splitlines()
+        ][old_log:]
+        assert not any(
+            op[:2] == ["systemctl", "stop"] or op[0] == "install"
+            for op in new_operations
+        )
+        assert target.read_text() == old_unit
+    finally:
+        http.shutdown()
+        http.server_close()
+        thread.join(5)

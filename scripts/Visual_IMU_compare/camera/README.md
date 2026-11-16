@@ -20,8 +20,8 @@ python camera_streamer.py --name cam1 --device /dev/video0 \
 ffprobe, v4l-utils, alsa-utils. Системный FFmpeg Ubuntu 22.04 (4.4) слишком стар
 для `-isync`: используйте более новый FFmpeg, доступный в `PATH` (например,
 Ubuntu 24.04 / Debian 12 и новее). Установщик проверяет наличие нужной опции.
-На современных Orange Pi системный Python 3.14 подходит. `sudo` нужен только
-для `--system-deps`. Камера не требует Python-пакетов, pip/uv/SkellyCam/OpenCV.
+На современных Orange Pi системный Python 3.14 подходит. `sudo` нужен для
+`--system-deps` и установки системной службы через `--install-service`. Камера не требует Python-пакетов, pip/uv/SkellyCam/OpenCV.
 В `.venv` создаётся окружение стандартной библиотеки; можно запускать и просто
 `python3 camera_streamer.py ...` при наличии системных инструментов.
 
@@ -63,46 +63,61 @@ V4L2 `-timestamps abs`) и дополняет начальный зазор ау
 
 ## Автозапуск systemd
 
-Остановите прежнюю службу (для cam2 имя обычно `visual-mocap-camera-cam2.service`).
-Проверьте его через `systemctl list-unit-files '*camera*'`.
-Замените её `ExecStart` новым вызовом либо перезапишите unit:
+Установщик сам создаёт или обновляет **ту же службу**, останавливает её перед
+изменением окружения, включает запуск при загрузке и запускает новый узел.
+Для cam2 выполните из каталога `camera`:
 
 ```bash
-sudo systemctl stop visual-mocap-camera-cam1.service
-sudo nano /etc/systemd/system/visual-mocap-camera-cam1.service
+./setup.sh --clean-legacy --install-service -- \
+  --name cam2 --device /dev/video0 \
+  --audio plughw:CARD=Camera,DEV=0 --resolution max --port 8081
 ```
 
-Пример для пользователя `camera`; замените пути, имя камеры и ALSA-устройство:
+Замените устройство и микрофон своими значениями. Если используется системный
+микрофон по умолчанию, укажите `--audio default`. Для cam1 замените `--name cam2`
+на `--name cam1`. Если системные пакеты ещё не установлены, добавьте
+`--system-deps` **перед** разделителем `--`.
 
-```ini
-[Unit]
-Description=Local motion-capture camera recorder
-After=network-online.target sound.target
-Wants=network-online.target
+Все ключи после `--` — параметры `camera_streamer.py`; обязательны явные `--name`
+и `--device`. Доступны также `--fps 30`, `--resolution 1920x1080`, `--records`,
+`--token-file` и остальные рабочие параметры камеры. Имя службы определяется
+именем камеры: `visual-mocap-camera-cam2.service`. Используйте то же имя, которое
+было у старой RTSP/SkellyCam-службы. Параметры старого запуска заменяются новыми.
 
-[Service]
-Type=simple
-User=camera
-SupplementaryGroups=video audio
-WorkingDirectory=/home/camera/MoCap/ImuMotionCapture/scripts/Visual_IMU_compare/camera
-ExecStart=/usr/bin/python3 /home/camera/MoCap/ImuMotionCapture/scripts/Visual_IMU_compare/camera/camera_streamer.py --name cam1 --device /dev/v4l/by-id/REPLACE-video-index0 --audio plughw:CARD=REPLACE,DEV=0 --resolution max --port 8081
-Restart=on-failure
-RestartSec=5
-TimeoutStopSec=90
-KillSignal=SIGTERM
-KillMode=mixed
+Запускайте `./setup.sh` **от обычного пользователя камеры, без `sudo` перед
+скриптом**. Установщик сам вызовет sudo для операций systemd. Служба работает
+от текущего пользователя с дополнительными группами `video` и `audio`.
+Если узел запущен вручную в терминале, сначала завершите его через Ctrl+C;
+установщик автоматически останавливает только выбранную systemd-службу.
+Обновление службы завершает текущую запись.
 
-[Install]
-WantedBy=multi-user.target
-```
+**Обновление кода или настроек:** выполните `git pull`, затем повторите ту же
+команду `setup.sh --install-service -- ...` с нужными параметрами. Окружение
+обновится, unit будет перезаписан, служба перезапустится. Обычный `./setup.sh`
+без `--install-service` службы не меняет.
+
+Для просмотра будущего unit без установки и остановки службы:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now visual-mocap-camera-cam1.service
-journalctl -u visual-mocap-camera-cam1.service -f
+./setup.sh --service-dry-run -- \
+  --name cam2 --device /dev/video0 --audio default --resolution max
 ```
 
-Установщик не создаёт и не перезапускает службы автоматически.
+Сгенерированный файл сохраняется в `runtime/systemd/`. Если ранее существовал
+файл `/etc/systemd/system/<имя>.service`, его копия сохраняется рядом с суффиксом
+`.previous`. Пользовательские drop-in overrides и masked-службы требуют сначала
+разобрать прежние настройки; установщик сообщает о них до остановки службы.
+После запуска проверяется ответ `/api/status`. При ошибке установки старая
+служба автоматически не восстанавливается: устраните указанную ошибку и
+повторите команду. Диагностика и ручное управление:
+
+```bash
+systemctl status visual-mocap-camera-cam2.service --no-pager
+journalctl -u visual-mocap-camera-cam2.service -f
+sudo systemctl stop visual-mocap-camera-cam2.service
+sudo systemctl restart visual-mocap-camera-cam2.service
+```
+
 В UFW камеры разрешите управление только серверу:
 
 ```bash
