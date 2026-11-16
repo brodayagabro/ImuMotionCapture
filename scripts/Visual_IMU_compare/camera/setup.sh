@@ -1,99 +1,112 @@
 #!/usr/bin/env bash
-# Local, repeatable setup for the camera computer. Never activate another venv.
 set -Eeuo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-PYTHON_BIN=/usr/bin/python3
-EXPLICIT_PYTHON=0
-INSTALL_SYSTEM=0
-WITH_TESTS=0
-
-usage() {
-    cat <<'EOF'
-Usage: ./setup.sh [--python /path/to/python3] [--system-deps] [--with-tests]
-
-Creates camera/.venv (Python >= 3.10), installs pinned dependencies and checks
-FFmpeg + V4L2. Safe to repeat. No camera is opened and no service is started.
-If system Python is too old, a private Python 3.12 is downloaded automatically.
---system-deps  Install python3-venv, ffmpeg, v4l-utils through apt/sudo.
---with-tests   Also install pytest.
-EOF
-}
+DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PYTHON=/usr/bin/python3
+SYSTEM=0 TESTS=0 CLEAN=0
 fail() { echo "ERROR: $*" >&2; exit 1; }
 while (($#)); do
     case "$1" in
-        --python) (($# >= 2)) || fail "--python requires a value"; PYTHON_BIN=$2; EXPLICIT_PYTHON=1; shift 2 ;;
-        --system-deps) INSTALL_SYSTEM=1; shift ;;
-        --with-tests) WITH_TESTS=1; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) fail "Unknown argument: $1" ;;
+        --python) (($# >= 2)) || fail "--python requires a path"; PYTHON=$2; shift 2 ;;
+        --system-deps) SYSTEM=1; shift ;;
+        --with-tests) TESTS=1; shift ;;
+        --clean-legacy) CLEAN=1; shift ;;
+        -h|--help) echo "Usage: ./setup.sh [--python /path/to/python3] [--system-deps] [--with-tests] [--clean-legacy]"; exit 0 ;;
+        *) fail "Unknown argument: $1 (see README for migration from RTSP/SkellyCam)" ;;
     esac
 done
-[[ $(uname -s) == Linux ]] || fail "This profile is for Linux V4L2"
-command -v flock >/dev/null || fail "flock (util-linux) is required"
-mkdir -p -- "$SCRIPT_DIR/.tools"
-exec 9>"$SCRIPT_DIR/.tools/setup.lock"
-flock -n 9 || fail "Another camera setup is running"
-if ((INSTALL_SYSTEM)); then
-    command -v apt-get >/dev/null || fail "--system-deps requires apt-get"
-    SUDO=()
-    if ((EUID != 0)); then command -v sudo >/dev/null || fail "sudo is required"; SUDO=(sudo); fi
+mkdir -p "$DIR/.tools"
+exec 9>"$DIR/.tools/setup.lock"
+flock -n 9 || fail "Another setup is running"
+if ((SYSTEM)); then
+    SUDO=(); if ((EUID)); then SUDO=(sudo); fi
     "${SUDO[@]}" apt-get update
-    "${SUDO[@]}" apt-get install -y --no-install-recommends python3-venv ffmpeg v4l-utils
+    "${SUDO[@]}" apt-get install -y --no-install-recommends python3-venv ffmpeg v4l-utils alsa-utils
 fi
-command -v "$PYTHON_BIN" >/dev/null || fail "Python not found: $PYTHON_BIN"
-if ! "$PYTHON_BIN" -c 'import sys; sys.exit(sys.version_info < (3,10))'; then
-    ((EXPLICIT_PYTHON == 0)) || fail "The supplied Python must be >= 3.10"
-    BOOTSTRAP="$SCRIPT_DIR/.tools/bootstrap"
-    mkdir -p -- "$SCRIPT_DIR/.tools"
-    "$PYTHON_BIN" -m venv "$BOOTSTRAP" || fail "Install python3-venv or repeat with --system-deps"
-    "$BOOTSTRAP/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: -r "$SCRIPT_DIR/requirements-bootstrap.txt"
-    export UV_PYTHON_INSTALL_DIR="$SCRIPT_DIR/.tools/python"
-    export UV_CACHE_DIR="$SCRIPT_DIR/.cache/uv"
-    "$BOOTSTRAP/bin/uv" python install 3.12
-    PYTHON_BIN=$("$BOOTSTRAP/bin/uv" python find --managed-python 3.12)
-fi
-command -v v4l2-ctl >/dev/null || fail "Install v4l-utils or repeat with --system-deps"
-ENV_DIR="$SCRIPT_DIR/.venv"
-[[ ! -L "$ENV_DIR" ]] || fail "Refusing a symlink environment: $ENV_DIR"
-if [[ -e "$ENV_DIR" ]]; then
-    [[ -f "$ENV_DIR/.setup-profile" && $(cat "$ENV_DIR/.setup-profile") == camera-v1 ]] || fail "Existing directory is not managed by this setup: $ENV_DIR"
-else
-    mkdir -p -- "$ENV_DIR"
-    echo camera-v1 > "$ENV_DIR/.setup-profile"
-fi
-if [[ ! -x "$ENV_DIR/bin/python" ]]; then
-    "$PYTHON_BIN" -m venv "$ENV_DIR" || fail "venv creation failed; install python3-venv (or the matching version's venv package), then repeat"
-fi
-PY="$ENV_DIR/bin/python"
-"$PY" -c 'import sys; assert sys.version_info >= (3,10), "Existing venv requires recreation with Python >= 3.10"'
-REQ="$SCRIPT_DIR/requirements.txt"
-if ((WITH_TESTS)); then REQ="$SCRIPT_DIR/requirements-dev.txt"; fi
-"$PY" -m pip install --disable-pip-version-check --only-binary=:all: -r "$REQ"
-"$PY" - "$ENV_DIR" <<'PY'
+command -v "$PYTHON" >/dev/null || fail "Python not found: $PYTHON"
+"$PYTHON" -c 'import sys; assert sys.version_info >= (3,10), "Camera needs Python >= 3.10"'
+for tool in ffmpeg ffprobe v4l2-ctl arecord; do
+    command -v "$tool" >/dev/null || fail "$tool missing. Install system dependencies (--system-deps), or add your binaries to PATH."
+done
+features=$(ffmpeg -hide_banner -h full 2>/dev/null)
+[[ $features == *-isync* ]] || fail "Camera needs FFmpeg with -isync (5.1+). Install a newer FFmpeg; system Ubuntu 22.04 FFmpeg 4.4 is too old."
+devices=$(ffmpeg -hide_banner -devices 2>&1)
+[[ $devices == *video4linux2* && $devices == *alsa* ]] || fail "FFmpeg needs V4L2 and ALSA inputs"
+ENV="$DIR/.venv"
+[[ ! -L "$ENV" ]] || fail "Refusing a symlink environment"
+# Never remove an active interpreter, recordings, or external environments.
+"$PYTHON" - "$DIR" "$CLEAN" <<'PY_GUARD'
 from pathlib import Path
-import shutil, subprocess, sys
-binary = shutil.which('ffmpeg')
-if not binary:
+import sys
+root=Path(sys.argv[1]).resolve()
+for proc in Path('/proc').glob('[0-9]*'):
     try:
-        import imageio_ffmpeg
-        binary = imageio_ffmpeg.get_ffmpeg_exe()
-    except (ImportError, RuntimeError) as exc:
-        raise SystemExit('FFmpeg unavailable; run setup.sh --system-deps') from exc
-binary = Path(binary).resolve()
-destination = Path(sys.argv[1])/'bin/ffmpeg'
-if destination.resolve() != binary:
-    destination.unlink(missing_ok=True)
-    destination.symlink_to(binary)
-devices = subprocess.run([str(binary), '-hide_banner', '-devices'], capture_output=True, text=True, check=True)
-if 'video4linux2' not in devices.stdout + devices.stderr:
-    raise SystemExit('This FFmpeg has no V4L2 input; install Ubuntu/Debian ffmpeg')
-encoders = subprocess.run([str(binary), '-hide_banner', '-encoders'], capture_output=True, text=True, check=True)
-if 'libx264' not in encoders.stdout + encoders.stderr:
-    raise SystemExit('This FFmpeg has no libx264; install Ubuntu/Debian ffmpeg')
-print('FFmpeg with V4L2 and libx264:', binary)
-PY
-"$PY" -m pip check
-mkdir -p -- "$SCRIPT_DIR/runtime"
-"$PY" -m pip freeze > "$SCRIPT_DIR/runtime/requirements-resolved.txt"
-echo "Ready. Activate: source '$ENV_DIR/bin/activate'"
-echo "List cameras: '$PY' '$SCRIPT_DIR/camera_streamer.py' --list-devices"
+        argv=(proc/'cmdline').read_bytes().decode(errors='replace').split('\0')
+        cmd=' '.join(argv)
+        cwd=(proc/'cwd').resolve()
+        if str(root) in cmd or cwd==root:
+            if any(Path(arg).name in ('camera_streamer.py','skellycam_node.py','visual_mocap_server.py','freemocap_recording_server.py','rtsp_relay.py') for arg in argv):
+                raise SystemExit(f'Stop the old service/application before setup (PID {proc.name})')
+    except (OSError,PermissionError):pass
+PY_GUARD
+if [[ -d "$ENV" && $(cat "$ENV/.setup-profile" 2>/dev/null || true) != camera-local-v2 ]]; then
+    [[ $(cat "$ENV/.setup-profile" 2>/dev/null || true) == camera-v1 ]] || fail "Unmanaged .venv: choose another directory or remove it manually"
+    [[ ! -e "$DIR/.venv-before-local" ]] || fail "Previous migration backup exists"
+    mv -- "$ENV" "$DIR/.venv-before-local"
+    if ! "$PYTHON" -m venv --without-pip "$ENV"; then
+        rm -rf -- "$ENV"; mv -- "$DIR/.venv-before-local" "$ENV"; fail "venv creation failed"
+    fi
+    echo camera-local-v2 > "$ENV/.setup-profile"
+    rm -rf -- "$DIR/.venv-before-local"
+else
+    if [[ ! -d "$ENV" ]]; then
+        "$PYTHON" -m venv --without-pip "$ENV"
+        echo camera-local-v2 > "$ENV/.setup-profile"
+    fi
+fi
+# Preserve the resolved FFmpeg location when launching the venv by absolute path.
+"$ENV/bin/python" - "$ENV" <<'PY_TOOLS'
+from pathlib import Path
+import shutil,sys
+for name in ('ffmpeg','ffprobe'):
+    source=Path(shutil.which(name)).resolve()
+    target=Path(sys.argv[1])/'bin'/name
+    if target.resolve()!=source:
+        target.unlink(missing_ok=True)
+        target.symlink_to(source)
+PY_TOOLS
+if ((TESTS)); then
+    "$ENV/bin/python" -m ensurepip --upgrade
+    "$ENV/bin/python" -m pip install --disable-pip-version-check -r "$DIR/requirements-dev.txt"
+fi
+"$ENV/bin/python" "$DIR/camera_streamer.py" --help >/dev/null
+if ((CLEAN)); then
+    "$PYTHON" - "$DIR" <<'PY_CLEAN'
+from pathlib import Path
+import shutil,subprocess,sys
+root=Path(sys.argv[1]).resolve()
+# Explicit list of generated runtimes from previous versions. Capture data is excluded.
+entries=['.tools/bootstrap', '.tools/python', '.tools/skellycam-compatible', '.cache/uv', '.venv-skellycam', '.tools/recording-bootstrap', '.tools/skellycam-compatible', '.cache/uv', 'repositories/skellycam']
+for relative in dict.fromkeys(entries):
+    path=root/relative
+    if not path.exists():continue
+    if path.is_symlink():print('Preserved symlink:',path);continue
+    if (root/'.venv/bin/python').resolve().is_relative_to(path):
+        print('Preserved Python used by the new environment:',path);continue
+    if not path.resolve().is_relative_to(root):raise SystemExit(f'Outside project: {path}')
+    if (path/'.git').exists():
+        changed=subprocess.check_output(['git','-C',str(path),'status','--porcelain'],text=True)
+        if changed.strip():print('Preserved modified checkout:',path);continue
+    in_use=False
+    for proc in Path('/proc').glob('[0-9]*'):
+        try:
+            command=(proc/'cmdline').read_bytes().decode(errors='replace')
+            if str(path) in command or (proc/'exe').resolve().is_relative_to(path):in_use=True
+        except OSError:pass
+    if in_use:raise SystemExit(f'Stop processes using {path} before cleanup')
+    if path.is_dir():shutil.rmtree(path)
+    else:path.unlink()
+    print('Removed obsolete runtime:',path)
+PY_CLEAN
+fi
+printf 'Ready: source "%s/bin/activate"
+' "$ENV"

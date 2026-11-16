@@ -1,39 +1,96 @@
 #!/usr/bin/env python3
-"""Send a Linux V4L2 camera to a server over RTSP/TCP.
+"""Local camera recorder and HTTP control node. Python standard library + FFmpeg only."""
 
-Camera computer:
-  python3 camera_streamer.py --server 192.168.1.90 --name cam1 \
-      --device /dev/video0 --resolution 1280x720 --fps 30
-
-Start ../server/rtsp_relay.py on the GPU server first.
-visual_mocap_server.py then reads rtsp://127.0.0.1:8554/cam1.
-Add --preview to view this camera at http://CAMERA_IP:8081/ while publishing.
-Python >= 3.9; camera side needs ffmpeg and v4l2-ctl, no Python packages.
-See README.md and ./setup.sh for installation and deployment.
-"""
 from __future__ import annotations
-
 import argparse
-from contextlib import nullcontext
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, asdict
 from fractions import Fraction
+import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import ipaddress
+import json
 import logging
 import math
-import os
 from pathlib import Path
 import re
-import selectors
 import shutil
 import signal
-import socket
 import subprocess
+import sys
 import threading
 import time
+from urllib.parse import urlsplit
 
-LOG = logging.getLogger("camera-streamer")
-PIXEL_FORMATS = {"MJPG": "mjpeg", "YUYV": "yuyv422", "H264": "h264", "NV12": "nv12"}
+LOG = logging.getLogger("camera-node")
+PIXEL_FORMATS = {"MJPG": "mjpeg", "H264": "h264", "YUYV": "yuyv422", "NV12": "nv12"}
+
+
+def save(path, value):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2))
+    temporary.replace(path)
+
+
+def checked_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{32}", value):
+        raise ValueError("Invalid recording ID")
+    return value
+
+
+def checked_name(value):
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"[\w][\w .-]{0,79}", value)
+        or ".." in value
+    ):
+        raise ValueError(
+            "Name: 1–80 letters/digits/spaces/_/./-, without .. or path separators"
+        )
+    return value
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def probe(path, ffprobe):
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    video = next(s for s in data["streams"] if s["codec_type"] == "video")
+    audio = next((s for s in data["streams"] if s["codec_type"] == "audio"), None)
+    duration = float(data.get("format", {}).get("duration", 0))
+    if not audio or duration < 0.5:
+        raise ValueError(
+            "Recording needs a readable video and audio track, at least 0.5 seconds"
+        )
+    return dict(
+        width=video["width"],
+        height=video["height"],
+        video_codec=video["codec_name"],
+        audio_codec=audio["codec_name"],
+        duration_s=duration,
+        fps=float(Fraction(video["avg_frame_rate"])),
+    )
 
 
 @dataclass(frozen=True)
@@ -50,7 +107,9 @@ def resolution(value):
         raise argparse.ArgumentTypeError("Use WIDTHxHEIGHT, e.g. 1280x720")
     width, height = map(int, match.groups())
     if min(width, height) < 16 or max(width, height) > 8192 or width % 2 or height % 2:
-        raise argparse.ArgumentTypeError("H.264 dimensions must be even, between 16 and 8192")
+        raise argparse.ArgumentTypeError(
+            "H.264 dimensions must be even, between 16 and 8192"
+        )
     return width, height
 
 
@@ -58,89 +117,12 @@ def rate(value):
     try:
         fps = Fraction(value)
     except (ValueError, ZeroDivisionError):
-        raise argparse.ArgumentTypeError("FPS must be a number or fraction such as 30000/1001") from None
+        raise argparse.ArgumentTypeError(
+            "FPS must be a number or fraction such as 30000/1001"
+        ) from None
     if not 0 < fps <= 240:
         raise argparse.ArgumentTypeError("FPS must be > 0 and <= 240")
     return fps
-
-
-def host(value):
-    value = value.strip("[]")
-    try:
-        ipaddress.ip_address(value)
-    except ValueError:
-        if len(value) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part)
-                                      for part in value.split(".")):
-            raise argparse.ArgumentTypeError("Use an IP address or hostname, without rtsp:// or port") from None
-    return value
-
-
-def arguments(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--server", type=host, help="Destination GPU server IP/hostname")
-    parser.add_argument("--port", type=int, default=8554, help="RTSP port on the server")
-    parser.add_argument("--name", default="cam1", help="Unique stream name on the server")
-    parser.add_argument("--device", "--camera", help="V4L2 path or index; auto-detected if exactly one camera is present")
-    parser.add_argument("--resolution", "--size", type=resolution, help="Camera resolution, e.g. 1280x720")
-    parser.add_argument("--fps", type=rate, help="Camera frame rate, e.g. 30 or 30000/1001")
-    parser.add_argument("--input-format", choices=["auto", *PIXEL_FORMATS.values()], default="auto")
-    parser.add_argument("--encoder", choices=["libx264", "h264_v4l2m2m", "copy"], default="libx264")
-    parser.add_argument("--bitrate", default="4M", help="H.264 target/max bitrate, e.g. 4M or 1500k")
-    parser.add_argument("--ffmpeg", help="FFmpeg executable; defaults to PATH, then optional imageio-ffmpeg")
-    parser.add_argument("--v4l2-ctl", default="v4l2-ctl", help="Path to v4l2-ctl")
-    parser.add_argument("--list-devices", action="store_true")
-    parser.add_argument("--list-formats", action="store_true", help="Show supported modes of the selected camera")
-    parser.add_argument("--retry-delay", type=float, default=2)
-    parser.add_argument("--stall-timeout", type=float, default=15, help="Restart if no new encoded frames for this many seconds")
-    parser.add_argument("--no-reconnect", action="store_true", help="Exit on a camera/network error")
-    parser.add_argument("--duration", type=float, help="Stop after N wall-clock seconds; useful for testing")
-    parser.add_argument("--preview", action="store_true", help="Host a live camera preview page (default port 8081)")
-    parser.add_argument("--preview-host", type=host, default="0.0.0.0", help="Preview listen address")
-    parser.add_argument("--preview-port", type=int, default=8081, help="HTTP port on this camera computer")
-    parser.add_argument("--preview-width", type=int, default=640, help="Maximum preview width; RTSP size stays unchanged")
-    parser.add_argument("--preview-fps", type=int, default=10, help="Preview refresh rate, capped at camera FPS")
-    args = parser.parse_args(argv)
-    if not 1 <= args.port <= 65535:
-        parser.error("--port must be in 1..65535")
-    if not 1 <= args.preview_port <= 65535:
-        parser.error("--preview-port must be in 1..65535")
-    if not 32 <= args.preview_width <= 1920 or args.preview_width % 2:
-        parser.error("--preview-width must be even and in 32..1920")
-    if not 1 <= args.preview_fps <= 30:
-        parser.error("--preview-fps must be in 1..30")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", args.name):
-        parser.error("--name must contain 1–48 letters, digits, '_' or '-'")
-    if not re.fullmatch(r"[1-9]\d*(?:[kKmM])?", args.bitrate):
-        parser.error("--bitrate must be a positive integer optionally followed by k or M")
-    for field in ("retry_delay", "stall_timeout", "duration"):
-        number = getattr(args, field)
-        if number is not None and (not math.isfinite(number) or number <= 0):
-            parser.error(f"--{field.replace('_', '-')} must be finite and positive")
-    if not (args.list_devices or args.list_formats):
-        if not args.server or args.resolution is None or args.fps is None:
-            parser.error("Camera streaming requires --server, --resolution and --fps")
-    if args.encoder == "copy" and args.input_format not in ("auto", "h264"):
-        parser.error("--encoder copy requires an H.264-capable camera (--input-format h264)")
-    return args
-
-
-def executable(value):
-    found = shutil.which(str(value))
-    if not found:
-        raise ValueError(f"Executable not found: {value}")
-    return str(Path(found).resolve())
-
-
-def find_ffmpeg(requested=None):
-    if requested:
-        return executable(requested)
-    if shutil.which("ffmpeg"):
-        return executable("ffmpeg")
-    try:
-        import imageio_ffmpeg
-        return executable(imageio_ffmpeg.get_ffmpeg_exe())
-    except ImportError:
-        raise ValueError("FFmpeg not found. Ubuntu/Debian: sudo apt install ffmpeg v4l-utils") from None
 
 
 def parse_modes(text):
@@ -163,10 +145,16 @@ def parse_modes(text):
 
 
 def probe_device(tool, device):
-    result = subprocess.run([tool, "--device", str(device), "--list-formats-ext"],
-                            capture_output=True, text=True, timeout=5)
+    result = subprocess.run(
+        [tool, "--device", str(device), "--list-formats-ext"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
     if result.returncode:
-        raise ValueError(f"Cannot query {device}: {result.stderr.strip() or result.stdout.strip()}")
+        raise ValueError(
+            f"Cannot query {device}: {result.stderr.strip() or result.stdout.strip()}"
+        )
     return parse_modes(result.stdout), result.stdout
 
 
@@ -186,324 +174,712 @@ def discover_devices(tool):
 
 def choose_device(args, tool):
     if args.device:
-        path = Path("/dev/video" + args.device) if args.device.isdecimal() else Path(args.device)
+        path = (
+            Path("/dev/video" + args.device)
+            if args.device.isdecimal()
+            else Path(args.device)
+        )
         modes, text = probe_device(tool, path)
         return path, modes, text
     cameras = discover_devices(tool)
     if len(cameras) != 1:
         available = ", ".join(str(c[0]) for c in cameras) or "none"
-        raise ValueError(f"Specify --device; usable cameras: {available}. Check --list-devices and device permissions.")
+        raise ValueError(
+            f"Specify --device; usable cameras: {available}. Check --list-devices and device permissions."
+        )
     path, _, modes, text = cameras[0]
     return path, modes, text
 
 
-def choose_format(args, modes):
-    if args.encoder == "copy":
-        preferences = ["h264"]
-    elif args.input_format == "auto":
-        preferences = ["mjpeg", "yuyv422", "h264", "nv12"]
+def select_mode(modes, size="max", fps=None, pixel_format="auto"):
+    allowed = {"mjpeg", "h264"} if pixel_format == "auto" else {pixel_format}
+    candidates = [
+        m
+        for m in modes
+        if m.pixel_format in allowed
+        and (size == "max" or (m.width, m.height) == size)
+        and (
+            fps is None or math.isclose(m.fps, float(fps), rel_tol=1e-4, abs_tol=0.001)
+        )
+    ]
+    if not candidates:
+        raise ValueError(
+            "No matching compressed camera mode; use --list-formats and select MJPEG or H.264"
+        )
+    return max(
+        candidates, key=lambda m: (m.width * m.height, m.fps, m.pixel_format == "h264")
+    )
+
+
+def command(args, mode, destination=None):
+    cmd = [
+        args.ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostats",
+        "-stats_period",
+        "0.5",
+        "-progress",
+        "pipe:2",
+    ]
+    if args.test_video:
+        cmd += ["-re", "-stream_loop", "-1", "-i", str(args.test_video)]
     else:
-        preferences = [args.input_format]
-    for pixel_format in preferences:
-        for mode in modes:
-            if (mode.pixel_format == pixel_format and (mode.width, mode.height) == args.resolution
-                    and math.isclose(mode.fps, float(args.fps), rel_tol=1e-4, abs_tol=.001)):
-                return pixel_format
-    width, height = args.resolution
-    raise ValueError(f"Camera does not advertise {width}x{height} @ {float(args.fps):g} fps "
-                     f"in {', '.join(preferences)}. Run --list-formats; resolution/FPS will not be silently changed.")
-
-
-def rtsp_url(server, port, name):
-    address = f"[{server}]" if ":" in server else server
-    return f"rtsp://{address}:{port}/{name}"
-
-
-def ffmpeg_command(args, binary, device, pixel_format):
-    width, height = args.resolution
-    fps = str(args.fps)
-    command = [binary, "-hide_banner", "-nostdin", "-loglevel", "warning", "-nostats",
-               "-stats_period", "1", "-progress", "pipe:1", "-thread_queue_size", "4",
-               "-f", "v4l2", "-input_format", pixel_format, "-video_size", f"{width}x{height}",
-               "-framerate", fps, "-i", str(device), "-map", "0:v:0", "-an"]
-    if args.encoder == "copy":
-        command += ["-c:v", "copy"]
+        if destination:
+            cmd += ["-copyts", "-start_at_zero"]
+        if mode.pixel_format == "h264":
+            cmd += ["-skip_frame", "nokey"]
+        cmd += [
+            "-thread_queue_size",
+            "8",
+            "-f",
+            "v4l2",
+            "-input_format",
+            mode.pixel_format,
+            "-timestamps",
+            "abs",
+            "-video_size",
+            f"{mode.width}x{mode.height}",
+            "-framerate",
+            str(mode.fps),
+            "-i",
+            str(args.device),
+        ]
+        if destination:
+            cmd += [
+                "-isync",
+                "0",
+                "-thread_queue_size",
+                "64",
+                "-f",
+                "alsa",
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-i",
+                args.audio,
+            ]
+    if destination:
+        audio = "0:a:0" if args.test_video else "1:a:0"
+        cmd += [
+            "-map",
+            "0:v:0",
+            "-map",
+            audio,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "pcm_s16le",
+            "-af",
+            "aresample=async=1:first_pts=0",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-f",
+            "matroska",
+            "-n",
+            str(destination),
+        ]
+    cmd += ["-map", "0:v:0", "-an"]
+    if mode.pixel_format == "mjpeg":
+        cmd += ["-c:v", "copy"]
     else:
-        command += ["-c:v", args.encoder, "-pix_fmt", "yuv420p", "-b:v", args.bitrate,
-                    "-maxrate", args.bitrate, "-bufsize", args.bitrate,
-                    "-g", str(max(1, round(float(args.fps)))), "-bf", "0"]
-        if args.encoder == "libx264":
-            command += ["-preset", "ultrafast", "-tune", "zerolatency", "-sc_threshold", "0"]
-        # No CFR resampling: do not duplicate frames to disguise camera drops.
-        command += ["-vsync", "0"]
-    command += ["-flush_packets", "1", "-f", "rtsp", "-rtsp_transport", "tcp",
-                rtsp_url(args.server, args.port, args.name)]
-    return command
+        # Decode only keyframes for native H.264 cameras; recorded packets are copied.
+        cmd += [
+            "-vf",
+            f"fps=1,scale=w='min(iw,{args.preview_width})':h=-2",
+            "-c:v",
+            "mjpeg",
+            "-threads",
+            "1",
+            "-q:v",
+            "10",
+        ]
+    return cmd + ["-f", "image2pipe", "pipe:1"]
 
 
-PREVIEW_PAGE = """<!doctype html>
-<html lang="ru"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Камера __NAME__</title>
-<style>
-body{margin:0;background:#111820;color:#eaf0f5;font:16px system-ui,sans-serif}
-main{max-width:1200px;margin:auto;padding:20px}h1{font-size:24px;margin:0 0 8px}
-p{color:#afbdcb}figure{margin:20px 0;background:#080d12;border-radius:12px;
-min-height:240px;display:flex;align-items:center;justify-content:center}
-img{display:block;max-width:100%;max-height:78vh;object-fit:contain}
-[hidden]{display:none}#waiting{padding:32px;text-align:center}
-</style><main><h1>Камера __NAME__</h1><p>__MODE__</p>
-<figure><img id="video" alt="Изображение камеры" hidden>
-<p id="waiting">Ожидаем изображение камеры…</p></figure>
-<p id="status" role="status">Подключение…</p></main>
-<script>
-const video=document.getElementById('video'),waiting=document.getElementById('waiting');
-const status=document.getElementById('status');
-function refresh(){video.src='/frame.jpg?t='+Date.now()}
-video.onload=()=>{video.hidden=false;waiting.hidden=true;
- status.textContent='Прямой просмотр · '+video.naturalWidth+' × '+video.naturalHeight;
- setTimeout(refresh,__INTERVAL__)};
-video.onerror=()=>{video.hidden=true;waiting.hidden=false;
- status.textContent='Нет видео. Повторное подключение…';setTimeout(refresh,1000)};
-refresh();
-</script></html>"""
-
-
-class CameraPreview:
-    """One bounded JPEG buffer shared by HTTP clients; capture never waits on a viewer."""
-
-    def __init__(self, args):
-        self.args = args
-        self.fps = min(args.preview_fps, float(args.fps))
-        self.max_age = max(2.0, 3 / self.fps)
-        self.lock = threading.Lock()
+class Capture:
+    def __init__(self, args, mode, destination=None):
+        self.args, self.mode = args, mode
+        self.process = subprocess.Popen(
+            command(args, mode, destination),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         self.jpeg = None
         self.updated = 0
-        self.pending = bytearray()
+        self.progress = time.monotonic()
+        self.media_s = 0
+        self.error = None
+        self.stopping = False
+        self.tail = []
+        self.readers = [
+            threading.Thread(target=f, daemon=True)
+            for f in (self.read_images, self.read_progress)
+        ]
+        for reader in self.readers:
+            reader.start()
 
-    def output(self, fd):
-        # A second FFmpeg output reuses the one V4L2 input. Filter only this output.
-        return ["-map", "0:v:0", "-an", "-vf",
-                f"fps={self.fps:g},scale=w='min(iw,{self.args.preview_width})':h=-2",
-                "-c:v", "mjpeg", "-threads:v", "1", "-pix_fmt", "yuvj420p", "-q:v", "5",
-                "-f", "image2pipe", f"pipe:{fd}"]
+    def read_images(self):
+        pending = bytearray()
+        try:
+            while block := self.process.stdout.read1(65536):
+                pending.extend(block)
+                while pending:
+                    start = pending.find(b"\xff\xd8")
+                    if start < 0:
+                        pending[:] = pending[-1:]
+                        break
+                    if start:
+                        del pending[:start]
+                    end = pending.find(b"\xff\xd9", 2)
+                    if end < 0:
+                        if len(pending) > 32 * 1024 * 1024:
+                            pending.clear()
+                        break
+                    # Keep one compressed sample. No image decoding in Python.
+                    now = time.monotonic()
+                    if now - self.updated >= 1 / self.args.preview_fps:
+                        self.jpeg = bytes(pending[: end + 2])
+                        self.updated = now
+                    del pending[: end + 2]
+        except OSError as exc:
+            self.error = str(exc)
 
-    def feed(self, block):
-        # FFmpeg's image2pipe JPEGs have no embedded thumbnails. Preserve partial
-        # markers between reads, discard noise and cap incomplete-frame memory.
-        self.pending.extend(block)
-        while self.pending:
-            start = self.pending.find(b"\xff\xd8")
-            if start < 0:
-                self.pending[:] = self.pending[-1:]
-                break
-            if start:
-                del self.pending[:start]
-            end = self.pending.find(b"\xff\xd9", 2)
-            if end < 0:
-                if len(self.pending) > 8 * 1024 * 1024:
-                    self.pending.clear()
-                break
-            jpeg = bytes(self.pending[:end+2])
-            del self.pending[:end+2]
-            with self.lock:
-                self.jpeg, self.updated = jpeg, time.monotonic()
-
-    def snapshot(self):
-        with self.lock:
-            return self.jpeg if time.monotonic() - self.updated <= self.max_age else None
-
-    def clear(self):
-        self.pending.clear()
-        with self.lock:
-            self.jpeg, self.updated = None, 0
-
-    def __enter__(self):
-        preview = self
-        width, height = self.args.resolution
-        page = (PREVIEW_PAGE.replace("__NAME__", self.args.name)
-                .replace("__MODE__", f"{width} × {height} · {float(self.args.fps):g} FPS")
-                .replace("__INTERVAL__", str(round(1000/self.fps)))).encode("utf-8")
-
-        class Handler(BaseHTTPRequestHandler):
-            def setup(self):
-                super().setup()
-                self.connection.settimeout(3)
-
-            def do_GET(self):
-                path = self.path.split("?", 1)[0]
-                if path == "/":
-                    status, mime, data = 200, "text/html; charset=utf-8", page
-                elif path == "/frame.jpg":
-                    data = preview.snapshot()
-                    status, mime = (200, "image/jpeg") if data else (503, "text/plain")
-                    if data is None:
-                        data = b"Waiting for camera frames\n"
-                else:
-                    status, mime, data = 404, "text/plain", b"Not found\n"
+    def read_progress(self):
+        for raw in self.process.stderr:
+            text = raw.decode(errors="replace").strip()
+            key, _, value = text.partition("=")
+            if key == "out_time_us":
                 try:
-                    self.send_response(status)
-                    self.send_header("Content-Type", mime)
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Cache-Control", "no-store, max-age=0")
-                    self.send_header("X-Content-Type-Options", "nosniff")
-                    self.end_headers()
-                    self.wfile.write(data)
-                except OSError:
-                    pass  # Closed tabs/slow viewers must not interrupt capture.
+                    seconds = int(value) / 1e6
+                    if seconds > self.media_s:
+                        self.media_s = seconds
+                        self.progress = time.monotonic()
+                except ValueError:
+                    pass
+            elif "=" not in text or text.startswith("["):
+                self.tail = (self.tail + [text])[-15:]
+        if not self.stopping:
+            self.error = "FFmpeg ended: " + "; ".join(self.tail)[-1500:]
 
-            def log_message(self, message, *values):
-                LOG.debug("Preview: " + message, *values)
+    def ready(self):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if self.error or self.process.poll() is not None:
+                raise RuntimeError(self.error or "; ".join(self.tail))
+            if self.jpeg and self.media_s > 0:
+                return
+            time.sleep(0.05)
+        raise RuntimeError(
+            "Camera did not produce frames within 15 seconds: " + "; ".join(self.tail)
+        )
 
-        class Server(ThreadingHTTPServer):
-            address_family = socket.AF_INET6 if ":" in preview.args.preview_host else socket.AF_INET
+    def finish(self):
+        self.stopping = True
+        if self.process.poll() is None:
+            try:
+                self.process.stdin.write(b"q\n")
+                self.process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+                self.error = "FFmpeg failed to finalize the recording"
+        for reader in self.readers:
+            reader.join(timeout=5)
+        if self.process.returncode and not self.error:
+            self.error = "FFmpeg failed: " + "; ".join(self.tail)
+        for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+            pipe.close()
 
-        self.http = Server((self.args.preview_host, self.args.preview_port), Handler)
-        self.thread = threading.Thread(target=self.http.serve_forever,
-                                       kwargs={"poll_interval": .2}, daemon=True)
-        self.thread.start()
-        address = self.args.preview_host
-        address = "<camera-ip>" if address in ("0.0.0.0", "::") else f"[{address}]" if ":" in address else address
-        LOG.info("Camera preview: http://%s:%s/", address, self.http.server_port)
-        return self
 
-    def __exit__(self, *_):
-        self.http.shutdown()
-        self.http.server_close()
-        self.thread.join(timeout=3)
-        self.clear()
+class Node:
+    def __init__(self, args, mode, idle_mode):
+        self.args, self.mode, self.idle_mode = args, mode, idle_mode
+        self.root = args.records.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.preview_lock = threading.Lock()
+        self.capture = None
+        self.active = None
+        self.finalizer = None
+        self.preview_requested = 0
+        self.thumbnail = None
+        self.thumbnail_time = 0
+        self.closed = threading.Event()
+        self.takes = {}
+        for path in self.root.glob("*/manifest.json"):
+            take = json.loads(path.read_text())
+            if take["state"] in ("recording", "stopping"):
+                take.update(
+                    state="interrupted",
+                    error="Camera node restarted; stop/finalize this take again",
+                )
+                save(path, take)
+            self.takes[take["id"]] = take
+        self.monitor = threading.Thread(target=self.watch, daemon=True)
+        self.monitor.start()
 
+    def update(self, take, **values):
+        take.update(values)
+        save(self.root / take["id"] / "manifest.json", take)
 
-def stop_child(process):
-    if process.poll() is None:
-        process.terminate()
+    def status(self):
+        with self.lock:
+            return dict(
+                camera=self.args.name,
+                mode=asdict(self.mode),
+                audio=self.args.audio,
+                active=self.active,
+                active_state=self.takes[self.active]["state"] if self.active else None,
+                free_bytes=shutil.disk_usage(self.root).free,
+                synthetic=bool(self.args.test_video),
+                recordings_count=len(self.takes),
+            )
+
+    def start(self, body):
+        identifier = checked_id(body.get("id"))
+        name = checked_name(body.get("name"))
+        kind = body.get("kind")
+        if kind not in ("calibration", "record"):
+            raise ValueError("kind must be calibration or record")
+        with self.lock:
+            if self.closed.is_set():
+                raise ValueError("Camera node is shutting down")
+            if identifier in self.takes:
+                take = self.takes[identifier]
+                if (take["name"], take["kind"]) != (name, kind):
+                    raise ValueError(
+                        "Recording identity already has different metadata"
+                    )
+                return dict(take)
+            if self.active:
+                raise ValueError("Another recording is active")
+            if shutil.disk_usage(self.root).free < self.args.min_free_mb * 1024**2:
+                raise ValueError("Not enough free disk space")
+            if self.capture:
+                self.capture.finish()
+                self.capture = None
+            directory = self.root / identifier
+            directory.mkdir()
+            take = dict(
+                id=identifier,
+                name=name,
+                kind=kind,
+                camera=self.args.name,
+                state="recording",
+                created=time.time(),
+                mode=asdict(self.mode),
+                synthetic=bool(self.args.test_video),
+            )
+            self.takes[identifier] = take
+            self.active = identifier
+            self.update(take)
+            try:
+                self.capture = Capture(
+                    self.args, self.mode, directory / "video.partial.mkv"
+                )
+                self.capture.ready()
+            except Exception as exc:
+                if self.capture:
+                    self.capture.finish()
+                    self.capture = None
+                self.active = None
+                self.update(take, state="failed", error=str(exc))
+                raise
+            return dict(take)
+
+    def stop(self, identifier):
+        checked_id(identifier)
+        with self.lock:
+            take = self.takes[identifier]
+            if take["state"] in ("ready", "stopping"):
+                return dict(take)
+            if self.active and self.active != identifier:
+                raise ValueError("Another recording is active")
+            if take["state"] not in ("recording", "interrupted"):
+                raise ValueError(take.get("error", "Recording failed"))
+            if not self.active and self.capture:
+                self.capture.finish()
+                self.capture = None
+            capture = self.capture if self.active == identifier else None
+            self.capture = None
+            self.active = identifier
+            self.update(take, state="stopping")
+            self.finalizer = threading.Thread(
+                target=self.finalize, args=(take, capture), daemon=True
+            )
+            self.finalizer.start()
+            return dict(take)
+
+    def finalize(self, take, capture):
         try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
-
-
-def stream_attempt(command, stop, deadline, stall_timeout, preview=None):
-    """Drain FFmpeg pipes; HTTP reads only the latest preview, never a video queue."""
-    preview_read = preview_write = None
-    if preview is not None:
-        preview.clear()
-        preview_read, preview_write = os.pipe()
-        command = [*command, *preview.output(preview_write)]
-    try:
-        try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       stdin=subprocess.DEVNULL, start_new_session=True,
-                                       pass_fds=() if preview_write is None else (preview_write,))
+            if capture:
+                capture.finish()
+                if capture.error:
+                    raise RuntimeError(capture.error)
+            directory = self.root / take["id"]
+            partial = directory / "video.partial.mkv"
+            video = directory / "video.mkv"
+            path = partial if partial.exists() else video
+            info = probe(path, self.args.ffprobe)
+            digest = sha256(path)
+            size = path.stat().st_size
+            if path == partial:
+                partial.replace(video)
+            with self.lock:
+                self.update(
+                    take,
+                    state="ready",
+                    error=None,
+                    bytes=size,
+                    sha256=digest,
+                    media=info,
+                )
+        except Exception as exc:
+            with self.lock:
+                self.update(take, state="failed", error=str(exc))
         finally:
-            if preview_write is not None:
-                os.close(preview_write)
-    except BaseException:
-        if preview_read is not None:
-            os.close(preview_read)
-        raise
-    buffers, progress = {}, {}
-    frames, last_frame = 0, time.monotonic()
-    stalled = False
-    try:
-        with selectors.DefaultSelector() as selector:
-            for pipe, name in ((process.stdout, "progress"), (process.stderr, "stderr")):
-                selector.register(pipe, selectors.EVENT_READ, name)
-                buffers[name] = b""
-            if preview_read is not None:
-                selector.register(preview_read, selectors.EVENT_READ, "preview")
-            while not stop.is_set() and time.monotonic() < deadline:
-                for key, _ in selector.select(timeout=.2):
-                    block = os.read(key.fd, 65536 if key.data == "preview" else 4096)
-                    if not block:
-                        selector.unregister(key.fileobj)
-                        continue
-                    name = key.data
-                    if name == "preview":
-                        preview.feed(block)
-                        continue
-                    buffers[name] += block
-                    while b"\n" in buffers[name]:
-                        raw, buffers[name] = buffers[name].split(b"\n", 1)
-                        line = raw.decode("utf-8", errors="replace").strip()
-                        if name == "stderr":
-                            if line:
-                                LOG.warning("FFmpeg: %s", line[:2000])
-                        else:
-                            field, sep, value = line.partition("=")
-                            if sep:
-                                progress[field] = value
-                            if field == "frame" and value.isdecimal() and int(value) > frames:
-                                frames, last_frame = int(value), time.monotonic()
-                            if field == "progress":
-                                LOG.info("Frames=%s, encoded fps=%s, speed=%s", progress.get("frame", "0"),
-                                         progress.get("fps", "?"), progress.get("speed", "?"))
-                    if len(buffers[name]) > 16384:
-                        buffers[name] = buffers[name][-16384:]
-                if process.poll() is not None and not selector.get_map():
-                    break
-                if time.monotonic() - last_frame > stall_timeout:
-                    LOG.error("No encoded-output progress for %.1f seconds (last reported frame=%s); restarting capture",
-                              stall_timeout, frames)
-                    if frames == 0:
-                        LOG.error("No output frames reported. Check RTSP access from THIS computer, server firewall, "
-                                  "and whether another publisher uses the same --name; then check camera/encoder logs.")
-                    stalled = True
-                    break
-    finally:
-        stop_child(process)
-        process.stdout.close()
-        process.stderr.close()
-        if preview_read is not None:
-            os.close(preview_read)
-            preview.clear()
-    return (1 if stalled else process.returncode), frames
+            with self.lock:
+                self.active = None
+
+    def preview(self):
+        self.preview_requested = time.monotonic()
+        with self.preview_lock:
+            now = time.monotonic()
+            if self.thumbnail and now - self.thumbnail_time < 1 / self.args.preview_fps:
+                return self.thumbnail
+            with self.lock:
+                if self.active and self.takes[self.active]["state"] != "recording":
+                    return None
+                if self.capture is None:
+                    self.capture = Capture(self.args, self.idle_mode)
+                capture = self.capture
+                jpeg = capture.jpeg if now - capture.updated < 3 else None
+            if not jpeg:
+                return None
+            # Decode ONE sampled JPEG, never all high-resolution camera frames.
+            result = subprocess.run(
+                [
+                    self.args.ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-threads",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-i",
+                    "pipe:0",
+                    "-vf",
+                    f"scale=w='min(iw,{self.args.preview_width})':h=-2",
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "mjpeg",
+                    "-threads",
+                    "1",
+                    "-q:v",
+                    "10",
+                    "-f",
+                    "image2pipe",
+                    "pipe:1",
+                ],
+                input=jpeg,
+                capture_output=True,
+                timeout=5,
+                check=True,
+            )
+            self.thumbnail = result.stdout
+            self.thumbnail_time = time.monotonic()
+            return self.thumbnail
+
+    def watch(self):
+        while not self.closed.wait(0.5):
+            with self.lock:
+                capture = self.capture
+                if not capture:
+                    continue
+                if self.active:
+                    if (
+                        capture.error
+                        or time.monotonic() - capture.progress > 15
+                        or shutil.disk_usage(self.root).free
+                        < self.args.min_free_mb * 1024**2
+                    ):
+                        capture.error = (
+                            capture.error
+                            or "Recording stopped: disk reserve or camera timeout"
+                        )
+                        self.stop(self.active)
+                elif time.monotonic() - self.preview_requested > 5 or capture.error:
+                    capture.finish()
+                    self.capture = None
+
+    def close(self):
+        self.closed.set()
+        self.monitor.join(timeout=2)
+        with self.lock:
+            if self.active and self.takes[self.active]["state"] in (
+                "recording",
+                "interrupted",
+            ):
+                self.stop(self.active)
+            elif self.capture:
+                self.capture.finish()
+                self.capture = None
+        if self.finalizer:
+            self.finalizer.join(timeout=60)
 
 
-def publish(args, stop):
-    tool = executable(args.v4l2_ctl)
+def handler(node):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def json(self, value, status=200):
+            payload = json.dumps(value, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def authorized(self):
+            return not node.args.token or hmac.compare_digest(
+                self.headers.get("Authorization", ""), "Bearer " + node.args.token
+            )
+
+        def do_GET(self):
+            if not self.authorized():
+                self.json({"error": "Unauthorized"}, 401)
+                return
+            path = urlsplit(self.path).path
+            try:
+                if path == "/api/status":
+                    self.json(node.status())
+                elif path == "/preview.jpg":
+                    jpeg = node.preview()
+                    if not jpeg:
+                        self.json({"error": "Camera preview is warming up"}, 503)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(jpeg)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(jpeg)
+                elif path.startswith("/api/recordings/"):
+                    identifier = checked_id(path.rsplit("/", 1)[-1])
+                    with node.lock:
+                        value = copy.deepcopy(node.takes[identifier])
+                    self.json(value)
+                elif path.startswith("/files/"):
+                    identifier = checked_id(path.rsplit("/", 1)[-1])
+                    take = node.takes[identifier]
+                    if take["state"] != "ready":
+                        raise ValueError("File is not finalized")
+                    source = node.root / identifier / "video.mkv"
+                    size = source.stat().st_size
+                    start = 0
+                    if self.headers.get("Range"):
+                        match = re.fullmatch(r"bytes=(\d+)-", self.headers["Range"])
+                        if not match or int(match[1]) >= size:
+                            self.json({"error": "Invalid range"}, 416)
+                            return
+                        start = int(match[1])
+                    self.send_response(206 if self.headers.get("Range") else 200)
+                    self.send_header("Content-Type", "video/x-matroska")
+                    self.send_header("Content-Length", str(size - start))
+                    self.send_header("ETag", '"' + take["sha256"] + '"')
+                    self.send_header("Accept-Ranges", "bytes")
+                    if self.headers.get("Range"):
+                        self.send_header(
+                            "Content-Range", f"bytes {start}-{size - 1}/{size}"
+                        )
+                    self.end_headers()
+                    with source.open("rb") as stream:
+                        stream.seek(start)
+                        while block := stream.read(256 * 1024):
+                            self.wfile.write(block)
+                else:
+                    self.json({"error": "Unknown route"}, 404)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except KeyError:
+                self.json({"error": "Unknown recording"}, 404)
+            except Exception as exc:
+                self.json({"error": str(exc)}, 400)
+
+        def do_POST(self):
+            if not self.authorized():
+                self.json({"error": "Unauthorized"}, 401)
+                return
+            try:
+                if (
+                    self.headers.get("Content-Type", "").split(";")[0]
+                    != "application/json"
+                ):
+                    raise ValueError("application/json required")
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 16384:
+                    raise ValueError("Invalid JSON size")
+                body = json.loads(self.rfile.read(size))
+                path = urlsplit(self.path).path
+                if path == "/api/start":
+                    self.json(node.start(body))
+                elif path == "/api/stop":
+                    self.json(node.stop(body.get("id")))
+                else:
+                    self.json({"error": "Unknown route"}, 404)
+            except KeyError:
+                self.json({"error": "Unknown recording"}, 404)
+            except Exception as exc:
+                self.json({"error": str(exc)}, 400)
+
+    return Handler
+
+
+def arguments(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--name", default="cam1")
+    parser.add_argument("--device")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8081)
+    parser.add_argument(
+        "--resolution", default="max", help="max (default) or WIDTHxHEIGHT"
+    )
+    parser.add_argument(
+        "--fps", type=rate, help="Default: maximum FPS at the selected resolution"
+    )
+    parser.add_argument(
+        "--input-format", choices=["auto", "mjpeg", "h264"], default="auto"
+    )
+    parser.add_argument(
+        "--audio", default="default", help="ALSA input, e.g. plughw:CARD=Camera,DEV=0"
+    )
+    parser.add_argument("--list-devices", action="store_true")
+    parser.add_argument("--list-formats", action="store_true")
+    parser.add_argument("--list-audio", action="store_true")
+    parser.add_argument(
+        "--records",
+        type=Path,
+        default=Path(__file__).resolve().parent / "runtime" / "recordings",
+    )
+    parser.add_argument(
+        "--ffmpeg",
+        default=shutil.which("ffmpeg") or str(Path(sys.executable).parent / "ffmpeg"),
+    )
+    parser.add_argument(
+        "--ffprobe",
+        default=shutil.which("ffprobe") or str(Path(sys.executable).parent / "ffprobe"),
+    )
+    parser.add_argument("--v4l2-ctl", default="v4l2-ctl")
+    parser.add_argument("--token-file", type=Path)
+    parser.add_argument("--preview-width", type=int, default=320)
+    parser.add_argument("--preview-fps", type=float, default=1)
+    parser.add_argument("--min-free-mb", type=int, default=256)
+    parser.add_argument(
+        "--test-video",
+        type=Path,
+        help="Diagnostic prerecorded MJPEG+audio file, instead of physical hardware",
+    )
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", args.name):
+        parser.error("Invalid camera name")
+    if (
+        not 1 <= args.port <= 65535
+        or not 64 <= args.preview_width <= 640
+        or not 0 < args.preview_fps <= 2
+        or args.min_free_mb < 16
+    ):
+        parser.error("Invalid port/preview/disk settings")
+    if args.resolution != "max":
+        args.resolution = resolution(args.resolution)
+    args.token = args.token_file.read_text().strip() if args.token_file else ""
+    return args
+
+
+def main():
+    args = arguments()
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+    if args.list_audio:
+        return subprocess.call(["arecord", "-L"])
     if args.list_devices:
-        for path, name, _, _ in discover_devices(tool):
-            print(f"{path}: {name}")
+        for device, name, modes, _ in discover_devices(args.v4l2_ctl):
+            print(
+                device,
+                name,
+                sorted({(m.width, m.height, m.fps, m.pixel_format) for m in modes}),
+            )
         return 0
-    device, modes, text = choose_device(args, tool)
-    if args.list_formats:
-        print(f"{device}\n{text}")
-        return 0
-    pixel_format = choose_format(args, modes)
-    command = ffmpeg_command(args, find_ffmpeg(args.ffmpeg), device, pixel_format)
-    destination = rtsp_url(args.server, args.port, args.name)
-    LOG.info("%s → %s; %sx%s @ %s fps; input=%s, encoder=%s", device, destination,
-             *args.resolution, args.fps, pixel_format, args.encoder)
-    deadline = time.monotonic() + args.duration if args.duration else math.inf
-    total = 0
-    with (CameraPreview(args) if args.preview else nullcontext()) as preview:
-        while not stop.is_set() and time.monotonic() < deadline:
-            code, frames = stream_attempt(command, stop, deadline, args.stall_timeout, preview)
-            total += frames
-            if stop.is_set() or time.monotonic() >= deadline:
-                break
-            if args.no_reconnect:
-                return code if code > 0 else 1
-            LOG.warning("Stream ended (code %s). Retrying in %.1f seconds", code, args.retry_delay)
-            stop.wait(max(0, min(args.retry_delay, deadline-time.monotonic())))
-    LOG.info("Stopped. Encoded frames across attempts: %s", total)
-    return 0 if total or stop.is_set() else 1
+    if args.test_video:
+        info = probe(args.test_video, args.ffprobe)
+        if info["video_codec"] != "mjpeg":
+            raise ValueError("--test-video requires MJPEG video and audio")
+        mode = idle = Mode("mjpeg", info["width"], info["height"], info["fps"])
+    else:
+        args.device, modes, text = choose_device(args, args.v4l2_ctl)
+        if args.list_formats:
+            print(text)
+            return 0
+        features = subprocess.run(
+            [args.ffmpeg, "-hide_banner", "-h", "full"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        if "-isync" not in features:
+            raise ValueError(
+                "FFmpeg with -isync is required on cameras (FFmpeg 5.1+); install a newer build"
+            )
+        mode = select_mode(modes, args.resolution, args.fps, args.input_format)
+        idle = min(
+            (m for m in modes if m.pixel_format == "mjpeg"),
+            key=lambda m: (abs(m.width * m.height - 320 * 240), m.fps),
+            default=mode,
+        )
+    node = Node(args, mode, idle)
+    http = ThreadingHTTPServer((args.host, args.port), handler(node))
+    http.daemon_threads = True
+    LOG.info(
+        "Camera %s: %sx%s @ %s, %s copy + PCM audio. API on port %s",
+        args.name,
+        mode.width,
+        mode.height,
+        mode.fps,
+        mode.pixel_format,
+        args.port,
+    )
 
+    def stop(*_):
+        threading.Thread(target=http.shutdown, daemon=True).start()
 
-def main(argv=None):
-    args = arguments(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    stop = threading.Event()
-    for number in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(number, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
     try:
-        return publish(args, stop)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        LOG.error("%s", exc)
-        return 1
+        http.serve_forever()
+    finally:
+        http.server_close()
+        node.close()
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit(str(exc))

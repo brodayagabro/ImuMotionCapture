@@ -1,1618 +1,776 @@
 #!/usr/bin/env python3
-"""RTSP → pretrained RTMPose → FreeMoCap triangulation → WebGL.
+"""Web controller: camera-local recordings → checked upload → native SkellySync audio synchronization."""
 
-One application file, including the browser UI. See README.md for deployment,
-camera calibration, timing limitations and the JSON/WebSocket contract.
-Python >= 3.11. Run ./setup.sh --device cpu or cuda to install dependencies.
-"""
 from __future__ import annotations
-
 import argparse
-import asyncio
-from bisect import bisect_left
-from collections import deque
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-import importlib.util
+import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
-import itertools
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
-import math
 import os
 from pathlib import Path
 import re
-import socket
 import shutil
+import signal
+import subprocess
 import sys
-import tempfile
 import threading
 import time
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import Request, build_opener, ProxyHandler
 import uuid
 
 HERE = Path(__file__).resolve().parent
-LOG = logging.getLogger("visual-mocap")
-JOINTS = ["nose", "left_eye", "right_eye", "left_ear", "right_ear",
-          "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-          "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee",
-          "right_knee", "left_ankle", "right_ankle"]
-EDGES = [(0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6), (5, 6), (5, 7), (7, 9),
-         (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13),
-         (13, 15), (12, 14), (14, 16)]
+LOG = logging.getLogger("recording-host")
+BUSY = {"preparing", "recording", "stopping", "uploading", "synchronizing"}
 
 
-def default_repos():
-    return HERE / "repositories"
+def save(path, value):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2))
+    temporary.replace(path)
 
 
-def arguments(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--repos", type=Path, default=default_repos())
-    p.add_argument("--camera", action="append", default=[], metavar="NAME=RTSP_URL", help="Repeat for each camera; USB index or video path also accepted")
-    p.add_argument("--config", type=Path, help='JSON: {"cameras": [{"id": "cam1", "source": "rtsp://...", "offset_ms": 0}]}')
-    p.add_argument("--demo", action="store_true", help="Synthetic three-camera demo; no models or real cameras")
-    p.add_argument("--device", default="cuda", help="cuda, cuda:0, cuda:1, ... or cpu (explicit CPU fallback)")
-    p.add_argument("--preset", choices=["lightweight", "balanced", "performance"], default="balanced")
-    p.add_argument("--det-model", help="Optional matching local YOLOX ONNX file")
-    p.add_argument("--pose-model", help="Optional matching 17-joint RTMPose ONNX file")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--fps", type=float, default=20, help="Maximum inference cycles per second, across all cameras")
-    p.add_argument("--preview-width", type=int, default=640)
-    p.add_argument("--confidence", type=float, default=0.4)
-    p.add_argument("--max-skew-ms", type=float, default=50, help="Allowed difference of corrected SERVER RECEPTION times, not exposure times")
-    p.add_argument("--max-age-ms", type=float, default=500)
-    p.add_argument("--max-reprojection-px", type=float, default=12)
-    p.add_argument("--rtsp-transport", choices=["tcp", "udp"], default="tcp")
-    p.add_argument("--calibration", type=Path, default=HERE / "runtime" / "calibration.json")
-    p.add_argument("--calibration-duration", type=float, default=60, help="Maximum calibration recording duration in seconds (1–300); then solve automatically")
-    p.add_argument("--calibration-temp", type=Path, help="Parent for private temporary calibration videos; default: system temporary directory")
-    p.add_argument("--calibration-max-mb", type=int, default=2048, help="Temporary video size limit in MiB; checked once per second")
-    p.add_argument("--board", default="7x5", help="ChArUco board square counts, columns x rows")
-    p.add_argument("--square-m", type=float, default=0.04)
-    p.add_argument("--marker-m", type=float, default=0.03)
-    p.add_argument("--bvh-target", help="Destination HOST:PORT; visual-mocap-bvh/1 protocol")
-    p.add_argument("--bvh-transport", choices=["udp", "tcp"], default="udp")
-    p.add_argument("--bvh-file", type=Path, help="Also record a regular BVH file; finalized on Ctrl+C")
-    p.add_argument("--bvh-units", choices=["m", "cm"], default="cm")
-    p.add_argument("--bvh-warmup", type=int, default=20, help="Fully visible poses used to estimate fixed bone lengths")
-    args = p.parse_args(argv)
-    if not re.fullmatch(r"cpu|cuda(?::\d+)?", args.device):
-        p.error("--device must be cpu or cuda[:GPU_INDEX]")
-    for key in ("fps", "max_skew_ms", "max_age_ms", "max_reprojection_px", "square_m", "marker_m"):
-        if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
-            p.error(f"--{key.replace('_', '-')} must be finite and positive")
-    if args.preview_width < 160 or not 0 < args.confidence <= 1 or not 1 <= args.port <= 65535:
-        p.error("Invalid preview width, confidence or port")
-    if not re.fullmatch(r"\d+x\d+", args.board) or min(map(int, args.board.split("x"))) < 3:
-        p.error("--board must be e.g. 7x5, at least 3x3 squares")
-    if args.marker_m >= args.square_m:
-        p.error("--marker-m must be smaller than --square-m")
-    if args.demo and (args.camera or args.config):
-        p.error("--demo cannot be mixed with real camera sources")
-    if args.bvh_warmup < 1 or not 1 <= args.fps <= 100:
-        p.error("--bvh-warmup must be positive; --fps must be between 1 and 100")
-    if not math.isfinite(args.calibration_duration) or not 1 <= args.calibration_duration <= 300 or args.calibration_max_mb < 16:
-        p.error("--calibration-duration must be 1–300 seconds; --calibration-max-mb must be at least 16")
-    return args
+def checked_name(name):
+    if (
+        not isinstance(name, str)
+        or not re.fullmatch(r"[\w][\w .-]{0,79}", name)
+        or ".." in name
+    ):
+        raise ValueError("Name: 1–80 letters/digits/spaces/_/./-, without .. or paths")
+    return name
 
 
-if __name__ == "__main__":
-    CLI_ARGS = arguments()
-
-try:
-    import cv2
-    import numpy as np
-    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-    from fastapi.responses import HTMLResponse, Response, StreamingResponse
-except ImportError as exc:
-    raise SystemExit(f"Missing dependency: {exc}. Run ./setup.sh --device cpu (or cuda) in the server directory.") from exc
-
-
-@dataclass(frozen=True)
-class Source:
-    id: str
-    source: str | int
-    offset_ms: float = 0.0
-
-
-@dataclass(frozen=True)
-class Frame:
-    sequence: int
-    received: float
-    aligned: float
-    image: np.ndarray
-    synthetic_points: np.ndarray | None = None
-
-
-def camera_sources(args):
-    if args.demo:
-        return [Source(f"cam{i+1}", "synthetic") for i in range(3)]
-    entries = []
-    if args.config:
-        entries.extend(json.loads(args.config.read_text())["cameras"])
-    for item in args.camera:
-        name, separator, source = item.partition("=")
-        if not separator:
-            raise ValueError("Use --camera NAME=RTSP_URL")
-        entries.append({"id": name, "source": source})
-    result = []
-    for entry in entries:
-        name, source = entry["id"], entry["source"]
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", name):
-            raise ValueError("Camera IDs must contain 1–48 ASCII letters, digits, '_' or '-'")
-        if not isinstance(source, (str, int)) or isinstance(source, bool) or source == "":
-            raise ValueError(f"Invalid source for {name}")
-        if isinstance(source, str) and source.isdecimal():
-            source = int(source)
-        offset = float(entry.get("offset_ms", 0))
-        if not math.isfinite(offset):
-            raise ValueError(f"Invalid timing offset for {name}")
-        result.append(Source(name, source, offset))
-    if not result or len({s.id for s in result}) != len(result) or len(result) > 8:
-        raise ValueError("Supply 1–8 uniquely named cameras; 3D needs at least two calibrated cameras")
+def cameras(values):
+    result = {}
+    for value in values:
+        name, sep, url = value.partition("=")
+        parsed = urlsplit(url)
+        if (
+            not sep
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", name)
+            or parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
+            raise ValueError("Use --camera cam1=http://CAMERA_IP:8081")
+        if name in result or url.rstrip("/") in result.values():
+            raise ValueError("Camera names and URLs must be unique")
+        result[name] = url.rstrip("/")
+    if not 2 <= len(result) <= 8:
+        raise ValueError("Configure 2–8 camera nodes")
     return result
 
 
-def load_triangulator(repos):
-    path = repos / "freemocap/freemocap/core/tasks/triangulation/helpers/triangulate_simple.py"
-    if not path.is_file():
-        raise ValueError(f"Missing FreeMoCap triangulation helper: {path}")
-    spec = importlib.util.spec_from_file_location("_freemocap_dlt", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.triangulate_simple
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
 
 
-def checked_calibration(data, ids):
-    if data.get("schema_version") != 1 or data.get("units") != "m":
-        raise ValueError("Calibration requires schema_version=1, units=m")
-    if data.get("extrinsics_convention") != "world_to_camera":
-        raise ValueError("Calibration extrinsics must be world_to_camera: Xc = R @ Xw + t")
-    cameras = {}
-    for name in ids:
-        if name not in data.get("cameras", {}):
-            raise ValueError(f"Calibration missing camera {name}")
-        entry = data["cameras"][name]
-        k = np.asarray(entry["K"], dtype=float)
-        d = np.asarray(entry["D"], dtype=float).reshape(-1)
-        r = np.asarray(entry["R"], dtype=float)
-        t = np.asarray(entry["t"], dtype=float).reshape(-1)
-        size = entry["image_size"]
-        if k.shape != (3, 3) or r.shape != (3, 3) or t.shape != (3,) or d.size not in (4, 5, 8, 12, 14):
-            raise ValueError(f"Invalid matrix dimensions for {name}")
-        if not all(np.isfinite(x).all() for x in (k, d, r, t)):
-            raise ValueError(f"Nonfinite calibration for {name}")
-        if k[0, 0] <= 0 or k[1, 1] <= 0 or not np.allclose(k[2], [0, 0, 1]):
-            raise ValueError(f"Invalid intrinsics for {name}")
-        if not np.allclose(r.T @ r, np.eye(3), atol=1e-4) or not np.isclose(np.linalg.det(r), 1, atol=1e-4):
-            raise ValueError(f"Invalid rotation for {name}")
-        if len(size) != 2 or any(isinstance(x, bool) or not isinstance(x, int) or x < 1 for x in size):
-            raise ValueError(f"Invalid image_size for {name}")
-        cameras[name] = dict(K=k, D=d, R=r, t=t, E=np.column_stack((r, t)), image_size=tuple(size))
-    if len(cameras) < 2:
-        raise ValueError("At least two calibrated cameras are required")
-    centers = [-c["R"].T @ c["t"] for c in cameras.values()]
-    if max(np.linalg.norm(a-b) for a, b in itertools.combinations(centers, 2)) < 1e-4:
-        raise ValueError("Camera centers coincide; 3D cannot be triangulated")
-    return cameras
+def synchronize(folder):
+    """Use the pinned upstream audio pipeline; no pose/calibration/GPU imports."""
+    from skelly_synchronize.core.models import SyncRequest, SyncMethod, VideoBackendKind
+    from skelly_synchronize.core.pipeline.runner import SyncPipeline
+    from skelly_synchronize.core.pipeline.stages import AudioLagStage, ProbeStage
+    import numpy as np
 
+    class CountedProbeStage(ProbeStage):
+        def run(self, context, progress_callback):
+            context = super().run(context, progress_callback)
+            for video in context.videos:
+                # OpenCV estimates MKV frame count from the *container* duration,
+                # including any trailing audio. Our MJPEG/H.264 Matroska recordings
+                # contain one encoded video frame per packet: count those without
+                # decoding full-resolution video or replacing native synchronization.
+                result = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-count_packets",
+                        "-show_entries",
+                        "stream=codec_name,nb_read_packets",
+                        "-of",
+                        "json",
+                        str(video.filepath),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=3600,
+                )
+                stream = json.loads(result.stdout)["streams"][0]
+                if stream["codec_name"] not in ("mjpeg", "h264"):
+                    raise ValueError("Camera recording must contain MJPEG or H.264")
+                video.frame_count = int(stream["nb_read_packets"])
+                if video.frame_count < 12:
+                    raise ValueError(f"{video.video_name}: fewer than 12 video frames")
+            context.videos_before = list(context.videos)
+            return context
 
-def project(points, camera):
-    pixels, _ = cv2.projectPoints(np.asarray(points, dtype=float), camera["R"], camera["t"], camera["K"], camera["D"])
-    return pixels.reshape(-1, 2)
+    class CheckedAudioStage(AudioLagStage):
+        def run(self, context, progress_callback):
+            context = super().run(context, progress_callback)
+            for name, samples in context.audio_signals.items():
+                if (
+                    not len(samples)
+                    or not np.isfinite(samples).all()
+                    or np.max(np.abs(samples)) < 1e-5
+                ):
+                    raise ValueError(
+                        f"{name}: audio is empty/silent; use a common audible clap or speech"
+                    )
+            return context
 
-
-def reconstruct(observations, calibration, triangulate, confidence=0.4, max_error=12):
-    """Triangulate only observed joints; reject poor geometry and reprojection.
-
-    Pair hypotheses make a third camera useful for rejecting an outlier. This
-    is single-person capture: detections with multiple people are excluded.
-    """
-    xyz, errors, scores = [None] * 17, [None] * 17, [0.0] * 17
-    for joint in range(17):
-        views = []
-        for name, (points, likelihood) in observations.items():
-            if name not in calibration or likelihood[joint] < confidence or not np.isfinite(points[joint]).all():
-                continue
-            c = calibration[name]
-            normalized = cv2.undistortPoints(points[joint].reshape(1, 1, 2).astype(float), c["K"], c["D"]).reshape(2)
-            ray = c["R"].T @ np.array([*normalized, 1.0])
-            views.append((name, c, normalized, ray / np.linalg.norm(ray), float(likelihood[joint])))
-        if len(views) < 2:
-            continue
-
-        def fit(indices):
-            selected = [views[i] for i in indices]
-            angles = [math.degrees(math.acos(float(np.clip(np.dot(a[3], b[3]), -1, 1))))
-                      for a, b in itertools.combinations(selected, 2)]
-            if not angles or max(min(a, 180-a) for a in angles) < 1.0:
-                return None
-            with np.errstate(divide="ignore", invalid="ignore"):
-                point = triangulate(points=np.array([v[2] for v in selected]),
-                                    extrinsics_mats=np.array([v[1]["E"] for v in selected]))
-            if not np.isfinite(point).all():
-                return None
-            residuals = []
-            for name, c, _, _, _ in views:
-                camera_point = c["R"] @ point + c["t"]
-                error = np.linalg.norm(project([point], c)[0] - observations[name][0][joint])
-                residuals.append(float(error) if 0.05 < camera_point[2] < 50 else math.inf)
-            return point, np.array(residuals)
-
-        best = None
-        candidates = [tuple(range(len(views))), *itertools.combinations(range(len(views)), 2)]
-        for indices in candidates:
-            fitted = fit(indices)
-            if fitted is None:
-                continue
-            point, residuals = fitted
-            inliers = np.flatnonzero(residuals <= max_error)
-            if len(inliers) < 2:
-                continue
-            rank = (len(inliers), -float(np.mean(residuals[inliers])))
-            if best is None or rank > best[0]:
-                best = rank, inliers
-        if best is None:
-            continue
-        fitted = fit(best[1])
-        if fitted is None or np.any(fitted[1][best[1]] > max_error):
-            continue
-        xyz[joint] = fitted[0].tolist()
-        errors[joint] = float(np.mean(fitted[1][best[1]]))
-        scores[joint] = float(np.mean([views[i][4] for i in best[1]]))
-    return dict(points=xyz, confidence=scores, reprojection_px=errors)
-
-
-def select_frames(histories, now, max_age, max_skew):
-    """Newest group with at least two views within a bounded time window.
-
-    A stalled camera never blocks the others. No unbounded work queue exists.
-    """
-    fresh = {name: [f for f in frames if 0 <= now - f.received <= max_age]
-             for name, frames in histories.items()}
-    fresh = {name: frames for name, frames in fresh.items() if frames}
-    best, best_key = {}, (0, -math.inf, 0)
-    for anchor in sorted({frames[-1].aligned for frames in fresh.values()}, reverse=True):
-        group = {}
-        for name, frames in fresh.items():
-            candidates = [f for f in frames if anchor - max_skew <= f.aligned <= anchor + 1e-9]
-            if candidates:
-                group[name] = max(candidates, key=lambda f: f.aligned)
-        # Prefer a current stereo pair over an older three-camera group.
-        key = min(len(group), 2), anchor, len(group)
-        if key > best_key:
-            best, best_key = group, key
-    return best
-
-
-def jpeg(image, width):
-    if image.shape[1] > width:
-        image = cv2.resize(image, (width, max(1, round(image.shape[0] * width / image.shape[1]))))
-    ok, data = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    if not ok:
-        raise ValueError("JPEG encoding failed")
-    return data.tobytes()
-
-
-def overlay(image, points, scores, threshold):
-    image = image.copy()
-    valid = np.isfinite(points).all(axis=1) & (scores >= threshold)
-    for a, b in EDGES:
-        if valid[a] and valid[b]:
-            cv2.line(image, tuple(points[a].astype(int)), tuple(points[b].astype(int)), (80, 230, 120), 2, cv2.LINE_AA)
-    for point in points[valid]:
-        cv2.circle(image, tuple(point.astype(int)), 4, (40, 180, 255), -1, cv2.LINE_AA)
-    return image
-
-
-def demo_calibration(ids):
-    cameras = {}
-    for i, name in enumerate(ids):
-        angle = math.radians((i - 1) * 35)
-        r, _ = cv2.Rodrigues(np.array([0, angle, 0], dtype=float))
-        cameras[name] = dict(K=[[700, 0, 400], [0, 700, 380], [0, 0, 1]], D=[0]*5,
-                             R=r.tolist(), t=[0, 0, 4], image_size=[800, 600])
-    return dict(schema_version=1, units="m", extrinsics_convention="world_to_camera",
-                world_frame="synthetic: X right, Y down, Z forward", cameras=cameras)
-
-
-def demo_points(t):
-    points = np.array([[0,-1.7,0],[-.035,-1.74,-.02],[.035,-1.74,-.02],[-.08,-1.7,0],[.08,-1.7,0],
-                       [-.22,-1.45,0],[.22,-1.45,0],[-.38,-1.15,0],[.38,-1.15,0],
-                       [-.5,-.9,0],[.5,-.9,0],[-.16,-.85,0],[.16,-.85,0],
-                       [-.16,-.45,0],[.16,-.45,0],[-.16,0,0],[.16,0,0]], dtype=float)
-    points[:, 0] += .2 * math.sin(t * .6)
-    points[9, 1] -= .55 * (1 + math.sin(t * 1.5))
-    points[7, 1] -= .25 * (1 + math.sin(t * 1.5))
-    points[10, 2] += .3 * math.sin(t)
-    return points
-
-
-class Camera:
-    def __init__(self, source, stop, width, demo_camera=None):
-        self.source, self.stop, self.width = source, stop, width
-        self.demo_camera = demo_camera
-        self.lock = threading.Lock()
-        self.frames = deque(maxlen=8)
-        self.preview = None
-        self.status = "connecting"
-        self.sequence = 0
-        self.fps = 0.0
-        self.last_jpeg = 0.0
-        self.thread = threading.Thread(target=self.run, name=f"camera-{source.id}", daemon=True)
-
-    def history(self):
-        with self.lock:
-            return list(self.frames)
-
-    def stats(self, now):
-        with self.lock:
-            frame = self.frames[-1] if self.frames else None
-            age = (now - frame.received) * 1000 if frame else None
-            return dict(id=self.source.id, status=self.status, fps=round(self.fps, 1),
-                        age_ms=round(age, 1) if age is not None else None,
-                        sequence=frame.sequence if frame else None,
-                        size=[frame.image.shape[1], frame.image.shape[0]] if frame else None)
-
-    def publish(self, image, synthetic=None):
-        now = time.monotonic()
-        self.sequence += 1
-        frame = Frame(self.sequence, now, now + self.source.offset_ms / 1000, image, synthetic)
-        encoded = jpeg(image, self.width) if now - self.last_jpeg >= 1/15 else None
-        with self.lock:
-            if self.frames:
-                interval = now - self.frames[-1].received
-                self.fps = .9 * self.fps + .1 / max(interval, .001)
-            self.frames.append(frame)
-            self.status = "online"
-            if encoded:
-                self.preview = (self.sequence, now, encoded)
-                self.last_jpeg = now
-
-    def run(self):
-        if self.demo_camera:
-            while not self.stop.is_set():
-                started = time.monotonic()
-                points = project(demo_points(started), self.demo_camera)
-                image = np.full((600, 800, 3), (32, 27, 22), dtype=np.uint8)
-                image = overlay(image, points, np.ones(17), .4)
-                cv2.putText(image, "SYNTHETIC DEMO", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, .8, (180, 190, 200), 2)
-                self.publish(image, points)
-                self.stop.wait(max(0, 1/30 - (time.monotonic() - started)))
-            return
-        while not self.stop.is_set():
-            cap = None
-            try:
-                source = self.source.source
-                is_file = isinstance(source, str) and "://" not in source and Path(source).is_file()
-                if isinstance(source, int):
-                    cap = cv2.VideoCapture(source)
-                else:
-                    cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG,
-                        [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000])
-                if not cap.isOpened():
-                    raise OSError("Could not open stream")
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                file_fps = cap.get(cv2.CAP_PROP_FPS)
-                file_fps = file_fps if math.isfinite(file_fps) and 0 < file_fps < 500 else 30
-                deadline = time.monotonic()
-                while not self.stop.is_set():
-                    ok, image = cap.read()
-                    if not ok or image is None:
-                        break
-                    self.publish(image)
-                    if is_file:
-                        deadline += 1/file_fps
-                        self.stop.wait(max(0, deadline-time.monotonic()))
-            except Exception:
-                # Do not echo RTSP URLs/passwords into the browser or our logs.
-                LOG.warning("Camera %s disconnected; retrying", self.source.id)
-            finally:
-                if cap is not None:
-                    cap.release()
-                with self.lock:
-                    self.status = "reconnecting"
-                    self.frames.clear()
-                    self.preview = None
-            self.stop.wait(1)
-
-
-class PoseModel:
-    def __init__(self, args):
-        root = (args.repos / "rtmlib").resolve()
-        if not (root / "rtmlib/__init__.py").is_file():
-            raise ValueError(f"Missing RTMlib checkout: {root}")
-        sys.path.insert(0, str(root))
-        os.environ.setdefault("TORCH_HOME", str(HERE / ".cache" / "rtmlib"))
-        import onnxruntime as ort
-        if args.device.startswith("cuda"):
-            if hasattr(ort, "preload_dlls"):
-                ort.preload_dlls(directory="")
-            if "CUDAExecutionProvider" not in ort.get_available_providers():
-                raise RuntimeError("CUDAExecutionProvider unavailable. Use ./setup.sh --device cuda and a supported NVIDIA driver; --device cpu is explicit CPU mode.")
-        from rtmlib import Body
-        config = Body.MODE[args.preset]
-        self.body = Body(mode=args.preset, backend="onnxruntime", device=args.device,
-                         det=args.det_model, pose=args.pose_model,
-                         det_input_size=config["det_input_size"], pose_input_size=config["pose_input_size"])
-        self.providers = {}
-        for name, tool in (("detector", self.body.det_model), ("pose", self.body.pose_model)):
-            providers = tool.session.get_providers()
-            if args.device.startswith("cuda") and "CUDAExecutionProvider" not in providers:
-                raise RuntimeError(f"{name}: CUDA initialization failed; refusing silent CPU fallback")
-            tool.session.disable_fallback()
-            self.providers[name] = providers
-
-    def infer(self, frame):
-        boxes = self.body.det_model(frame.image)
-        # RTMPose itself treats [] as a full-image box. Do not hallucinate a
-        # person when the detector found nobody; do not merge different people.
-        if len(boxes) != 1:
-            return np.zeros((17, 2)), np.zeros(17), len(boxes)
-        points, scores = self.body.pose_model(frame.image, bboxes=boxes)
-        if points.shape != (1, 17, 2) or scores.shape != (1, 17):
-            raise ValueError("Expected a COCO-17 RTMPose model")
-        scores = np.where(np.isfinite(scores[0]) & np.isfinite(points[0]).all(axis=1), scores[0], 0)
-        return np.nan_to_num(points[0]), scores, 1
-
-
-def load_bvh_module():
-    path = next((parent / "host/storage/bvh.py" for parent in HERE.parents
-                 if (parent / "host/storage/bvh.py").is_file()), None)
-    if path is None:
-        raise ValueError("Missing ImuMotionCapture/host/storage/bvh.py; keep the server inside the full repository")
-    name = "_visual_mocap_host_bvh"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def rotation_between(a, b):
-    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
-    if min(np.linalg.norm(a), np.linalg.norm(b)) < 1e-8:
-        raise ValueError("Degenerate bone direction")
-    a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
-    cross = np.cross(a, b)
-    cosine = float(np.clip(a @ b, -1, 1))
-    if cosine < -1 + 1e-8:
-        axis = np.cross(a, np.eye(3)[np.argmin(np.abs(a))])
-        axis /= np.linalg.norm(axis)
-        return 2 * np.outer(axis, axis) - np.eye(3)
-    skew = np.array([[0, -cross[2], cross[1]], [cross[2], 0, -cross[0]], [-cross[1], cross[0], 0]])
-    return np.eye(3) + skew + skew @ skew / max(1 + cosine, 1e-8)
-
-
-def body_basis(right, up):
-    x = right / max(np.linalg.norm(right), 1e-12)
-    y = up - x * (x @ up)
-    if min(np.linalg.norm(right), np.linalg.norm(y)) < 1e-6:
-        raise ValueError("Degenerate torso geometry")
-    y /= np.linalg.norm(y)
-    return np.column_stack((x, y, np.cross(x, y)))
-
-
-def bvh_hierarchy(recording, module):
-    lines, order = ["HIERARCHY"], []
-
-    def vector(values):
-        return " ".join(f"{v:.8f}" for v in recording.units_per_meter * module.TO_BVH @ values)
-
-    def emit(index, depth):
-        joint = recording.joints[index]
-        pad = "  " * depth
-        order.append(index)
-        lines.extend([f"{pad}{'ROOT' if index == 0 else 'JOINT'} {joint.name}", pad + "{",
-                      pad + "  OFFSET " + vector(joint.offset),
-                      pad + "  CHANNELS " + ("6 Xposition Yposition Zposition " if index == 0 else "3 ") + "Zrotation Xrotation Yrotation"])
-        children = [i for i, j in enumerate(recording.joints) if j.parent == index]
-        for child in children:
-            emit(child, depth + 1)
-        if not children:
-            lines.extend([pad + "  End Site", pad + "  {", pad + "    OFFSET " + vector(joint.end), pad + "  }"])
-        lines.append(pad + "}")
-
-    emit(0, 0)
-    return "\n".join(lines) + "\n", order
-
-
-class BvhFile:
-    """Bounded-memory BVH writer, regular time grid with last-pose hold."""
-    def __init__(self, path, hierarchy, fps):
-        self.path, self.fps = path, fps
-        if path.exists():
-            raise ValueError(f"BVH output already exists: {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.temporary = path.with_name(path.name + ".part")
-        self.file = self.temporary.open("x", encoding="ascii", newline="\n")
-        self.file.write(hierarchy + "MOTION\nFrames: ")
-        self.count_position = self.file.tell()
-        self.file.write(f"{0:012d}\nFrame Time: {1/fps:.12f}\n")
-        self.count = 0
-        self.origin = None
-        self.previous = None
-        self.last_flush = time.monotonic()
-
-    def append(self, timestamp, channels):
-        if self.origin is None:
-            self.origin = timestamp
-            self.previous = channels
-        # No gap is silently compressed: missing measurements are held in
-        # the file. The network frames retain their original timestamps.
-        while self.origin + self.count / self.fps <= timestamp + 1e-8:
-            values = channels if abs(self.origin + self.count/self.fps - timestamp) < 1e-8 else self.previous
-            self.file.write(" ".join(f"{v:.8f}" for v in values) + "\n")
-            self.count += 1
-        self.previous = channels
-        if time.monotonic() - self.last_flush > 1:
-            self.file.flush()
-            self.last_flush = time.monotonic()
-
-    def close(self):
-        self.file.seek(self.count_position)
-        self.file.write(f"{self.count:012d}")
-        self.file.flush()
-        self.file.close()
-        self.temporary.replace(self.path)
-
-
-def bvh_rig(measurements):
-    """Fixed rest offsets, in BVH metres; shared by export and the idle armature."""
-    torso, shoulders, hips, head, la, lf, ra, rf, lt, ls, rt, rs = measurements
-    specs = [
-        ("Hips", None, (0,0,0)), ("Spine", 0, (0,0,0)), ("Chest", 1, (0,torso,0)),
-        ("Head", 2, (0,head,0)), ("LeftArm", 2, (-shoulders/2,0,0)),
-        ("LeftForeArm", 4, (-la,0,0)), ("LeftHand", 5, (-lf,0,0)),
-        ("RightArm", 2, (shoulders/2,0,0)), ("RightForeArm", 7, (ra,0,0)),
-        ("RightHand", 8, (rf,0,0)), ("LeftUpLeg", 0, (-hips/2,0,0)),
-        ("LeftLeg", 10, (0,-lt,0)), ("LeftFoot", 11, (0,-ls,0)),
-        ("RightUpLeg", 0, (hips/2,0,0)), ("RightLeg", 13, (0,-rt,0)),
-        ("RightFoot", 14, (0,-rs,0)),
+    output = folder / "synchronized_videos"
+    report = folder / "sync_result.json"
+    if report.is_file():
+        return json.loads(report.read_text())
+    if output.exists():
+        # Preserve outputs of an interrupted previous attempt for diagnosis.
+        output.rename(folder / ("incomplete-sync-" + uuid.uuid4().hex[:8]))
+    request = SyncRequest(
+        raw_video_folder_path=folder / "raw_videos",
+        synchronized_video_folder_path=output,
+        method=SyncMethod.AUDIO,
+        video_handler=VideoBackendKind.FFMPEG,
+        create_debug_artifacts=True,
+    )
+    pipeline = SyncPipeline.for_request(request)
+    pipeline.stages = [
+        CheckedAudioStage()
+        if isinstance(stage, AudioLagStage)
+        else CountedProbeStage()
+        if isinstance(stage, ProbeStage)
+        else stage
+        for stage in pipeline.stages
     ]
-    return [dict(name=name, parent=parent, offset=offset,
-                 end=(0,.1,0) if name == "Head" else (-.1,0,0) if name == "LeftHand"
-                 else (.1,0,0) if name == "RightHand" else (0,0,.12) if name.endswith("Foot") else None)
-            for name, parent, offset in specs]
+    result = pipeline.run(
+        request,
+        progress_callback=lambda name, fraction: save(
+            folder / "progress.json", dict(stage=name, fraction=fraction)
+        ),
+    )
+    if result.synchronized_frame_count < 12:
+        raise ValueError(
+            "Less than 12 synchronized frames; record longer overlapping videos"
+        )
+    value = result.model_dump(mode="json")
+    value.update(
+        method="skellysync_audio",
+        package_commit="0231c41a3bcb967e231163943a39dd40b50278f1",
+    )
+    save(report, value)
+    return value
 
 
-def armature_geometry(rig, channels, tracked):
-    """Forward kinematics of the exported ZXY channels, including End Sites.
-
-    Channels and offsets are in metres here. Bone frames keep octahedron
-    cross-sections attached to the parent rotation, as in human_canvas_gl.py.
-    """
-    positions, rotations, bones = [], [], []
-    for i, joint in enumerate(rig):
-        z, x, y = np.radians(channels[3+3*i:6+3*i])
-        cz, sz, cx, sx, cy, sy = np.cos(z), np.sin(z), np.cos(x), np.sin(x), np.cos(y), np.sin(y)
-        local = (np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]]) @
-                 np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]]) @
-                 np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]]))
-        parent = joint["parent"]
-        if parent is None:
-            position, rotation = np.asarray(channels[:3]) + joint["offset"], local
-        else:
-            position = positions[parent] + rotations[parent] @ joint["offset"]
-            rotation = rotations[parent] @ local
-            if np.linalg.norm(joint["offset"]) > 1e-8:
-                bones.append(dict(name=rig[parent]["name"]+":"+joint["name"],
-                                  start=positions[parent].tolist(), end=position.tolist(),
-                                  axes=rotations[parent].T.tolist(), tracked=bool(tracked[parent])))
-        positions.append(position)
-        rotations.append(rotation)
-        if joint["end"] is not None:
-            bones.append(dict(name=joint["name"]+":End", start=position.tolist(),
-                              end=(position + rotation @ joint["end"]).tolist(),
-                              axes=rotation.T.tolist(), tracked=bool(tracked[i])))
-    return dict(joint_names=[j["name"] for j in rig], points=[p.tolist() for p in positions], bones=bones)
-
-
-class ArmatureView:
-    """Display-only state: T-pose, three fresh BVH frames, then last-pose hold.
-
-    Never generates or changes outbound BVH. All methods use Engine.bvh_lock.
-    """
-    def __init__(self, max_age_s):
-        self.max_age_s = max_age_s
-        self.identity = None
-        self.rig = bvh_rig((.5,.4,.28,.22,.28,.25,.28,.25,.42,.42,.42,.42))
-        self.geometry = self.rest_geometry()
-        self.last_timestamp = None
-        self.last_frame = -1
-        self.display_timestamp = None
-        self.display_frame = None
-        self.consecutive = 0
-        self.live = False
-
-    def rest_geometry(self):
-        channels = np.zeros(3+3*len(self.rig))
-        geometry = armature_geometry(self.rig, channels, [False]*len(self.rig))
-        channels[1] = -min(p[1] for p in geometry["points"])
-        return armature_geometry(self.rig, channels, [False]*len(self.rig))
-
-    def update(self, adapter, frame, now):
-        self.live = False
-        if frame is None:
-            self.consecutive = 0
-            return
-        identity = (adapter.metadata["stream_id"], adapter.metadata["skeleton_id"])
-        if identity != self.identity:
-            self.__init__(self.max_age_s)
-            self.identity = identity
-            order = adapter.order
-            index = {original: i for i, original in enumerate(order)}
-            self.rig = [dict(name=j.name, parent=index.get(j.parent),
-                             offset=adapter.module.TO_BVH @ np.array(j.offset),
-                             end=adapter.module.TO_BVH @ np.array(j.end) if np.linalg.norm(j.end) else None)
-                        for j in (adapter.recording.joints[i] for i in order)]
-            self.geometry = self.rest_geometry()
-        timestamp, frame_id = frame["timestamp_monotonic_s"], frame["frame_id"]
-        channels = np.asarray(frame["channels"], dtype=float)
-        if (not np.isfinite(timestamp) or not 0 <= now-timestamp <= self.max_age_s
-                or channels.shape != (3+3*len(self.rig),) or not np.isfinite(channels).all()
-                or len(frame["tracked"]) != len(self.rig)
-                or frame_id <= self.last_frame
-                or (self.last_timestamp is not None and timestamp <= self.last_timestamp)):
-            self.consecutive = 0
-            return
-        if self.last_timestamp is not None and timestamp-self.last_timestamp > self.max_age_s:
-            self.consecutive = 0
-        self.last_timestamp, self.last_frame = timestamp, frame_id
-        self.consecutive += 1
-        if self.consecutive < 3:
-            return
-        if adapter.metadata["units"] == "cm":
-            channels[:3] /= 100
-        self.geometry = armature_geometry(self.rig, channels, frame["tracked"])
-        self.display_timestamp, self.display_frame = timestamp, frame_id
-        self.live = True
-
-    def snapshot(self, now):
-        age = now-self.display_timestamp if self.display_timestamp is not None else None
-        live = self.live and age is not None and age <= self.max_age_s
-        status = "live" if live else "held" if age is not None else "waiting" if self.identity else "rest"
-        return dict(**self.geometry, status=status, units="m", rotation_order="ZXY",
-                    rig_id=":".join(self.identity) if self.identity else "preview",
-                    frame_id=self.display_frame, age_ms=age*1000 if age is not None else None,
-                    consecutive_frames=self.consecutive, required_frames=3, max_age_ms=self.max_age_s*1000)
-
-
-class BvhAdapter:
-    """COCO-17 positions → fixed skeleton → host BVH channel convention.
-
-    Swing-only limb fitting is deliberate: axial twist, wrist and foot
-    orientations cannot be measured from these landmarks. Missing limbs
-    hold their previous LOCAL rotation and are explicitly marked untracked.
-    """
-    def __init__(self, args):
-        self.args, self.module = args, load_bvh_module()
-        self.samples = []
-        self.recording = None
-        self.metadata = None
-        self.writer = None
-        self.file_error = None
-        self.previous_local = {}
-        self.stream_id = str(uuid.uuid4())
-        self.status = "waiting_for_3d"
-        self.axis = np.diag([1., -1., -1.])  # camera-world → BVH (Y up)
-
-    def initialize(self, measurements):
-        t = self.module.TO_BVH
-        joints = []
-        for joint in bvh_rig(measurements):
-            name = joint["name"]
-            end = joint["end"] or (0,0,0)
-            joints.append(self.module.Joint(name, joint["parent"], tuple(t.T @ joint["offset"]), name, tuple(t.T @ end)))
-        self.recording = self.module.BvhRecording(joints, [0,0,0], fps=self.args.fps,
-                                                  units_per_meter=100 if self.args.bvh_units == "cm" else 1)
-        hierarchy, self.order = bvh_hierarchy(self.recording, self.module)
-        channel_names = ["Hips.Xposition", "Hips.Yposition", "Hips.Zposition"]
-        channel_names += [f"{joints[i].name}.{axis}rotation" for i in self.order for axis in "ZXY"]
-        self.metadata = dict(protocol="visual-mocap-bvh/1", type="skeleton", stream_id=self.stream_id,
-                             skeleton_id=hashlib.sha256(hierarchy.encode()).hexdigest()[:16], hierarchy=hierarchy,
-                             channel_names=channel_names, joint_names=[joints[i].name for i in self.order],
-                             units=self.args.bvh_units, nominal_fps=self.args.fps, rotation_order="ZXY",
-                             axes="X right, Y up, Z backward relative to calibration world",
-                             orientation_method="torso basis + limb shortest-arc swing; axial twist unmeasured",
-                             unmeasured_joints=["LeftHand", "RightHand", "LeftFoot", "RightFoot"])
-        if self.args.bvh_file:
-            try:
-                self.writer = BvhFile(self.args.bvh_file, hierarchy, self.args.fps)
-            except (OSError, ValueError) as exc:
-                self.file_error = str(exc)
-
-    def update(self, skeleton, timestamp, frame_id):
-        if self.recording and self.recording.times and timestamp <= self.recording.times[-1]:
-            self.status = "waiting_for_new_timestamp"
-            return None
-        points = [self.axis @ p if p is not None else None for p in skeleton["points"]]
-        if any(points[i] is None for i in (5,6,11,12)):
-            self.status = "torso_not_tracked"
-            return None
-        hips = (points[11]+points[12])/2
-        chest = (points[5]+points[6])/2
-        try:
-            hip_basis = body_basis(points[12]-points[11], chest-hips)
-            chest_basis = body_basis(points[6]-points[5], chest-hips)
-        except ValueError:
-            self.status = "degenerate_torso"
-            return None
-        if self.recording is None:
-            needed = [0,5,6,7,8,9,10,11,12,13,14,15,16]
-            if any(points[i] is None for i in needed):
-                self.status = "warmup_requires_full_body"
-                return None
-            lengths = [np.linalg.norm(chest-hips), np.linalg.norm(points[6]-points[5]),
-                       np.linalg.norm(points[12]-points[11]), np.linalg.norm(points[0]-chest)]
-            lengths += [np.linalg.norm(points[a]-points[b]) for a,b in ((5,7),(7,9),(6,8),(8,10),(11,13),(13,15),(12,14),(14,16))]
-            if min(lengths) < .05 or max(lengths) > 1.2:
-                self.status = "implausible_body_dimensions"
-                return None
-            self.samples.append(lengths)
-            if len(self.samples) < self.args.bvh_warmup:
-                self.status = f"warmup_{len(self.samples)}_of_{self.args.bvh_warmup}"
-                return None
-            self.initialize(np.median(self.samples, axis=0))
-            self.samples.clear()
-        world = {"Hips": hip_basis, "Spine": chest_basis, "Chest": chest_basis}
-        tracked = {"Hips": True, "Spine": True, "Chest": True}
-
-        def fit(name, parent, rest, start, end):
-            valid = start is not None and end is not None and np.linalg.norm(end-start) > .02
-            rotation = rotation_between(world[parent] @ rest, end-start) @ world[parent] if valid else world[parent] @ self.previous_local.get(name, np.eye(3))
-            world[name], tracked[name] = rotation, bool(valid)
-
-        fit("Head", "Chest", np.array([0.,1,0]), chest, points[0])
-        for side, sign, shoulder, elbow, wrist, hip, knee, ankle in (
-            ("Left",-1,5,7,9,11,13,15), ("Right",1,6,8,10,12,14,16)):
-            fit(side+"Arm", "Chest", np.array([sign,0.,0]), points[shoulder], points[elbow])
-            fit(side+"ForeArm", side+"Arm", np.array([sign,0.,0]), points[elbow], points[wrist])
-            world[side+"Hand"] = world[side+"ForeArm"]
-            tracked[side+"Hand"] = False
-            fit(side+"UpLeg", "Hips", np.array([0.,-1,0]), points[hip], points[knee])
-            fit(side+"Leg", side+"UpLeg", np.array([0.,-1,0]), points[knee], points[ankle])
-            world[side+"Foot"] = world[side+"Leg"]
-            tracked[side+"Foot"] = False
-        for joint in self.recording.joints:
-            parent = np.eye(3) if joint.parent is None else world[self.recording.joints[joint.parent].name]
-            self.previous_local[joint.name] = parent.T @ world[joint.name]
-        t = self.module.TO_BVH
-        self.recording.append(timestamp, {name:t.T @ rotation @ t for name,rotation in world.items()}, root_position=t.T @ hips)
-        raw = self.recording.frames[-1]
-        channels = list(raw[:3]) + [v for i in self.order for v in raw[3+i*3:6+i*3]]
-        # Keep only continuity state. Recording to disk is incremental.
-        self.recording.frames[:] = self.recording.frames[-1:]
-        self.recording.times[:] = self.recording.times[-1:]
-        if self.writer:
-            try:
-                self.writer.append(timestamp, channels)
-            except OSError as exc:
-                self.file_error = str(exc)
-                self.writer.file.close()
-                self.writer = None
-        self.status = "streaming_pose"
-        return dict(protocol="visual-mocap-bvh/1", type="frame", stream_id=self.stream_id,
-                    skeleton_id=self.metadata["skeleton_id"], frame_id=frame_id,
-                    timestamp_monotonic_s=timestamp, channels=[round(float(v), 6) for v in channels],
-                    tracked=[tracked[self.recording.joints[i].name] for i in self.order])
-
-    def close(self):
-        if self.writer:
-            self.writer.close()
-            self.writer = None
-
-
-def parse_target(target):
-    host, separator, port = target.rpartition(":")
-    if not separator or not host or not port.isdecimal() or not 1 <= int(port) <= 65535:
-        raise ValueError("--bvh-target must be HOST:PORT (IPv6: [ADDRESS]:PORT)")
-    return host.strip("[]"), int(port)
-
-
-class BvhSender:
-    """Latest-frame sender: reconnects never block capture or inference."""
-    def __init__(self, target, transport, stop):
-        self.target, self.transport, self.stop = target, transport, stop
-        self.address = parse_target(target) if target else None
-        self.lock = threading.Lock()
-        self.wake = threading.Event()
-        self.pending = None
-        self.sent = 0
-        self.error = None
-        self.thread = threading.Thread(target=self.run, name="bvh-network", daemon=True)
-
-    def submit(self, metadata, frame):
-        if self.address:
-            with self.lock:
-                self.pending = (metadata, frame, time.monotonic())
-            self.wake.set()
-
-    def stats(self):
-        with self.lock:
-            return dict(enabled=bool(self.address), target=self.target, transport=self.transport,
-                        sent=self.sent, error=self.error, protocol="visual-mocap-bvh/1")
-
-    def run(self):
-        if not self.address:
-            return
-        connection, last_header, known_id = None, 0.0, None
-        while not self.stop.is_set():
-            self.wake.wait(.2)
-            self.wake.clear()
-            with self.lock:
-                pending, self.pending = self.pending, None
-            if not pending:
-                continue
-            metadata, frame, queued = pending
-            try:
-                if connection is None:
-                    kind = socket.SOCK_DGRAM if self.transport == "udp" else socket.SOCK_STREAM
-                    family, kind, protocol, _, remote = socket.getaddrinfo(*self.address, type=kind)[0]
-                    connection = socket.socket(family, kind, protocol)
-                    connection.settimeout(1)
-                    connection.connect(remote)
-                    last_header, known_id = 0.0, None
-                if time.monotonic() - queued > .5:
-                    continue
-                messages = []
-                identity = (metadata["stream_id"], metadata["skeleton_id"]) if metadata else None
-                if metadata and (identity != known_id or self.transport == "udp" and time.monotonic()-last_header > 2):
-                    messages.append(metadata)
-                messages.append(frame)
-                for message in messages:
-                    payload = json.dumps(message, separators=(",", ":"), allow_nan=False).encode()
-                    if self.transport == "udp":
-                        if len(payload) > 60000:
-                            raise ValueError("BVH datagram exceeds maximum size")
-                        connection.send(payload)
-                    else:
-                        connection.sendall(payload + b"\n")
-                    if message is metadata:
-                        last_header, known_id = time.monotonic(), identity
-                with self.lock:
-                    self.sent += 1
-                    self.error = None
-            except (OSError, ValueError) as exc:
-                with self.lock:
-                    self.error = str(exc)
-                if connection:
-                    connection.close()
-                    connection = None
-                self.stop.wait(.5)
-        if connection:
-            connection.close()
-
-
-class CalibrationSession:
-    def __init__(self, args):
-        cols, rows = map(int, args.board.split("x"))
-        if (cols * rows) // 2 > 50:
-            raise ValueError("Board is too large for DICT_4X4_50")
-        self.board = cv2.aruco.CharucoBoard((cols, rows), args.square_m, args.marker_m,
-                                          cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
-        self.detector = cv2.aruco.CharucoDetector(self.board)
-        self.samples = []
-        self.lock = threading.Lock()
-        self.last_sequences = None
-
-    def capture(self, frames, all_ids, distinct=False):
-        with self.lock:
-            if set(frames) != set(all_ids):
-                raise ValueError("All cameras need fresh frames within the time tolerance")
-            sequences = tuple(frames[name].sequence for name in all_ids)
-            if sequences == self.last_sequences:
-                raise ValueError("These frames were already captured")
-            if len(self.samples) >= 60:
-                raise ValueError("Maximum 60 calibration samples")
-            sample = {}
-            for name, frame in frames.items():
-                corners, ids, _, _ = self.detector.detectBoard(frame.image)
-                if ids is None or len(ids) < 8:
-                    raise ValueError(f"{name}: at least 8 ChArUco corners must be visible")
-                sample[name] = dict(ids=ids.reshape(-1), corners=corners.reshape(-1, 2),
-                                    size=(frame.image.shape[1], frame.image.shape[0]))
-            if distinct:
-                for name in all_ids[1:]:
-                    if len(np.intersect1d(sample[all_ids[0]]["ids"], sample[name]["ids"])) < 8:
-                        raise ValueError("At least 8 common corners must be visible in every camera pair with the reference")
-                for previous in self.samples:
-                    differences = []
-                    for name in all_ids:
-                        a, b = previous[name], sample[name]
-                        common, ia, ib = np.intersect1d(a["ids"], b["ids"], return_indices=True)
-                        differences.append(float(np.median(np.linalg.norm(a["corners"][ia]-b["corners"][ib], axis=1))) /
-                                           math.hypot(*b["size"]) if len(common) >= 8 else math.inf)
-                    if max(differences) < .01:
-                        raise ValueError("Repeated board pose; move and tilt the board")
-            self.samples.append(sample)
-            self.last_sequences = sequences
-            return len(self.samples)
-
-    def solve(self, all_ids):
-        with self.lock:
-            if len(self.samples) < 12:
-                raise ValueError("Video needs at least 12 distinct board poses visible in all cameras; record again while moving and tilting the board")
-            objects = self.board.getChessboardCorners()
-            cameras, rms = {}, {}
-            for name in all_ids:
-                views = [sample[name] for sample in self.samples]
-                size = views[0]["size"]
-                if any(v["size"] != size for v in views):
-                    raise ValueError(f"{name}: resolution changed during calibration")
-                object_points = [objects[v["ids"]].astype(np.float32) for v in views]
-                image_points = [v["corners"].astype(np.float32) for v in views]
-                error, k, d, _, _ = cv2.calibrateCamera(object_points, image_points, size, None, None)
-                if not math.isfinite(error) or error > 3:
-                    raise ValueError(f"{name}: calibration RMS {error:.2f}px > 3px. Capture more varied, sharp board poses.")
-                cameras[name] = dict(K=k.tolist(), D=d.reshape(-1).tolist(), R=np.eye(3).tolist(), t=[0., 0., 0.], image_size=list(size))
-                rms[name] = float(error)
-            reference = all_ids[0]
-            for name in all_ids[1:]:
-                objects_shared, left, right = [], [], []
-                for sample in self.samples:
-                    a, b = sample[reference], sample[name]
-                    common, ia, ib = np.intersect1d(a["ids"], b["ids"], return_indices=True)
-                    if len(common) >= 8:
-                        objects_shared.append(objects[common].astype(np.float32))
-                        left.append(a["corners"][ia].astype(np.float32))
-                        right.append(b["corners"][ib].astype(np.float32))
-                if len(objects_shared) < 12:
-                    raise ValueError(f"{reference}/{name}: need 12 poses with 8 common corners")
-                a, b = cameras[reference], cameras[name]
-                error, _, _, _, _, r, t, _, _ = cv2.stereoCalibrate(
-                    objects_shared, left, right, np.array(a["K"]), np.array(a["D"]),
-                    np.array(b["K"]), np.array(b["D"]), tuple(a["image_size"]), flags=cv2.CALIB_FIX_INTRINSIC,
-                    criteria=(cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 100, 1e-7))
-                if not math.isfinite(error) or error > 3:
-                    raise ValueError(f"{reference}/{name}: stereo RMS {error:.2f}px > 3px; check timing and board poses")
-                b.update(R=r.tolist(), t=t.reshape(-1).tolist())
-                rms[f"{reference}/{name}"] = float(error)
-            return dict(schema_version=1, units="m", extrinsics_convention="world_to_camera",
-                        world_frame=f"{reference}: X right, Y down, Z forward", cameras=cameras,
-                        rms_px=rms, board=dict(squares=list(self.board.getChessboardSize()),
-                        square_m=float(self.board.getSquareLength()), marker_m=float(self.board.getMarkerLength())))
-
-
-def calibration_video_groups(rows, all_ids, max_skew_s):
-    """Match recorded frames by corrected receive time, never by AVI index/FPS."""
-    if any(not rows[name] for name in all_ids):
-        raise ValueError("No recorded frames from one or more cameras")
-    times = {name: [r["aligned"] for r in rows[name]] for name in all_ids}
-    if any(any(b <= a for a, b in zip(t, t[1:])) for t in times.values()):
-        raise ValueError("Nonmonotonic calibration video timestamps")
-    groups, previous, last_time = [], dict.fromkeys(all_ids, -1), -math.inf
-    reference = all_ids[0]
-    for index, timestamp in enumerate(times[reference]):
-        if timestamp-last_time < .5:
-            continue
-        group = {reference: index}
-        for name in all_ids[1:]:
-            right = bisect_left(times[name], timestamp)
-            candidates = [i for i in (right-1, right) if previous[name] < i < len(times[name])]
-            if candidates:
-                group[name] = min(candidates, key=lambda i: abs(times[name][i]-timestamp))
-        if len(group) != len(all_ids):
-            continue
-        stamps = [times[name][i] for name, i in group.items()]
-        if max(stamps)-min(stamps) > max_skew_s:
-            continue
-        groups.append(group)
-        previous, last_time = group, timestamp
-    # Spread detection work over the whole recording; keep CPU/memory bounded.
-    return [groups[i] for i in np.linspace(0, len(groups)-1, min(240, len(groups)), dtype=int)]
-
-
-class CalibrationCancelled(Exception):
-    pass
-
-
-class VideoCalibration:
-    """Owns one temporary recording, offline detection/solve, and cleanup.
-
-    Reads existing camera buffers independently of inference. The worker owns
-    all video files; HTTP actions only set events. No camera module changes.
-    """
-    def __init__(self, args, ids, histories, apply):
-        self.args, self.ids, self.histories, self.apply = args, ids, histories, apply
-        self.lock = threading.Lock()
-        self.finish = threading.Event()
-        self.cancelled = threading.Event()
-        self.thread = None
-        self.active = False
-        self.started = None
-        self.state = dict(status="idle", seconds=0., frames=dict.fromkeys(ids, 0),
-                          dropped_frames=dict.fromkeys(ids, 0), samples=0, candidates=0, processed=0,
-                          error=None, last_rejection=None, rms_px=None, temporary_files_removed=True)
-
-    def snapshot(self):
-        with self.lock:
-            state = dict(self.state, frames=dict(self.state["frames"]),
-                         dropped_frames=dict(self.state["dropped_frames"]), active=self.active,
-                         duration_s=self.args.calibration_duration)
-            if state["status"] == "recording":
-                state["seconds"] = min(time.monotonic()-self.started, self.args.calibration_duration)
-            return state
-
-    def start(self):
-        with self.lock:
-            if self.active:
-                raise ValueError("Calibration is already recording or processing")
-            histories = self.histories()
-            now = time.monotonic()
-            if len(self.ids) < 2 or any(not histories[name] or
-                    not 0 <= now-histories[name][-1].received <= self.args.max_age_ms/1000 for name in self.ids):
-                raise ValueError("At least two cameras are required, and all configured cameras must have fresh video")
-            self.finish.clear()
-            self.cancelled.clear()
-            self.started, self.active = now, True
-            self.state.update(status="recording", seconds=0., frames=dict.fromkeys(self.ids, 0),
-                              dropped_frames=dict.fromkeys(self.ids, 0), samples=0, candidates=0, processed=0,
-                              error=None, last_rejection=None, rms_px=None, temporary_files_removed=False)
-            self.thread = threading.Thread(target=self.run, name="video-calibration", daemon=True)
-            self.thread.start()
-
-    def stop_recording(self):
-        with self.lock:
-            if not self.active or self.state["status"] != "recording":
-                raise ValueError("No calibration recording is active")
-            self.finish.set()
-
-    def cancel(self):
-        with self.lock:
-            if not self.active or self.state["status"] not in ("recording", "processing", "cancelling"):
-                raise ValueError("No cancellable calibration is active")
-            self.cancelled.set()
-            self.finish.set()
-            self.state["status"] = "cancelling"
-
-    def close(self):
-        with self.lock:
-            if self.active:
-                self.cancelled.set()
-                self.finish.set()
-        if self.thread and self.thread.ident:
-            # OpenCV's current solve may need to finish before cancellation;
-            # the worker checks the event before applying its result.
-            self.thread.join()
-
-    def check_cancelled(self):
-        if self.cancelled.is_set():
-            raise CalibrationCancelled()
-
-    def check_disk(self, folder):
-        if shutil.disk_usage(folder).free < 128*1024**2:
-            raise OSError("Less than 128 MiB free for calibration recording")
-        if sum(p.stat().st_size for p in folder.iterdir() if p.is_file()) > self.args.calibration_max_mb*1024**2:
-            raise OSError("Calibration video size limit exceeded; shorten the recording or increase --calibration-max-mb")
-
-    def record(self, folder):
-        writers, sidecars, sizes = {}, {}, {}
-        last, counts, dropped = dict.fromkeys(self.ids, None), dict.fromkeys(self.ids, 0), dict.fromkeys(self.ids, 0)
-        next_disk_check = 0
-        try:
-            while not self.finish.is_set() and time.monotonic()-self.started < self.args.calibration_duration:
-                self.check_cancelled()
-                if time.monotonic() >= next_disk_check:
-                    self.check_disk(folder)
-                    next_disk_check = time.monotonic()+1
-                for name, history in self.histories().items():
-                    for frame in history:
-                        if frame.received < self.started or (last[name] is not None and frame.sequence <= last[name]):
-                            continue
-                        size = (frame.image.shape[1], frame.image.shape[0])
-                        if name not in writers:
-                            if any(v % 2 for v in size):
-                                raise ValueError(f"{name}: calibration video needs an even image width and height")
-                            writer = cv2.VideoWriter(str(folder/f"{name}.avi"), cv2.VideoWriter_fourcc(*"MJPG"), 30., size)
-                            writers[name] = writer
-                            if not writer.isOpened():
-                                raise OSError(f"{name}: could not create temporary MJPEG video")
-                            sidecars[name] = (folder/f"{name}.jsonl").open("w", encoding="utf-8")
-                            sizes[name] = size
-                        if size != sizes[name]:
-                            raise ValueError(f"{name}: resolution changed during calibration recording")
-                        if last[name] is not None:
-                            dropped[name] += max(0, frame.sequence-last[name]-1)
-                        writers[name].write(frame.image)
-                        sidecars[name].write(json.dumps(dict(index=counts[name], sequence=frame.sequence,
-                            received=frame.received, aligned=frame.aligned))+"\n")
-                        counts[name] += 1
-                        last[name] = frame.sequence
-                with self.lock:
-                    self.state.update(frames=dict(counts), dropped_frames=dict(dropped))
-                self.finish.wait(.005)
-        finally:
-            for writer in writers.values():
-                writer.release()
-            for file in sidecars.values():
-                file.close()
-            with self.lock:
-                self.state["seconds"] = min(time.monotonic()-self.started, self.args.calibration_duration)
-        self.check_cancelled()
-        self.check_disk(folder)
-        if any(counts[name] == 0 for name in self.ids):
-            raise ValueError("No video recorded from one or more cameras")
-        return sizes
-
-    def process(self, folder, sizes):
-        rows = {name: [json.loads(line) for line in (folder/f"{name}.jsonl").read_text().splitlines()]
-                for name in self.ids}
-        groups = calibration_video_groups(rows, self.ids, self.args.max_skew_ms/1000)
-        with self.lock:
-            self.state["candidates"] = len(groups)
-        if len(groups) < 12:
-            raise ValueError("Video needs at least 12 time-matched groups; record longer and check camera timing")
-        session, captures = CalibrationSession(self.args), {}
-        try:
-            for name in self.ids:
-                cap = cv2.VideoCapture(str(folder/f"{name}.avi"))
-                captures[name] = cap
-                if not cap.isOpened() or round(cap.get(cv2.CAP_PROP_FRAME_COUNT)) != len(rows[name]):
-                    raise OSError(f"{name}: video frame count does not match recorded timestamps")
-            for i, group in enumerate(groups):
-                self.check_cancelled()
-                frames = {}
-                for name, index in group.items():
-                    cap = captures[name]
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-                    ok, image = cap.read()
-                    if not ok or round(cap.get(cv2.CAP_PROP_POS_FRAMES)) != index+1:
-                        raise OSError(f"{name}: could not decode recorded frame {index}")
-                    if (image.shape[1], image.shape[0]) != sizes[name]:
-                        raise ValueError(f"{name}: recorded video resolution changed")
-                    row = rows[name][index]
-                    frames[name] = Frame(row["sequence"], row["received"], row["aligned"], image)
-                try:
-                    session.capture(frames, self.ids, distinct=True)
-                except ValueError as exc:
-                    with self.lock:
-                        self.state["last_rejection"] = str(exc)
-                with self.lock:
-                    self.state.update(processed=i+1, samples=len(session.samples))
-                if len(session.samples) >= 60:
-                    break
-            self.check_cancelled()
-            result = session.solve(self.ids)
-            self.check_cancelled()
-            with self.lock:
-                result["video_calibration"] = dict(samples=len(session.samples), frames=dict(self.state["frames"]),
-                    dropped_frames=dict(self.state["dropped_frames"]), duration_s=self.state["seconds"],
-                    timing_basis="server_monotonic_after_decode_plus_manual_offset")
-            return result
-        finally:
-            for cap in captures.values():
-                cap.release()
-
-    def run(self):
-        final_status, error, folder = "error", None, None
-        try:
-            parent = self.args.calibration_temp
-            if parent:
-                parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix="visual-mocap-calibration-", dir=parent) as temporary:
-                folder = Path(temporary)
-                sizes = self.record(folder)
-                with self.lock:
-                    self.check_cancelled()
-                    self.state["status"] = "processing"
-                data = self.process(folder, sizes)
-                with self.lock:
-                    self.check_cancelled()
-                    self.state["status"] = "saving"
-                    self.apply(data)
-                    self.state["rms_px"] = data["rms_px"]
-                final_status = "complete"
-        except CalibrationCancelled:
-            final_status = "cancelled"
-        except Exception as exc:
-            error = str(exc)
-            LOG.exception("Video calibration failed")
-        finally:
-            removed = folder is None or not folder.exists()
-            if not removed:
-                error = (error or "") + f"; temporary files could not be removed: {folder}"
-                final_status = "error"
-            with self.lock:
-                self.state.update(status=final_status, error=error, temporary_files_removed=removed)
-                self.active = False
-
-
-class Engine:
+class Host:
     def __init__(self, args):
         self.args = args
-        self.sources = camera_sources(args)
-        self.ids = [s.id for s in self.sources]
-        self.triangulate = load_triangulator(args.repos)
-        self.stop = threading.Event()
-        self.lock = threading.Lock()
-        self.calibrator = CalibrationSession(args)
-        self.bvh_lock = threading.Lock()
-        self.bvh = BvhAdapter(args)
-        self.armature = ArmatureView(args.max_age_ms/1000)
-        self.sender = BvhSender(args.bvh_target, args.bvh_transport, self.stop)
-        self.calibration_data = demo_calibration(self.ids) if args.demo else None
-        if not args.demo and args.calibration.exists():
-            self.calibration_data = json.loads(args.calibration.read_text())
-        self.calibration = checked_calibration(self.calibration_data, self.ids) if self.calibration_data else None
-        self.cameras = {s.id: Camera(s, self.stop, args.preview_width, self.calibration[s.id] if args.demo else None) for s in self.sources}
-        self.video_calibration = VideoCalibration(args, self.ids,
-            lambda: {name: camera.history() for name, camera in self.cameras.items()}, self.apply_calibration)
-        self.result = None
-        self.processed = {}
-        self.model_status = "synthetic" if args.demo else "loading"
-        self.model_error = None
-        self.providers = {}
-        self.thread = threading.Thread(target=self.run, name="pose-inference", daemon=True)
+        self.cameras = cameras(args.camera)
+        self.root = args.records.expanduser().resolve()
+        (self.root / "takes").mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.closed = threading.Event()
+        self.worker = None
+        self.process = None
+        self.opener = build_opener(ProxyHandler({}))
+        self.takes = {}
+        self.health = {}
+        self.preview_cache = {}
+        self.preview_locks = {name: threading.Lock() for name in self.cameras}
+        for path in (self.root / "takes").glob("*/take.json"):
+            take = json.loads(path.read_text())
+            if take["state"] in BUSY:
+                take.update(
+                    state="interrupted",
+                    error="Host restarted; use Upload / retry to finish this take",
+                )
+                save(path, take)
+            self.takes[take["id"]] = take
+        self.calibration_path = self.root / "current_calibration.json"
+        self.calibration = (
+            json.loads(self.calibration_path.read_text())
+            if self.calibration_path.exists()
+            else None
+        )
+        self.poller = threading.Thread(target=self.poll, daemon=True)
+        self.poller.start()
 
-    def start(self):
-        for camera in self.cameras.values():
-            camera.thread.start()
-        self.thread.start()
-        self.sender.thread.start()
+    def request(self, name, path, body=None, timeout=20, headers=None):
+        options = dict(headers or {})
+        if self.args.camera_token:
+            options["Authorization"] = "Bearer " + self.args.camera_token
+        data = None if body is None else json.dumps(body).encode()
+        if data is not None:
+            options["Content-Type"] = "application/json"
+        request = Request(self.cameras[name] + path, data=data, headers=options)
+        return self.opener.open(request, timeout=timeout)
 
-    def close(self):
-        self.stop.set()
-        self.video_calibration.close()
-        deadline = time.monotonic() + 6
-        self.sender.wake.set()
-        for thread in [*(c.thread for c in self.cameras.values()), self.thread, self.sender.thread]:
-            if thread.ident:
-                thread.join(max(0, deadline-time.monotonic()))
-        with self.bvh_lock:
-            self.bvh.close()
-
-    def apply_calibration(self, data):
-        calibration = checked_calibration(data, self.ids)
-        adapter = BvhAdapter(self.args)
-        payload = json.dumps(data, indent=2, allow_nan=False)+"\n"
-        path = self.args.calibration
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
+    def json_request(self, name, path, body=None, timeout=20):
         try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=path.name+".",
-                                             suffix=".tmp", dir=path.parent, delete=False) as file:
-                temporary = Path(file.name)
-                file.write(payload)
-            with self.bvh_lock:
-                self.bvh.close()
-                temporary.replace(path)
-                self.bvh = adapter
-                self.armature = ArmatureView(self.args.max_age_ms/1000)
-                with self.lock:
-                    self.calibration_data, self.calibration = data, calibration
-                    self.result = None
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            with self.request(name, path, body, timeout) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            try:
+                detail = json.load(exc).get("error", str(exc))
+            except Exception:
+                detail = str(exc)
+            raise ValueError(f"{name}: {detail}") from exc
 
-    def group(self):
-        return select_frames({name: c.history() for name, c in self.cameras.items()}, time.monotonic(),
-                             self.args.max_age_ms/1000, self.args.max_skew_ms/1000)
+    def poll(self):
+        def status(name):
+            try:
+                info = self.json_request(name, "/api/status", timeout=3)
+                if info.get("camera") != name:
+                    raise ValueError("Camera name differs from configured ID")
+                return dict(name=name, online=True, **info)
+            except Exception as exc:
+                return dict(name=name, online=False, error=str(exc))
+
+        with ThreadPoolExecutor(max_workers=len(self.cameras)) as pool:
+            while not self.closed.is_set():
+                values = list(pool.map(status, self.cameras))
+                with self.lock:
+                    self.health = {v["name"]: v for v in values}
+                self.closed.wait(2)
+
+    def update(self, take, **values):
+        with self.lock:
+            take.update(values)
+            save(self.root / "takes" / take["id"] / "take.json", take)
 
     def snapshot(self):
-        now = time.monotonic()
-        video_calibration = self.video_calibration.snapshot()
-        with self.bvh_lock:
-            armature = self.armature.snapshot(now)
         with self.lock:
-            result = self.result
-            age = (now - result["completed_monotonic_s"])*1000 if result else None
-            # A disconnected camera or crashed inference must not leave a
-            # frozen pose looking like current tracking data.
-            pose = result if age is not None and age < self.args.max_age_ms else None
-            return dict(schema_version=1, demo=self.args.demo, model=f"RTMPose {self.args.preset}",
-                        device="synthetic" if self.args.demo else self.args.device,
-                        model_status=self.model_status, error=self.model_error, providers=self.providers,
-                        calibrated=self.calibration is not None, calibration_samples=video_calibration["samples"],
-                        video_calibration=video_calibration,
-                        calibration_rms_px=(self.calibration_data or {}).get("rms_px"),
-                        world_frame=(self.calibration_data or {}).get("world_frame"),
-                        timing_basis="server_monotonic_after_decode_plus_manual_offset",
-                        max_skew_ms=self.args.max_skew_ms, pose_age_ms=age,
-                        board=dict(squares=self.args.board, square_m=self.args.square_m, marker_m=self.args.marker_m),
-                        bvh=dict(**self.sender.stats(), pose_status=self.bvh.status, file_error=self.bvh.file_error),
-                        cameras=[c.stats(now) for c in self.cameras.values()], pose=pose, armature=armature,
-                        joint_names=JOINTS, edges=EDGES)
+            return copy.deepcopy(
+                dict(
+                    cameras=[
+                        self.health.get(
+                            n, dict(name=n, online=False, error="Connecting…")
+                        )
+                        for n in self.cameras
+                    ],
+                    takes=sorted(
+                        self.takes.values(), key=lambda t: t["created"], reverse=True
+                    ),
+                    calibration=self.calibration,
+                    records=str(self.root),
+                )
+            )
 
-    def preview(self, name, annotated):
-        camera = self.cameras[name]
+    def launch(self, func, *args):
+        if self.worker and self.worker.is_alive():
+            raise ValueError("An operation is already running")
+        self.worker = threading.Thread(target=func, args=args, daemon=True)
+        self.worker.start()
+
+    def start(self, body):
+        name = checked_name(body.get("name"))
+        kind = body.get("kind")
+        if kind not in ("calibration", "record"):
+            raise ValueError("kind must be calibration or record")
         with self.lock:
-            frame = self.processed.get(name) if annotated else None
-        if frame and time.monotonic() - frame[1] < 1:
-            return frame
-        with camera.lock:
-            return camera.preview
+            if self.closed.is_set() or (self.worker and self.worker.is_alive()):
+                raise ValueError(
+                    "An operation is already running or host is shutting down"
+                )
+            if any(t["state"] in BUSY for t in self.takes.values()):
+                raise ValueError("A recording or transfer is already active")
+            if kind == "calibration" and self.calibration:
+                if (
+                    not body.get("replace_calibration")
+                    or body.get("expected_calibration_id") != self.calibration["id"]
+                ):
+                    raise ValueError(
+                        "Calibration already exists. Confirm replacing the current calibration set"
+                    )
+            identifier = uuid.uuid4().hex
+            folder = self.root / "takes" / identifier
+            folder.mkdir()
+            take = dict(
+                id=identifier,
+                name=name,
+                kind=kind,
+                state="preparing",
+                created=time.time(),
+                cameras=self.cameras.copy(),
+                calibration_id=(self.calibration or {}).get("id")
+                if kind == "record"
+                else None,
+            )
+            self.takes[identifier] = take
+            self.update(take)
+            self.launch(self.prepare, take)
+            return dict(take)
 
-    def run(self):
+    def prepare(self, take):
         try:
-            model = None if self.args.demo else PoseModel(self.args)
-            with self.lock:
-                self.model_status = "synthetic" if self.args.demo else "ready"
-                self.providers = model.providers if model else {}
-            previous, counter = None, 0
-            while not self.stop.is_set():
-                started = time.monotonic()
-                group = self.group()
-                # Even with bad synchronization, show 2D detections for each
-                # live camera; 3D uses only the coherent group below.
-                frames = dict(group)
-                for name, camera in self.cameras.items():
-                    history = camera.history()
-                    if name not in frames and history and started-history[-1].received < self.args.max_age_ms/1000:
-                        frames[name] = history[-1]
-                key = tuple((name, f.sequence) for name, f in sorted(frames.items()))
-                if not frames or key == previous:
-                    self.stop.wait(.01)
-                    continue
-                previous = key
-                observations, views, previews = {}, {}, {}
-                for name, frame in frames.items():
-                    if model:
-                        points, scores, people = model.infer(frame)
-                    else:
-                        points, scores, people = frame.synthetic_points, np.ones(17), 1
-                    observations[name] = points, scores
-                    views[name] = dict(frame_id=frame.sequence, receive_monotonic_s=frame.received,
-                                       aligned_monotonic_s=frame.aligned, people=people,
-                                       points=points.tolist(), confidence=scores.tolist(),
-                                       image_size=[frame.image.shape[1], frame.image.shape[0]])
-                    previews[name] = (frame.sequence, frame.received,
-                        jpeg(overlay(frame.image, points, scores, self.args.confidence), self.args.preview_width))
-                with self.lock:
-                    calibration = self.calibration
-                reconstruction = dict(points=[None]*17, confidence=[0.0]*17, reprojection_px=[None]*17)
-                reason = "calibration_required"
-                eligible = {}
-                if calibration:
-                    for name in group:
-                        if tuple(views[name]["image_size"]) == calibration[name]["image_size"]:
-                            eligible[name] = observations[name]
-                    reason = "waiting_for_synchronized_views"
-                    if len(eligible) >= 2:
-                        reconstruction = reconstruct(eligible, calibration, self.triangulate,
-                                                     self.args.confidence, self.args.max_reprojection_px)
-                        reason = "tracking" if any(p is not None for p in reconstruction["points"]) else "no_valid_single_person_pose"
-                    if len(eligible) < len(group):
-                        reason = "calibration_resolution_mismatch"
-                completed = time.monotonic()
-                counter += 1
-                with self.bvh_lock:
-                    if self.stop.is_set():
-                        break
-                    with self.lock:
-                        if calibration is not self.calibration:
-                            continue
-                    timestamp = max(f.received for f in group.values()) if group else completed
-                    bvh_frame = self.bvh.update(reconstruction, timestamp, counter)
-                    self.armature.update(self.bvh, bvh_frame, time.monotonic())
-                    if bvh_frame:
-                        bvh_frame["source_frame_ids"] = {name: frames[name].sequence for name in eligible}
-                        bvh_frame["time_basis"] = "server_receive_monotonic"
-                    message = bvh_frame or dict(protocol="visual-mocap-bvh/1", type="tracking_lost",
-                        stream_id=self.bvh.stream_id, frame_id=counter, timestamp_monotonic_s=timestamp,
-                        reason=self.bvh.status)
-                    self.sender.submit(self.bvh.metadata, message)
-                result = dict(frame_id=counter, completed_monotonic_s=completed,
-                              receive_to_result_ms=(completed-min(f.received for f in frames.values()))*1000,
-                              inference_cycle_ms=(completed-started)*1000,
-                              reception_skew_ms=(max(f.aligned for f in group.values())-min(f.aligned for f in group.values()))*1000 if group else None,
-                              triangulation_cameras=list(eligible), status=reason, units="m",
-                              views=views, skeleton=reconstruction, bvh=bvh_frame)
-                with self.lock:
-                    self.result = result
-                    self.processed.update(previews)
-                self.stop.wait(max(0, 1/self.args.fps-(time.monotonic()-started)))
+            body = {key: take[key] for key in ("id", "name", "kind")}
+            with ThreadPoolExecutor(max_workers=len(self.cameras)) as pool:
+                futures = {
+                    name: pool.submit(self.json_request, name, "/api/start", body, 25)
+                    for name in self.cameras
+                }
+                errors = []
+                for name, future in futures.items():
+                    try:
+                        result = future.result()
+                        if (
+                            result.get("state") != "recording"
+                            or result.get("camera") != name
+                        ):
+                            raise ValueError("Camera is not recording")
+                    except Exception as exc:
+                        errors.append(f"{name}: {exc}")
+            if errors:
+                raise ValueError("; ".join(errors))
+            if self.closed.is_set():
+                raise InterruptedError("Host shutting down")
+            self.update(take, state="recording", error=None)
         except Exception as exc:
-            LOG.exception("Inference stopped")
-            with self.lock:
-                self.model_status = "error"
-                self.model_error = str(exc)
-                self.result = None
-                self.processed.clear()
+            for name in self.cameras:
+                try:
+                    self.json_request(name, "/api/stop", {"id": take["id"]}, timeout=5)
+                except Exception:
+                    pass
+            self.update(
+                take,
+                state="interrupted" if self.closed.is_set() else "failed",
+                error=str(exc),
+            )
 
+    def stop(self, identifier, upload=True):
+        with self.lock:
+            take = self.takes[identifier]
+            if take["state"] not in ("recording", "stopped", "failed", "interrupted"):
+                raise ValueError("Take is not available for stopping/upload")
+            if take["cameras"] != self.cameras:
+                raise ValueError("Restore the camera configuration used by this take")
+            if any(
+                t["state"] in BUSY and t["id"] != identifier
+                for t in self.takes.values()
+            ):
+                raise ValueError("Another operation is active")
+            self.launch(self.collect, take, upload)
+            return dict(take)
 
-def create_app(engine):
-    @asynccontextmanager
-    async def lifespan(app):
-        engine.start()
+    def collect(self, take, upload):
         try:
-            yield
-        finally:
-            await asyncio.to_thread(engine.close)
+            self.update(take, state="stopping", error=None)
+            with ThreadPoolExecutor(max_workers=len(self.cameras)) as pool:
+                list(
+                    pool.map(
+                        lambda name: self.json_request(
+                            name, "/api/stop", {"id": take["id"]}, timeout=20
+                        ),
+                        self.cameras,
+                    )
+                )
+            deadline = time.monotonic() + 600
+            manifests = {}
+            while len(manifests) < len(self.cameras):
+                if self.closed.wait(0.5):
+                    raise InterruptedError(
+                        "Host shutting down; transfer can be resumed"
+                    )
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        "Cameras did not finalize recordings in 10 minutes"
+                    )
+                for name in self.cameras:
+                    if name in manifests:
+                        continue
+                    value = self.json_request(
+                        name, "/api/recordings/" + take["id"], timeout=10
+                    )
+                    if value["state"] == "failed":
+                        raise ValueError(f"{name}: {value.get('error')}")
+                    if value["state"] == "ready":
+                        if (
+                            any(
+                                value.get(key) != take[key]
+                                for key in ("id", "name", "kind")
+                            )
+                            or value.get("camera") != name
+                        ):
+                            raise ValueError(f"{name}: manifest identity mismatch")
+                        if (
+                            type(value.get("bytes")) is not int
+                            or not 0 < value["bytes"] <= 1024**4
+                            or not re.fullmatch("[a-f0-9]{64}", value.get("sha256", ""))
+                        ):
+                            raise ValueError(f"{name}: invalid file manifest")
+                        manifests[name] = value
+            folder = self.root / "takes" / take["id"]
+            manifest_path = folder / "camera_manifests.json"
+            if (
+                manifest_path.exists()
+                and json.loads(manifest_path.read_text()) != manifests
+            ):
+                raise ValueError(
+                    "Camera manifests changed; refusing to resume different files"
+                )
+            save(manifest_path, manifests)
+            self.update(
+                take,
+                state="stopped",
+                total_bytes=sum(v["bytes"] for v in manifests.values()),
+            )
+            if not upload:
+                return
+            raw = folder / "raw_videos"
+            raw.mkdir(exist_ok=True)
+            self.update(take, state="uploading", transferred_bytes=0)
+            for name, manifest in manifests.items():
+                self.download(
+                    take, name, manifest, raw / f"{take['name']}.id-{name}.idx-0.mkv"
+                )
+            self.update(
+                take, state="synchronizing", transferred_bytes=take["total_bytes"]
+            )
+            with (folder / "sync.log").open("wb") as log:
+                self.process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--sync-job",
+                        str(folder),
+                    ],
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                )
+                while self.process.poll() is None:
+                    if self.closed.wait(0.2):
+                        raise InterruptedError(
+                            "Host shutting down; synchronization can be retried"
+                        )
+                    progress = folder / "progress.json"
+                    if progress.exists():
+                        try:
+                            with self.lock:
+                                take["progress"] = json.loads(progress.read_text())
+                        except (OSError, ValueError):
+                            pass
+                if self.process.returncode:
+                    raise RuntimeError(
+                        "SkellySync failed: "
+                        + (folder / "sync.log").read_text(errors="replace")[-1800:]
+                    )
+            result = json.loads((folder / "sync_result.json").read_text())
+            destination = str(folder / "synchronized_videos")
+            self.update(
+                take,
+                state="ready",
+                error=None,
+                synchronized_path=destination,
+                sync=result,
+            )
+            if take["kind"] == "calibration":
+                with self.lock:
+                    self.calibration = dict(
+                        id=take["id"], name=take["name"], synchronized_path=destination
+                    )
+                    save(self.calibration_path, self.calibration)
+        except InterruptedError as exc:
+            self.update(take, state="interrupted", error=str(exc))
+        except Exception as exc:
+            self.update(take, state="failed", error=str(exc))
 
-    app = FastAPI(title="Visual MoCap", lifespan=lifespan)
+    def download(self, take, name, manifest, target):
+        if target.exists():
+            if (
+                target.stat().st_size != manifest["bytes"]
+                or digest(target) != manifest["sha256"]
+            ):
+                raise ValueError(
+                    f"{name}: existing received file does not match its manifest"
+                )
+            return
+        partial = target.with_suffix(".partial")
+        for attempt in range(3):
+            if self.closed.is_set():
+                raise InterruptedError("Upload interrupted; partial file preserved")
+            start = partial.stat().st_size if partial.exists() else 0
+            if start >= manifest["bytes"]:
+                if start == manifest["bytes"] and digest(partial) == manifest["sha256"]:
+                    partial.replace(target)
+                    return
+                partial.unlink()
+                start = 0
+            if (
+                shutil.disk_usage(target.parent).free
+                < manifest["bytes"] - start + 256 * 1024**2
+            ):
+                raise ValueError("Not enough free space on the host")
+            try:
+                with self.request(
+                    name,
+                    "/files/" + take["id"],
+                    timeout=30,
+                    headers={"Range": f"bytes={start}-"} if start else {},
+                ) as response:
+                    if start and (
+                        response.status != 206
+                        or not response.headers.get("Content-Range", "").startswith(
+                            f"bytes {start}-"
+                        )
+                    ):
+                        raise ValueError("Camera did not honor resume range")
+                    if (
+                        int(response.headers.get("Content-Length", "-1"))
+                        != manifest["bytes"] - start
+                    ):
+                        raise ValueError("Incorrect upload size")
+                    with partial.open("ab" if start else "wb") as stream:
+                        written = start
+                        updated = 0
+                        while block := response.read(256 * 1024):
+                            if self.closed.is_set():
+                                raise InterruptedError(
+                                    "Upload interrupted; partial file preserved"
+                                )
+                            written += len(block)
+                            if written > manifest["bytes"]:
+                                raise ValueError("Camera sent more bytes than declared")
+                            stream.write(block)
+                            if time.monotonic() - updated > 1:
+                                updated = time.monotonic()
+                                self.update(
+                                    take,
+                                    transfer_camera=name,
+                                    transferred_bytes=sum(
+                                        p.stat().st_size
+                                        for p in target.parent.iterdir()
+                                        if p.is_file()
+                                    ),
+                                )
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                if partial.stat().st_size != manifest["bytes"]:
+                    raise ValueError("Incomplete upload")
+                if digest(partial) != manifest["sha256"]:
+                    partial.unlink()
+                    raise ValueError("Upload SHA-256 mismatch")
+                partial.replace(target)
+                return
+            except InterruptedError:
+                raise
+            except Exception:
+                if attempt == 2:
+                    raise
+                if self.closed.wait(attempt + 1):
+                    raise InterruptedError("Upload interrupted; partial file preserved")
 
-    @app.get("/", response_class=HTMLResponse)
-    def index():
-        return HTML
+    def preview(self, name):
+        if name not in self.cameras:
+            raise KeyError(name)
+        with self.preview_locks[name]:
+            cached = self.preview_cache.get(name)
+            if cached and time.monotonic() - cached[0] < 1:
+                return cached[1]
+            with self.request(name, "/preview.jpg", timeout=6) as response:
+                data = response.read(512 * 1024 + 1)
+                if len(data) > 512 * 1024 or not data.startswith(b"\xff\xd8"):
+                    raise ValueError("Invalid preview image")
+            self.preview_cache[name] = (time.monotonic(), data)
+            return data
 
-    @app.get("/api/state")
-    def state():
-        return engine.snapshot()
+    def close(self):
+        self.closed.set()
+        if self.process and self.process.poll() is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait()
+        for take in list(self.takes.values()):
+            if take["state"] in ("preparing", "recording"):
+                for name in self.cameras:
+                    try:
+                        self.json_request(
+                            name, "/api/stop", {"id": take["id"]}, timeout=3
+                        )
+                    except Exception:
+                        pass
+                self.update(
+                    take,
+                    state="interrupted",
+                    error="Host stopped; cameras were asked to finalize recordings",
+                )
+        if self.worker:
+            self.worker.join(timeout=35)
+        self.poller.join(timeout=5)
 
-    @app.get("/healthz")
-    def health():
-        return {"model_status": engine.snapshot()["model_status"], "running": not engine.stop.is_set()}
 
-    @app.get("/api/bvh/skeleton")
-    def bvh_skeleton():
-        with engine.bvh_lock:
-            if not engine.bvh.metadata:
-                raise HTTPException(409, engine.bvh.status)
-            return engine.bvh.metadata
-
-    @app.get("/video/{name}.mjpg")
-    async def video(name: str, overlay: bool = True):
-        if name not in engine.cameras:
-            raise HTTPException(404, "Unknown camera")
-
-        async def chunks():
-            previous = None
-            while not engine.stop.is_set():
-                frame = engine.preview(name, overlay)
-                if frame and (frame[0], frame[1]) != previous:
-                    previous = frame[0], frame[1]
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame[2])).encode() + b"\r\n\r\n" + frame[2] + b"\r\n"
-                await asyncio.sleep(1/30)
-        return StreamingResponse(chunks(), media_type="multipart/x-mixed-replace; boundary=frame",
-                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
-
-    @app.websocket("/ws")
-    async def websocket(ws: WebSocket):
-        await ws.accept()
-        try:
-            while not engine.stop.is_set():
-                # No per-client queue. Slow viewers receive the latest state.
-                await asyncio.wait_for(ws.send_json(engine.snapshot()), timeout=3)
-                await asyncio.sleep(.05)
-        except (WebSocketDisconnect, TimeoutError, OSError, RuntimeError):
+def handler(host):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
             pass
 
-    @app.get("/api/calibration/board.png")
-    def board():
-        cols, rows = engine.calibrator.board.getChessboardSize()
-        image = engine.calibrator.board.generateImage((cols*160+80, rows*160+80), marginSize=40)
-        _, data = cv2.imencode(".png", image)
-        return Response(data.tobytes(), media_type="image/png")
+        def send(
+            self, data, content_type="application/json; charset=utf-8", status=200
+        ):
+            if not isinstance(data, bytes):
+                data = json.dumps(data, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
 
-    @app.post("/api/calibration/{action}", status_code=202)
-    def calibrate(action: str):
-        if engine.args.demo:
-            raise HTTPException(409, "Calibration is disabled for synthetic demo")
-        try:
-            if action == "start":
-                engine.video_calibration.start()
-            elif action == "stop":
-                engine.video_calibration.stop_recording()
-            elif action == "cancel":
-                engine.video_calibration.cancel()
-            else:
-                raise HTTPException(404, "Use /api/calibration/start, /stop or /cancel")
-            return engine.video_calibration.snapshot()
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
+        def do_GET(self):
+            path = urlsplit(self.path).path
+            try:
+                if path == "/":
+                    self.send(HTML.encode(), "text/html; charset=utf-8")
+                elif path == "/api/state":
+                    self.send(host.snapshot())
+                elif path.startswith("/preview/"):
+                    try:
+                        self.send(
+                            host.preview(
+                                path.removeprefix("/preview/").removesuffix(".jpg")
+                            ),
+                            "image/jpeg",
+                        )
+                    except KeyError:
+                        raise
+                    except Exception:
+                        self.send({"error": "Preview unavailable"}, status=503)
+                elif path.startswith("/api/takes/"):
+                    identifier = path.rsplit("/", 1)[-1]
+                    with host.lock:
+                        value = copy.deepcopy(host.takes[identifier])
+                    self.send(value)
+                else:
+                    self.send({"error": "Unknown route"}, status=404)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except KeyError:
+                self.send({"error": "Unknown recording/camera"}, status=404)
+            except Exception as exc:
+                self.send({"error": str(exc)}, status=400)
 
-    return app
+        def do_POST(self):
+            try:
+                if (
+                    self.headers.get("Content-Type", "").split(";")[0]
+                    != "application/json"
+                ):
+                    raise ValueError("application/json required")
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 16384:
+                    raise ValueError("Invalid JSON size")
+                body = json.loads(self.rfile.read(size))
+                path = urlsplit(self.path).path
+                if path == "/api/start":
+                    value = host.start(body)
+                elif path == "/api/stop":
+                    value = host.stop(body["id"], bool(body.get("upload", True)))
+                elif path == "/api/upload":
+                    value = host.stop(body["id"], True)
+                else:
+                    self.send({"error": "Unknown route"}, status=404)
+                    return
+                self.send(value, status=202)
+            except KeyError:
+                self.send(
+                    {"error": "Unknown recording or required field missing"}, status=404
+                )
+            except Exception as exc:
+                self.send({"error": str(exc)}, status=409)
+
+    return Handler
 
 
-HTML = r'''<!doctype html>
-<html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Visual MoCap · Live</title>
-<style>
-:root{color-scheme:light;font:15px system-ui;background:#f1f5f9;color:#1e293b}*{box-sizing:border-box}body{margin:0}header{padding:22px 28px;border-bottom:1px solid #dbe3ed;background:#fff;display:flex;gap:20px;align-items:center;justify-content:space-between}h1{font-size:22px;margin:0}small,.muted{color:#64748b}main{padding:22px;max-width:1800px;margin:auto}.badge{border-radius:20px;padding:6px 12px;background:#e8eef5;font-size:13px}.good{color:#166534}.warn{color:#92400e}.layout{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.4fr);gap:18px}.card{background:#fff;border:1px solid #dbe3ed;border-radius:12px;overflow:hidden;margin-bottom:16px}.bar{padding:12px 16px;display:flex;gap:12px;justify-content:space-between;align-items:center}img{width:100%;display:block;min-height:100px;background:#e2e8f0}.camera-stat{font-size:12px;color:#475569}.viewer{height:620px;position:relative;background:#f8fafc}canvas{display:block;width:100%;height:100%;touch-action:none}.hint{position:absolute;bottom:16px;left:18px;right:18px;color:#64748b;font-size:12px;pointer-events:none}.empty{position:absolute;top:16px;left:18px;right:18px;color:#475569;pointer-events:none;font-size:13px}.empty.live{color:#166534}.empty.held{color:#92400e}.stats{display:flex;flex-wrap:wrap;gap:24px;padding:16px;border-top:1px solid #dbe3ed}.stat b{display:block;font-size:24px;font-weight:500}.stat span{font-size:12px;color:#64748b}button,a.button{background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;border-radius:7px;padding:9px 12px;cursor:pointer;text-decoration:none;font:inherit}button:hover{background:#dbeafe}button:disabled{opacity:.5;cursor:wait}details{padding:16px;border-top:1px solid #dbe3ed}summary{cursor:pointer}p{line-height:1.55}.controls{display:flex;gap:8px;flex-wrap:wrap}#message{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.error{color:#b91c1c}#notice{margin:0 0 16px;padding:12px 16px;background:#e8eef5;border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere}label{font-size:13px}@media(max-width:900px){.layout{grid-template-columns:1fr}.viewer{height:430px}header{padding:18px}main{padding:12px}}
-</style>
-<header><div><h1>Visual MoCap <span class="muted">/ Live</span></h1><small>Камеры → RTMPose → 3D</small></div><span id="connection" class="badge">Подключение…</span></header>
-<main><div id="notice">Ожидание состояния сервера…</div><div class="layout"><section><div class="bar"><b>Видеопотоки</b><label><input id="overlay" type="checkbox" checked> Ключевые точки</label></div><div id="cameras"></div></section>
-<section><div class="card"><div class="bar"><b>BVH-арматура · WebGL</b><button id="resetView">Центрировать</button></div><div class="viewer"><canvas id="gl"></canvas><div id="empty" class="empty">T-поза · ожидание BVH</div><div class="hint">Мышь / касание — вращать · колесо / щипок — масштаб · координаты в метрах</div></div><div class="stats"><div class="stat"><b id="fps">—</b><span>результатов / с</span></div><div class="stat"><b id="latency">—</b><span>приём → результат, мс</span></div><div class="stat"><b id="skew">—</b><span>разница времени приёма, мс</span></div><div class="stat"><b id="joints">0 / 17</b><span>3D-точек</span></div></div>
-<details><summary>Калибровка камер по видео</summary><p>Распечатайте ChArUco-доску. <span id="boardSize"></span> Во время записи медленно перемещайте и наклоняйте её в общей области обзора всех камер. Покажите не менее 12 разных положений, делая короткие паузы.</p><div class="controls"><a class="button" href="/api/calibration/board.png" target="_blank" rel="noopener">Скачать доску</a><button data-action="start">Начать запись</button><button data-action="stop" disabled>Остановить и калибровать</button><button data-action="cancel" disabled>Отмена</button></div><p id="calibrationStatus" role="status">Запись не начата</p><progress id="calibrationProgress" max="1" value="0" style="width:100%"></progress><p id="calibrationFrames" class="muted"></p><p>Выбрано положений доски: <b id="samples">0</b></p><p id="message" role="status"></p><p class="muted">Видео записывается во временную папку и удаляется после расчёта, ошибки или отмены. Сохраняется только успешная калибровка.</p></details><details open><summary>BVH</summary><p id="bvhStatus">Ожидание скелета…</p><p class="muted">Первые 20 пригодных поз задают длины костей (настраивается при запуске). Вращения конечностей вокруг их осей не измерены; кисти и стопы наследуют ориентацию родителя.</p></details></div><p class="muted">Режим одного человека. 3D использует калибровку и минимум два согласованных вида. Время приёма RTSP не равно времени экспозиции камеры.</p><p id="world" class="muted"></p></section></div></main>
+HTML = r"""<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Запись камер</title><style>
+*{box-sizing:border-box}[hidden]{display:none!important}body{font:16px system-ui;background:#f3f6fa;color:#203146;margin:24px auto;max-width:1200px;padding:0 16px}h1{font-size:26px}section,.cam{background:white;border:1px solid #dbe3ec;border-radius:12px;padding:18px;margin:16px 0}button,input,select{font:inherit;border:1px solid #bccbdc;border-radius:6px;padding:8px;max-width:100%}button{background:#eaf2fb;cursor:pointer}button:disabled{opacity:.5;cursor:wait}label{display:inline-block;margin:6px 14px 6px 0}input[type=text]{width:260px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}.cam{margin:0}.cam img{width:100%;max-width:320px;display:block;margin:10px auto}.muted{color:#63768a;font-size:14px}#error,.bad{color:#ac263a;white-space:pre-wrap}.take{padding:12px 0;border-top:1px solid #e0e7ef;overflow-wrap:anywhere}.take button{margin:8px 8px 0 0}.path{font:13px monospace;overflow-wrap:anywhere}.good{color:#24704c}@media(max-width:600px){body{margin:12px auto}label{display:block}}
+</style><h1>Запись камер → синхронизация</h1><p class="muted">Видео и звук записываются на камерах. После выгрузки SkellySync выравнивает файлы по общему звуку.</p>
+<section><div id="calibration">Калибровочный набор пока не записан</div><label>Имя <input id="name" type="text" maxlength="80" value="take_001"></label><label>Тип <select id="kind"><option value="record">record — движение</option><option value="calibration">calibration — доска</option></select></label>
+<p><button id="start">Начать запись на всех камерах</button> <label><input id="autoUpload" type="checkbox" checked> Выгрузить и синхронизировать после остановки</label></p><p class="muted">Когда все камеры записывают, сделайте общий хлопок или произнесите несколько слов. Затем выполняйте движение или показывайте калибровочную доску.</p><div id="error" role="alert"></div></section>
+<label><input id="preview" type="checkbox" checked> Превью камер — до 320 px, 1 кадр/с</label><div class="grid" id="cameras"></div>
+<section><h2>Записи</h2><div id="takes">Подключение…</div></section>
 <script>
-'use strict';
-const $=id=>document.getElementById(id), cards=new Map();let current=null, ws=null, seenFrame=-1, arrivals=[];
-let armature=__REST_ARMATURE__, connected=false, lastStateMs=0, calibrationRequest=false, calibrationError='', calibrationStage=null;
-const statuses={calibration_required:'Для 3D нужна калибровка камер',waiting_for_synchronized_views:'Ожидание двух согласованных видеопотоков',no_valid_single_person_pose:'Нет уверенной позы одного человека в двух камерах',calibration_resolution_mismatch:'Разрешение видео отличается от калибровки',tracking:''};
-function setFeed(card,id){card.querySelector('img').src='/video/'+encodeURIComponent(id)+'.mjpg?overlay='+$('overlay').checked}
-$('overlay').onchange=()=>cards.forEach((card,id)=>setFeed(card,id));
-function update(s){current=s;lastStateMs=performance.now();if(s.armature)armature=s.armature; const pose=s.pose; let warnings=[];
- if(s.demo)warnings.push('ДЕМО: синтетические камеры и точки. Нейросетевой инференс не выполняется.');
- if(s.model_status==='loading')warnings.push('Загрузка модели и весов. Видео доступно независимо от инференса.');
- if(s.error)warnings.push('Ошибка инференса: '+s.error);
- if(!s.demo)warnings.push(s.model+' · '+s.device+' · '+s.model_status);
- $('notice').textContent=warnings.join('\n');$('samples').textContent=s.calibration_samples;
- $('boardSize').textContent=s.board.squares+' клеток; сторона клетки '+(s.board.square_m*1000).toFixed(1)+' мм, маркера '+(s.board.marker_m*1000).toFixed(1)+' мм.';
- $('bvhStatus').textContent=s.bvh.pose_status+(s.bvh.enabled?' · '+s.bvh.transport.toUpperCase()+' → '+s.bvh.target+' · отправлено '+s.bvh.sent:' · сетевой адрес не задан')+(s.bvh.error?' · '+s.bvh.error:'')+(s.bvh.file_error?' · запись: '+s.bvh.file_error:'');
- $('world').textContent=s.world_frame?'Система координат: '+s.world_frame+'. В WebGL оси Y и Z развёрнуты для отображения.':'';
- for(const c of s.cameras){let card=cards.get(c.id);if(!card){card=document.createElement('div');card.className='card';const bar=document.createElement('div');bar.className='bar';const name=document.createElement('b');name.textContent=c.id;const stat=document.createElement('span');stat.className='camera-stat';bar.append(name,stat);const img=document.createElement('img');img.alt=c.id;card.append(bar,img);$('cameras').append(card);cards.set(c.id,card);setFeed(card,c.id)}
- const people=pose?.views[c.id]?.people;card.querySelector('.camera-stat').textContent=c.status+' · '+c.fps+' fps'+(c.age_ms!==null?' · '+Math.round(c.age_ms)+' мс':'')+(people>1?' · несколько людей':'');}
- const now=performance.now();if(pose&&pose.frame_id!==seenFrame){seenFrame=pose.frame_id;arrivals.push(now)}arrivals=arrivals.filter(t=>now-t<2000);$('fps').textContent=arrivals.length>1?((arrivals.length-1)*1000/(now-arrivals[0])).toFixed(1):'—';
- $('latency').textContent=pose?pose.receive_to_result_ms.toFixed(0):'—';$('skew').textContent=pose?.reception_skew_ms!=null?pose.reception_skew_ms.toFixed(1):'—';
- const count=pose?pose.skeleton.points.filter(Boolean).length:0;$('joints').textContent=count+' / 17';
- updateCalibration(s.video_calibration);
-}
-function connect(){ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.onopen=()=>{connected=true;$('connection').textContent='● Подключено';$('connection').className='badge good'};ws.onmessage=e=>update(JSON.parse(e.data));ws.onclose=()=>{connected=false;$('connection').textContent='Переподключение…';$('connection').className='badge warn';current=null;setTimeout(connect,1500)};ws.onerror=()=>ws.close()}
-function updateCalibration(c){
- if(!c)return;
- if(calibrationStage!==c.status){calibrationStage=c.status;calibrationError=''}
- const labels={idle:'Запись не начата',recording:'Запись видео',processing:'Поиск доски и расчёт калибровки',saving:'Сохранение калибровки',cancelling:'Отмена · ожидание завершения текущей операции',cancelled:'Запись отменена',complete:'Калибровка сохранена',error:'Калибровка не выполнена'};
- $('calibrationStatus').textContent=(labels[c.status]||c.status)+(c.status==='recording'?' · '+c.seconds.toFixed(1)+' / '+c.duration_s+' с':'')+(!c.active&&c.temporary_files_removed&&c.status!=='idle'?' · временное видео удалено':'');
- $('calibrationProgress').value=c.status==='recording'?c.seconds/c.duration_s:c.status==='complete'?1:c.candidates?c.processed/c.candidates:0;
- $('calibrationFrames').textContent=Object.entries(c.frames).map(([name,n])=>name+': '+n+' кадров'+(c.dropped_frames[name]?' · пропущено при записи '+c.dropped_frames[name]:'')).join(' / ');
- $('samples').textContent=c.samples;
- $('message').textContent=calibrationError||c.error||(c.rms_px?'RMS, пиксели: '+Object.entries(c.rms_px).map(([name,v])=>name+': '+v.toFixed(2)).join(' · '):c.last_rejection||'Запись автоматически завершится через '+c.duration_s+' с. Можно остановить раньше.');
- $('message').className=calibrationError||c.error?'error':'';
- for(const b of document.querySelectorAll('[data-action]'))b.disabled=calibrationRequest||current?.demo||
-  (b.dataset.action==='start'?c.active:b.dataset.action==='stop'?c.status!=='recording':!c.active||!['recording','processing'].includes(c.status));
-}
-for(const button of document.querySelectorAll('[data-action]'))button.onclick=async()=>{
- calibrationRequest=true;calibrationError='';updateCalibration(current?.video_calibration);
- try{const r=await fetch('/api/calibration/'+button.dataset.action,{method:'POST'}),v=await r.json();if(!r.ok)throw Error(v.detail||r.statusText);if(current)current.video_calibration=v;updateCalibration(v)}
- catch(e){calibrationError=e.message;$('message').textContent=e.message;$('message').className='error'}
- finally{calibrationRequest=false;for(const b of document.querySelectorAll('[data-action]'))b.disabled=true}
-};
-// Native WebGL, no CDN, Node build, Three.js or browser plugins required.
-const canvas=$('gl'), gl=canvas.getContext('webgl',{antialias:true});let yaw=.35,pitch=.12,distance=3.5,target=[0,.9,0],autoCenter=true;
-if(!gl){$('empty').textContent='WebGL недоступен. Включите аппаратное ускорение браузера.'}else{
- const vs='attribute vec3 p; attribute vec3 color; uniform mat4 mvp; varying vec3 c; void main(){gl_Position=mvp*vec4(p,1.0);gl_PointSize=7.0;c=color;}',fs='precision mediump float; varying vec3 c; void main(){gl_FragColor=vec4(c,1.0);}';
- function shader(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s}
- const program=gl.createProgram();gl.attachShader(program,shader(gl.VERTEX_SHADER,vs));gl.attachShader(program,shader(gl.FRAGMENT_SHADER,fs));gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));gl.useProgram(program);
- const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);for(const [name,offset] of [['p',0],['color',12]]){const loc=gl.getAttribLocation(program,name);gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,3,gl.FLOAT,false,24,offset)}const matrix=gl.getUniformLocation(program,'mvp');gl.enable(gl.DEPTH_TEST);
- const sub=(a,b)=>a.map((x,i)=>x-b[i]),dot=(a,b)=>a.reduce((s,x,i)=>s+x*b[i],0),cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],norm=a=>{const n=Math.hypot(...a);return a.map(x=>x/n)};
- function multiply(a,b){const o=new Float32Array(16);for(let c=0;c<4;c++)for(let r=0;r<4;r++)for(let k=0;k<4;k++)o[c*4+r]+=a[k*4+r]*b[c*4+k];return o}
- function mvp(){const eye=[target[0]+distance*Math.cos(pitch)*Math.sin(yaw),target[1]+distance*Math.sin(pitch),target[2]+distance*Math.cos(pitch)*Math.cos(yaw)],z=norm(sub(eye,target)),x=norm(cross([0,1,0],z)),y=cross(z,x);const view=[x[0],y[0],z[0],0,x[1],y[1],z[1],0,x[2],y[2],z[2],0,-dot(x,eye),-dot(y,eye),-dot(z,eye),1];const f=1/Math.tan(Math.PI/8),aspect=canvas.width/canvas.height,n=.02,far=150;return multiply([f/aspect,0,0,0,0,f,0,0,0,0,(far+n)/(n-far),-1,0,0,2*far*n/(n-far),0],view)}
- const pointers=new Map();canvas.onpointerdown=e=>{canvas.setPointerCapture(e.pointerId);pointers.set(e.pointerId,[e.clientX,e.clientY])};canvas.onpointerup=canvas.onpointercancel=e=>pointers.delete(e.pointerId);canvas.onpointermove=e=>{if(!pointers.has(e.pointerId))return;const old=pointers.get(e.pointerId);if(pointers.size===1){yaw-=(e.clientX-old[0])*.006;pitch=Math.max(-1.4,Math.min(1.4,pitch+(e.clientY-old[1])*.006))}else{const other=[...pointers.entries()].find(([id])=>id!==e.pointerId)[1];const before=Math.hypot(old[0]-other[0],old[1]-other[1]),after=Math.hypot(e.clientX-other[0],e.clientY-other[1]);if(after>0)distance=Math.max(.3,Math.min(80,distance*before/after))}pointers.set(e.pointerId,[e.clientX,e.clientY])};canvas.onwheel=e=>{e.preventDefault();distance=Math.max(.3,Math.min(80,distance*Math.exp(e.deltaY*.001))) };
- $('resetView').onclick=()=>{autoCenter=true;yaw=.35;pitch=.12;distance=3.5};
- // Octahedra match host/viz/pyqt_mocap/human_canvas_gl.py: 20% head,
- // radius 12% (at most 4.5 cm), eight shaded facets and dark edges.
- const add=(a,b)=>a.map((v,i)=>v+b[i]),scale=(a,k)=>a.map(v=>v*k);
- const shades=[1,.90,.78,.70,.88,.80,.96,.85];
- function boneMesh(bone,color,triangles,edges){
-  const delta=sub(bone.end,bone.start),length=Math.hypot(...delta);if(length<1e-8)return;
-  const direction=scale(delta,1/length),axes=bone.axes;
-  const reference=axes.reduce((a,b)=>Math.abs(dot(direction,a))<=Math.abs(dot(direction,b))?a:b);
-  const u=norm(cross(direction,reference)),v=cross(direction,u),radius=Math.min(length*.12,.045),center=add(bone.start,scale(delta,.2));
-  const vertices=[bone.start,bone.end,add(center,scale(u,radius)),add(center,scale(v,radius)),add(center,scale(u,-radius)),add(center,scale(v,-radius))];
-  for(let i=0;i<4;i++){const a=2+i,b=2+(i+1)%4;for(const [k,face] of [[0,[0,b,a]],[1,[1,a,b]]])for(const index of face)triangles.push(...vertices[index],...scale(color,shades[2*i+k]));
-   for(const [a,b] of [[0,2+i],[1,2+i],[2+i,2+(i+1)%4]])edges.push(...vertices[a],.18,.24,.30,...vertices[b],.18,.24,.30);
-  }
- }
- let centeredRig=null,centeredLive=false,floor=0;
- function draw(){
-  const dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,Math.round(canvas.clientWidth*dpr)),h=Math.max(1,Math.round(canvas.clientHeight*dpr));
-  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}gl.viewport(0,0,w,h);gl.clearColor(248/255,250/255,252/255,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
-  const age=(armature.age_ms||0)+performance.now()-lastStateMs;
-  const live=connected&&armature.status==='live'&&age<=armature.max_age_ms;
-  const held=armature.frame_id!==null&&!live;
-  $('empty').className='empty'+(live?' live':held?' held':'');
-  $('empty').textContent=live?'● BVH · движение'+(armature.bones.some(b=>!b.tracked&&!b.name.endsWith(':End'))?' · часть костей удерживается':''):held?'Поза удерживается · '+(!connected?'связь потеряна':'нет стабильного свежего BVH'):armature.status==='waiting'?'T-поза · ожидание 3 последовательных BVH-кадров':'T-поза · '+(current?.pose?(statuses[current.pose.status]||'ожидание BVH'):'ожидание BVH');
-  if(centeredRig!==armature.rig_id){centeredRig=armature.rig_id;centeredLive=false;autoCenter=true}
-  if(armature.frame_id!==null&&!centeredLive){centeredLive=true;autoCenter=true}
-  const points=armature.points;
-  if(autoCenter){target=[0,1,2].map(i=>points.reduce((sum,p)=>sum+p[i],0)/points.length);floor=Math.min(...points.map(p=>p[1]));autoCenter=false}
-  const grid=[],triangles=[],edges=[];
-  const line=(a,b,c)=>grid.push(...a,...c,...b,...c);
-  for(let i=-5;i<=5;i++){line([target[0]+i*.5,floor,target[2]-2.5],[target[0]+i*.5,floor,target[2]+2.5],[.82,.86,.90]);line([target[0]-2.5,floor,target[2]+i*.5],[target[0]+2.5,floor,target[2]+i*.5],[.82,.86,.90])}
-  for(const bone of armature.bones){const color=live&&bone.tracked?(bone.name.includes('Leg')||bone.name.includes('Foot')?[.30,.58,.77]:[.88,.55,.41]):held?[.66,.69,.73]:[.54,.62,.70];boneMesh(bone,color,triangles,edges)}
-  gl.uniformMatrix4fv(matrix,false,mvp());
-  function upload(data,mode){gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.DYNAMIC_DRAW);gl.drawArrays(mode,0,data.length/6)}
-  upload(grid,gl.LINES);gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1,1);upload(triangles,gl.TRIANGLES);gl.disable(gl.POLYGON_OFFSET_FILL);upload(edges,gl.LINES);
-  requestAnimationFrame(draw)
- }draw();
-}connect();
-</script></html>'''.replace('__REST_ARMATURE__', json.dumps(ArmatureView(.5).snapshot(0)))
+const $=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const labels={preparing:'Подготовка камер',recording:'Все камеры записывают',stopping:'Завершение файлов на камерах',stopped:'Готово к выгрузке',uploading:'Выгрузка на сервер',synchronizing:'Синхронизация SkellySync',ready:'Готово для официального FreeMoCap',failed:'Ошибка',interrupted:'Прервано'};
+let state=null,polling=false,lastHTML='';const cards=new Map();
+async function api(path,body){const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});const value=await r.json();if(!r.ok)throw Error(value.error||r.status);return value}
+function fail(e){$('error').textContent=e.message||String(e)}
+async function preview(name,card){if(document.hidden||!$('preview').checked){card.img.hidden=true}else{try{const r=await fetch('/preview/'+encodeURIComponent(name)+'.jpg',{signal:AbortSignal.timeout(7000)});if(!r.ok)throw Error('Превью недоступно');const url=URL.createObjectURL(await r.blob());card.img.src=url;card.img.hidden=false;if(card.url)URL.revokeObjectURL(card.url);card.url=url;card.note.textContent=''}catch(e){card.img.hidden=true;card.note.textContent=e.message}}setTimeout(()=>preview(name,card),1000)}
+async function refresh(){if(polling)return;polling=true;try{state=await api('/api/state');$('calibration').textContent=state.calibration?'Текущий калибровочный набор: '+state.calibration.name:'Калибровочный набор пока не записан';$('start').disabled=state.takes.some(t=>['preparing','recording','stopping','uploading','synchronizing'].includes(t.state));
+ for(const c of state.cameras){let card=cards.get(c.name);if(!card){const box=document.createElement('div');box.className='cam';const title=document.createElement('b'),info=document.createElement('p'),img=document.createElement('img'),note=document.createElement('small');title.textContent=c.name;info.className='muted';img.alt=c.name;img.hidden=true;box.append(title,info,img,note);$('cameras').append(box);card={info,img,note};cards.set(c.name,card);preview(c.name,card)}card.info.textContent=c.online?`${c.mode.width}×${c.mode.height} · ${c.mode.fps} FPS · ${c.mode.pixel_format} · свободно ${(c.free_bytes/1024**3).toFixed(1)} ГБ · ${c.active_state==='recording'?'записывает':c.active_state==='stopping'?'завершает файл':'ожидает'}${c.synthetic?' · ТЕСТОВОЕ ВИДЕО':''}`:c.error}
+ const html=state.takes.map(t=>`<div class="take"><b>${esc(t.name)}</b> · ${esc(t.kind)}<p>${esc(labels[t.state]||t.state)}${t.state==='uploading'?' · '+Math.min(100,100*(t.transferred_bytes||0)/t.total_bytes).toFixed(0)+'%':''}</p>${t.error?`<div class="bad">${esc(t.error)}</div>`:''}${t.state==='recording'?`<button data-stop="${t.id}">Остановить запись</button>`:''}${['stopped','failed','interrupted'].includes(t.state)?`<button data-upload="${t.id}">Выгрузить / повторить</button>`:''}${t.synchronized_path?`<div class="path">${esc(t.synchronized_path)}</div><button data-copy="${t.id}">Копировать путь</button><a href="/api/takes/${t.id}" target="_blank">Отчёт</a>`:''}</div>`).join('')||'Записей пока нет';if(html!==lastHTML){$('takes').innerHTML=html;lastHTML=html}
+ }catch(e){fail(e)}finally{polling=false}}
+$('start').onclick=async()=>{try{$('error').textContent='';let replace=false;const kind=$('kind').value;if(kind==='calibration'&&state?.calibration){if(!confirm('Калибровочный набор «'+state.calibration.name+'» уже есть. Заменить его новым после успешной выгрузки? Предыдущие файлы сохранятся.'))return;replace=true}$('start').disabled=true;await api('/api/start',{name:$('name').value.trim(),kind,replace_calibration:replace,expected_calibration_id:state?.calibration?.id});await refresh()}catch(e){fail(e);$('start').disabled=false}};
+$('takes').onclick=async e=>{const b=e.target.closest('button');if(!b)return;try{$('error').textContent='';if(b.dataset.stop){b.disabled=true;await api('/api/stop',{id:b.dataset.stop,upload:$('autoUpload').checked})}if(b.dataset.upload){b.disabled=true;await api('/api/upload',{id:b.dataset.upload})}if(b.dataset.copy){const path=state.takes.find(t=>t.id===b.dataset.copy).synchronized_path;if(navigator.clipboard)await navigator.clipboard.writeText(path);else prompt('Путь к синхронизированным видео',path)}await refresh()}catch(e){b.disabled=false;fail(e)}};
+refresh();setInterval(refresh,2000);
+</script></html>"""
 
 
-def main(args):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", f"rtsp_transport;{args.rtsp_transport}")
-    engine = Engine(args)
-    import uvicorn
-    LOG.info("Open http://%s:%s (use server IP when binding 0.0.0.0)", args.host, args.port)
-    uvicorn.run(create_app(engine), host=args.host, port=args.port, access_log=False, workers=1)
+def main():
+    os.environ["PATH"] = (
+        str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
+    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--camera",
+        action="append",
+        default=[],
+        help="cam1=http://CAMERA_IP:8081; repeat for every camera",
+    )
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--records", type=Path, default=HERE.parent / "records" / "local_capture"
+    )
+    parser.add_argument("--camera-token-file", type=Path)
+    parser.add_argument("--sync-job", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.sync_job:
+        synchronize(args.sync_job.resolve())
+        return
+    args.camera_token = (
+        args.camera_token_file.read_text().strip() if args.camera_token_file else ""
+    )
+    if not 1 <= args.port <= 65535:
+        parser.error("Invalid port")
+    host = Host(args)
+    http = ThreadingHTTPServer((args.host, args.port), handler(host))
+    http.daemon_threads = True
+
+    def stop(*_):
+        threading.Thread(target=http.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    print(f"Open http://SERVER_IP:{args.port}; recordings: {host.root}", flush=True)
+    try:
+        http.serve_forever()
+    finally:
+        http.server_close()
+        host.close()
 
 
 if __name__ == "__main__":
-    try:
-        main(CLI_ARGS)
-    except (ValueError, OSError, KeyError) as exc:
-        sys.exit(str(exc))
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+    main()
